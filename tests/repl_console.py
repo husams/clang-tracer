@@ -20,6 +20,33 @@ def main():
         assert server.stdout.readline().strip() == "ready"
         with tempfile.TemporaryDirectory(prefix="tracer-repl-console-") as directory:
             root = Path(directory)
+            continued_help = "%help \\\r\n  probe \\ \t\r\n  inject\r\n"
+            continued = subprocess.run(
+                [console, "--fail-fast"], input=continued_help + "%quit\n",
+                text=True, capture_output=True, timeout=10)
+            assert continued.returncode == 0 and "Deployment options" in continued.stdout, (
+                continued.stdout, continued.stderr)
+
+            startup = root / "startup.repl"
+            startup.write_bytes(continued_help.encode())
+            continued = subprocess.run(
+                [console, "--startup", str(startup)], input="%status\n%quit\n",
+                text=True, capture_output=True, timeout=10)
+            assert continued.returncode == 0 and "Deployment options" in continued.stdout, (
+                continued.stdout, continued.stderr)
+            assert "ready=unconnected" in continued.stdout, continued.stdout
+
+            incomplete = "%status \\\n"
+            startup.write_text(incomplete)
+            for options, stdin in (([], incomplete),
+                                   (["--startup", str(startup)], "%help probe inject\n")):
+                rejected = subprocess.run([console, *options], input=stdin, text=True,
+                                          capture_output=True, timeout=10)
+                assert rejected.returncode == 1, (rejected.stdout, rejected.stderr)
+                assert "incomplete REPL command continuation" in rejected.stderr, rejected.stderr
+                assert "ready=unconnected" not in rejected.stdout, rejected.stdout
+                assert "Deployment options" not in rejected.stdout, rejected.stdout
+
             callback = root / "client only callback.cpp"
             callback.write_text("// client-only interceptor\n")
             capture = root / "capture.pb"
@@ -305,10 +332,10 @@ if (live.running()) throw std::runtime_error("stop failed");
 %cpp reset
 auto live_again = tracer.events_async(session);
 %cpp reset
-auto sync_events = tracer.events(session, 4, 5);
-if (!sync_events.snapshot().complete) throw std::runtime_error("incomplete sync range");
+auto sync = tracer.events(session, 4, 5);
+if (!sync.snapshot().complete) throw std::runtime_error("incomplete sync range");
 int visited = 0;
-for (const auto &event : sync_events) { ++visited; }
+for (const auto &event : sync) { ++visited; }
 std::cout << "live-sync-visited=" << visited << std::endl;
 %quit
 '''

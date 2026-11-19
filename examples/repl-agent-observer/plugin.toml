@@ -1,0 +1,9 @@
+id = "latency"
+sdk = 1
+
+[agent]
+sources = ["src/latency.cpp"]
+extra_flags = ["-O1"]
+
+[agent.target]
+executable = "/absolute/path/to/your/application"

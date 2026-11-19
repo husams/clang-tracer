@@ -20,13 +20,13 @@ add_custom_command(
   VERBATIM)
 add_library(tracer_context_transport_proto STATIC
   ${_context_proto_dir}/context_transport.pb.cc)
-target_compile_features(tracer_context_transport_proto PUBLIC cxx_std_23)
+target_compile_features(tracer_context_transport_proto PUBLIC cxx_std_20)
 set_target_properties(tracer_context_transport_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_context_transport_proto PUBLIC ${_context_proto_dir})
 target_link_libraries(tracer_context_transport_proto PUBLIC protobuf::libprotobuf)
 add_library(tracer_context_delivery STATIC src/context_journal.cpp src/context_stream.cpp
   ${_context_proto_dir}/context_transport.grpc.pb.cc)
-target_compile_features(tracer_context_delivery PUBLIC cxx_std_23)
+target_compile_features(tracer_context_delivery PUBLIC cxx_std_20)
 set_target_properties(tracer_context_delivery PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_context_delivery PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${_context_proto_dir})
 target_link_libraries(tracer_context_delivery PUBLIC protobuf::libprotobuf gRPC::grpc++

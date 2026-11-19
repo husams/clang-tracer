@@ -91,11 +91,67 @@ public:
   const Context &context() const;
 
   template <class T> T arg(std::size_t index) const {
-    if (index >= context_.argument_count || index >= kMaxArguments) {
+    if (index >= context_.argument_count) {
       throw std::out_of_range("callback argument index is out of range");
     }
     return decode<T>(context_.arguments[index]);
   }
+
+  template <class T> void override_argument(std::size_t index, T value) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_arguments)
+      throw std::logic_error("argument overrides require an opted-in pre() hook");
+    if (index >= context_.argument_count) {
+      throw std::out_of_range("callback argument index is out of range");
+    }
+    require_type(context_.arguments[index], override_type<T>());
+    overrides->arguments[index] = ScalarOverrides::pack(value);
+    overrides->argument_set[index] = 1;
+  }
+
+  template <class T> void override_result(T value) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Post || !overrides || !overrides->allow_result)
+      throw std::logic_error("result overrides require an opted-in post() hook");
+    require_type(context_.result, override_type<T>());
+    overrides->result = ScalarOverrides::pack(value);
+    overrides->result_set = true;
+  }
+
+  template <class T> void replace_with(T value) const {
+    auto *overrides = replacement_overrides(override_type<T>());
+    overrides->replacement = ScalarOverrides::pack(value);
+    overrides->replacement_set = true;
+  }
+
+  // Invokes the original with its entry arguments. Repeated calls return the
+  // first result. The wrapper propagates any original C++ exception to the caller.
+  template <class T = void> T call_original() const {
+    if (context_.phase != TracePhase::Pre || !context_.invoke_original)
+      throw std::logic_error("calling the original requires an opted-in pre() hook");
+    if constexpr (std::is_void_v<T>) {
+      require_type(context_.result, ValueType::Void);
+      context_.invoke_original(context_.original_state);
+    } else {
+      require_type(context_.result, override_type<T>());
+      return ScalarOverrides::unpack<T>(context_.invoke_original(context_.original_state));
+    }
+  }
+
+  void replace_with() const {
+    replacement_overrides(ValueType::Void)->replacement_set = true;
+  }
+
+private:
+  ScalarOverrides *replacement_overrides(ValueType type) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_replacement)
+      throw std::logic_error("replacement requires an opted-in pre() hook");
+    require_type(context_.result, type);
+    return overrides;
+  }
+
+public:
 
   template <class T = InferResultType> decltype(auto) result() const {
     if (context_.phase != TracePhase::Post) {
@@ -135,6 +191,21 @@ public:
     return static_cast<std::uintptr_t>(context_.object_address);
   }
 
+  // Registration identity is available only for a receiver verified live at
+  // entry. The copied generation remains stable across this invocation.
+  bool identity_verified() const noexcept {
+    return context_.object_identity_verified;
+  }
+  std::uint64_t object_watch_id() const noexcept {
+    return context_.object_watch_id;
+  }
+  std::uint64_t object_id() const noexcept {
+    return context_.object_id;
+  }
+  std::uint64_t object_generation() const noexcept {
+    return context_.object_generation;
+  }
+
 #if defined(CLANG_TRACER_HAS_TYPED_RECEIVER)
   const ResolvedTarget *self() const {
     if (context_.object_address == 0) {
@@ -170,16 +241,20 @@ public:
     return context_.argument_count;
   }
   const TraceValue &argument_value(std::size_t index) const {
-    if (index >= context_.argument_count || index >= kMaxArguments)
+    if (index >= context_.argument_count) {
       throw std::out_of_range("callback argument index is out of range");
+    }
     return context_.arguments[index];
   }
   const char *argument_name(std::size_t index) const {
     (void)argument_value(index);
-    static constexpr const char *fallback[kMaxArguments] = {
-        "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"};
     const char *name = context_.argument_names[index];
-    return name && name[0] ? name : fallback[index];
+    if (name && name[0]) {
+      return name;
+    }
+    thread_local std::string fallback;
+    fallback = "arg" + std::to_string(index);
+    return fallback.c_str();
   }
   const TraceValue &result_value() const {
     if (context_.phase != TracePhase::Post)
@@ -205,8 +280,6 @@ public:
 
   // Types and passing modes are supplied by the validated DWARF description.
   template <std::size_t Index> decltype(auto) argument() const {
-    static_assert(Index < kMaxArguments,
-                  "argument index exceeds the supported limit");
     using T = typename ArgumentType<Index>::type;
     if constexpr (std::is_reference_v<T>) {
       if (Index >= context_.argument_count)
@@ -257,28 +330,15 @@ private:
     std::size_t length = 0;
     while (name[length]) {
       const char c = name[length];
-      if (length >= 63 ||
-          !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
             (length && name[length - 1] != '.' && c >= '0' && c <= '9') ||
-            (c == '.' && length && name[length - 1] != '.' &&
-             name[length + 1]))) {
-        throw std::invalid_argument(
-            "event value name must be an identifier of at most 63 bytes");
+            (c == '.' && length && name[length - 1] != '.' && name[length + 1]))) {
+        throw std::invalid_argument("event value name must be an identifier");
       }
       ++length;
     }
-    unsigned field_count = 0;
-    for (std::uint32_t i = 0; i < context_.named_count && i < 16; ++i)
-      if (context_.named_values[i].kind == 2)
-        ++field_count;
-    if (kind == 2 && field_count + context_.argument_count >= 16)
-      throw std::out_of_range(
-          "at most 16 arguments and fields combined per hook");
-    if (context_.named_count >= 16) {
-      throw std::out_of_range("at most 16 named values per hook are supported");
-    }
     for (std::uint32_t i = 0; i < context_.named_count; ++i) {
-      const auto &previous = context_.named_values[i];
+      const auto& previous = context_.named_values[i];
       if (previous.kind != kind)
         continue;
       std::size_t j = 0;
@@ -290,13 +350,13 @@ private:
             "duplicate event value name or argument index");
       }
     }
-    auto &entry = context_.named_values[context_.named_count++];
-    entry.kind = kind;
-    entry.argument_index = index;
-    for (std::size_t i = 0; i < length; ++i)
-      entry.name[i] = name[i];
-    entry.name[length] = '\0';
-    entry.value = value;
+    if (!context_.named_storage) {
+      throw std::logic_error("named-value storage is unavailable");
+    }
+    if (!context_.append_named ||
+        !context_.append_named(&context_, name, length, value, kind, index)) {
+      throw std::runtime_error("cannot store named callback value");
+    }
   }
 
   template <class T> static TraceValue encode(T value) {
@@ -333,6 +393,23 @@ private:
   }
 
   template <class> static constexpr bool kUnsupportedType = false;
+
+  template <class T> static constexpr ValueType override_type() {
+    if constexpr (std::is_same_v<T, bool>)
+      return ValueType::Bool;
+    else if constexpr (std::is_same_v<T, int>)
+      return ValueType::Int32;
+    else if constexpr (std::is_same_v<T, long> || std::is_same_v<T, long long>)
+      return ValueType::Int64;
+    else if constexpr (std::is_same_v<T, unsigned long> || std::is_same_v<T, unsigned long long>)
+      return ValueType::UInt64;
+    else if constexpr (std::is_same_v<T, float>)
+      return ValueType::Float32;
+    else if constexpr (std::is_same_v<T, double>)
+      return ValueType::Float64;
+    else
+      static_assert(kUnsupportedType<T>, "override requires a supported scalar value");
+  }
 
   static void require_type(const TraceValue &value, ValueType expected) {
     if (value.type != expected) {

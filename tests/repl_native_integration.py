@@ -1,4 +1,4 @@
-"""Real Linux attach/deploy/collect/restore path for the native C++ console."""
+"""Real Linux attach/deploy/collect/restore path for the native C++17 console."""
 import argparse
 import json
 import os

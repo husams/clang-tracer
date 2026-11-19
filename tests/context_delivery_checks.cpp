@@ -149,6 +149,8 @@ void verify_context_delivery() {
     first_schema->set_serialized_file_descriptor_set("opaque-fds");
     first.mutable_event()->set_event_id("event-before");
     first.mutable_event()->set_name("request");
+    assert(!journal.append(first, p1, first.ByteSizeLong()));
+    assert(journal.committed_prefix() == 0);
     assert(journal.append(first, p1) && p1 == 1);
     assert(journal.read_after(0, 10, 4096).empty()); // Offline data waits for CREATE confirmation.
     assert(journal.confirm_create("recording-A", 0));
@@ -445,10 +447,14 @@ void verify_context_delivery() {
         ("clang-tracer-producer-journal-" + std::to_string(::getpid()));
     std::filesystem::remove_all(producer_journal_path);
     auto producer_journal = std::make_shared<tracer::context_delivery::ContextJournal>(producer_journal_path);
+    tracer::context_delivery::StreamLimits producer_limits;
+    producer_limits.max_event_bytes = 64;
+    auto collector_limits = producer_limits;
+    collector_limits.max_event_bytes = 63;
     tracer::context_delivery::ContextExportService service(collector_store, [&](const ContextFrame &frame) {
       if (frame.has_event()) { std::lock_guard lock(mutex); received = true; cv.notify_all(); }
       return true;
-    });
+    }, collector_limits);
     auto rpc = start_rpc_server(service);
     auto &server = rpc.server;
     auto channel = rpc.channel;
@@ -456,11 +462,27 @@ void verify_context_delivery() {
     open.set_protocol_version(1); open.set_epoch_id(1); open.set_producer_session_id("session");
     open.set_profile(DURABLE); open.set_operation(CREATE);
     open.set_recording_id("grpc-recording"); open.set_sink_id("grpc-sink");
-    tracer::context_delivery::ContextExportClient client(channel, open, {}, [&](const DurableControl &control) {
+    tracer::context_delivery::ContextExportClient client(channel, open, producer_limits, [&](const DurableControl &control) {
       std::lock_guard lock(mutex); ++durable_controls; cv.notify_all();
       return control.result() == DurableControl::ACCEPTED && control.recording_id() == "grpc-recording";
     }, producer_journal);
-    assert(client.start());
+    const auto publish = [&](const ContextBatch &candidate) {
+      const auto bytes = candidate.SerializeAsString();
+      assert(client.hook_ring().try_publish(::tracer::compat::as_bytes(
+          ::tracer::compat::span(bytes.data(), bytes.size()))));
+    };
+    ContextBatch rejected;
+    rejected.mutable_event()->add_states()->set_schema_identity("unannounced");
+    publish(rejected);
+    rejected.Clear();
+    // At position 1 the wire tag and varint add two bytes. Exercise both
+    // the producer's own event bound and the collector's smaller bound.
+    rejected.mutable_event()->set_name(std::string(62, 'x'));
+    assert(rejected.event().ByteSizeLong() == producer_limits.max_event_bytes);
+    publish(rejected);
+    rejected.mutable_event()->set_name(std::string(60, 'x'));
+    assert(rejected.event().ByteSizeLong() + 2 == producer_limits.max_event_bytes);
+    publish(rejected);
     ContextBatch batch;
     auto *schema = batch.add_schemas();
     schema->set_schema_identity("revision-1"); schema->set_revision_id("revision-1");
@@ -469,15 +491,22 @@ void verify_context_delivery() {
     auto *attachment = event->add_states(); attachment->set_schema_identity("revision-1");
     attachment->set_payload("bytes");
     const auto batch_bytes = batch.SerializeAsString();
-    assert(client.hook_ring().try_publish(::tracer::compat::as_bytes(
-        ::tracer::compat::span(batch_bytes.data(), batch_bytes.size()))));
+    publish(batch);
+    assert(client.start());
     {
       std::unique_lock lock(mutex);
       assert(cv.wait_for(lock, 5s, [&] { return received && durable_controls >= 2; }));
     }
     client.stop();
+    assert(client.counters().queue_dropped == 3);
     assert(collector_store->durable_prefix() == 1);
     assert(producer_journal->state().creation_confirmed && producer_journal->state().acknowledged == 1);
+    // Simulate a disconnect after a valid record was committed locally.
+    auto unacknowledged = batch;
+    unacknowledged.mutable_event()->set_event_id("event-2");
+    std::uint64_t replay_position = 0;
+    assert(producer_journal->append(unacknowledged, replay_position) &&
+           replay_position == 2);
     open.set_operation(RESUME); open.set_saved_ack_position(1); open.set_epoch_id(2);
     ContextBatch replay_batch;
     assert(replay_batch.ParseFromString(batch_bytes));
@@ -486,17 +515,19 @@ void verify_context_delivery() {
     int resume_controls = 0;
     tracer::context_delivery::ContextExportClient resumed(channel, open, {}, [&](const DurableControl &control) {
       std::lock_guard lock(mutex); ++resume_controls; cv.notify_all();
-      return control.result() == DurableControl::ACCEPTED && control.durable_prefix() == 1;
+      return control.result() == DurableControl::ACCEPTED &&
+             control.durable_prefix() >= 1 && control.durable_prefix() <= 2;
     }, producer_journal);
-    assert(resumed.start());
     assert(resumed.hook_ring().try_publish(::tracer::compat::as_bytes(
         ::tracer::compat::span(replay_bytes.data(), replay_bytes.size()))));
+    assert(resumed.start());
     {
       std::unique_lock lock(mutex);
-      assert(cv.wait_for(lock, 5s, [&] { return resume_controls >= 2; }));
+      assert(cv.wait_for(lock, 5s, [&] { return resume_controls >= 3; }));
     }
     resumed.stop();
-    assert(collector_store->durable_prefix() == 1);
+    assert(collector_store->durable_prefix() == 2);
+    assert(producer_journal->state().acknowledged == 2);
     server->Shutdown(); server->Wait();
     std::filesystem::remove_all(producer_journal_path);
     std::filesystem::remove_all(std::filesystem::temp_directory_path() /

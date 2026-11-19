@@ -34,9 +34,9 @@ awk -v n="$functions" 'BEGIN {
   for (i=0; i<n; i++)
     printf "extern \"C\" __attribute__((noinline)) int unused_%d(int argument) { volatile int value = argument + %d; return value; }\n", i, i;
 }' >> "$output/module.cpp"
-"$compiler" "${compiler_flags[@]}" -std=c++23 -g -O0 -shared -fPIC -fno-omit-frame-pointer \
+"$compiler" "${compiler_flags[@]}" -std=c++17 -g -O0 -shared -fPIC -fno-omit-frame-pointer \
   -fcf-protection=none "$output/module.cpp" "${link_flags[@]}" -o "$output/module.so"
-"$compiler" "${compiler_flags[@]}" -std=c++23 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
+"$compiler" "${compiler_flags[@]}" -std=c++17 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
   "$source_root/benchmarks/injection/target.cpp" "${link_flags[@]}" -ldl -o "$output/target"
 sha256sum "$output/module.cpp" "$output/module.so" "$output/target" \
   > "$output/identity.sha256"

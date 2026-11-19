@@ -1,4 +1,6 @@
 #include "injector.hpp"
+#include "mapped_elf.hpp"
+#include "ptrace_wait.hpp"
 
 #include <algorithm>
 #include <array>
@@ -27,7 +29,6 @@
 #include <vector>
 
 #include <dirent.h>
-#include <dlfcn.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <link.h>
@@ -45,7 +46,9 @@
 #endif
 
 #include "admission.hpp"
+#include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
+#include "linux_syscalls.hpp"
 #include "object_launch.hpp"
 #include "object_target.hpp"
 #include "runtime_identity.hpp"
@@ -55,11 +58,22 @@
 #define NT_X86_XSTATE 0x202
 #endif
 
+#if defined(__aarch64__)
+// Linux UAPI note IDs absent from older glibc elf.h headers. Runtime hardware
+// capability checks below still gate access to these optional register sets.
+#ifndef NT_ARM_SSVE
+#define NT_ARM_SSVE 0x40b
+#endif
+#ifndef NT_ARM_ZA
+#define NT_ARM_ZA 0x40c
+#endif
+#ifndef NT_ARM_ZT
+#define NT_ARM_ZT 0x40d
+#endif
+#endif
+
 // glibc exposes the seize requests even with this SDK's older kernel headers.
 // The running kernel must still support the existing seize/interrupt protocol.
-#ifndef PTRACE_EVENT_STOP
-#define PTRACE_EVENT_STOP 128
-#endif
 
 namespace tracer::injector {
 namespace {
@@ -492,9 +506,8 @@ InjectedStop inspect_injected_stop(pid_t process_id, pid_t tid, int status,
   return stop;
 }
 
-std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
-                                       std::size_t size) {
-  std::vector<unsigned char> result(size);
+void read_remote_into(pid_t tid, std::uintptr_t address, void *destination, std::size_t size) {
+  auto *result = static_cast<unsigned char *>(destination);
   std::size_t copied = 0;
   while (copied < size) {
     errno = 0;
@@ -505,9 +518,14 @@ std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
       throw_errno("read tracee memory");
     }
     const auto amount = std::min(sizeof(word), size - copied);
-    std::memcpy(result.data() + copied, &word, amount);
+    std::memcpy(result + copied, &word, amount);
     copied += amount;
   }
+}
+
+std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address, std::size_t size) {
+  std::vector<unsigned char> result(size);
+  read_remote_into(tid, address, result.data(), result.size());
   return result;
 }
 
@@ -543,7 +561,7 @@ struct MapEntry {
   std::uintptr_t offset = 0;
   std::string path;
   std::string module_path;
-  bool readable = false, executable = false;
+  bool readable = false, executable = false, private_writable = false;
 };
 
 std::vector<MapEntry> read_maps(pid_t process_id) {
@@ -562,6 +580,8 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
     MapEntry entry;
     entry.readable = permissions.find('r') != std::string::npos;
     entry.executable = permissions.find('x') != std::string::npos;
+    entry.private_writable = permissions.size() == 4 && permissions[1] == 'w' &&
+                             permissions[3] == 'p';
     const auto dash = range.find('-');
     if (dash == std::string::npos) {
       continue;
@@ -585,7 +605,122 @@ struct ExecutableEntry {
   std::vector<unsigned char> bytes;
   std::uintptr_t debug = 0;
   std::uintptr_t loader = 0;
+  std::uintptr_t environment = 0;
 };
+
+std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps, const std::string &path);
+
+std::uintptr_t initial_environment(pid_t pid, const std::vector<MapEntry> &maps) {
+  // The exec stop precedes any loader code. The initial stack begins with
+  // argc, followed by argv, its null terminator, and then envp.
+  const auto sp = object_target::sp(object_target::read_registers(pid));
+  const auto stack = std::find_if(maps.begin(), maps.end(), [&](const MapEntry &map) {
+    return map.path == "[stack]" && map.readable && map.start <= sp && sp < map.end;
+  });
+  constexpr auto word = sizeof(std::uintptr_t);
+  if (stack == maps.end() || (stack->end - sp) / word < 3)
+    throw std::runtime_error("cannot locate the initial environment on the exec stack");
+  std::uintptr_t argc = 0, terminator = 0;
+  read_remote_into(pid, sp, &argc, word);
+  if (argc > (stack->end - sp) / word - 3)
+    throw std::runtime_error("initial argument vector exceeds the exec stack");
+  const auto envp = sp + (argc + 2) * word;
+  read_remote_into(pid, envp - word, &terminator, word);
+  if (terminator)
+    throw std::runtime_error("initial argument vector is missing its terminator");
+  return envp;
+}
+
+void initialize_loader_environment(pid_t pid, std::uintptr_t envp) {
+  // An early dlopen passes libc's current __environ to its dependency
+  // initializers, which can include libc itself. Supply the exec environment
+  // before that call so the initializers see it and libc retains it for main.
+  const auto maps = read_maps(pid);
+#if defined(__aarch64__)
+  const auto libc = ::dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY);
+  if (!libc)
+    throw std::runtime_error("cannot locate glibc for the loader-ready environment");
+  const auto symbol = ::dlsym(libc, "getenv");
+  ::dlclose(libc);
+  Dl_info info{};
+  if (!symbol || !tracer::runtime::has_soname(symbol, "libc.so.6") ||
+      !::dladdr(symbol, &info) || !info.dli_fname)
+    throw std::runtime_error("cannot identify glibc for the loader-ready environment");
+  const auto path = tracer::detail::canonical_mapped_path(info.dli_fname);
+#else
+  const auto getenv_entry = target_runtime_entry(pid, "getenv");
+  const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const MapEntry &map) {
+    return map.executable && !map.module_path.empty() &&
+           map.start <= getenv_entry.address && getenv_entry.address < map.end;
+  });
+  if (mapping == maps.end())
+    throw std::runtime_error("cannot identify target glibc for the loader-ready environment");
+  const auto &path = mapping->module_path;
+#endif
+  auto binary = llvm::object::createBinary(path);
+  if (!binary)
+    throw std::runtime_error(llvm::toString(binary.takeError()));
+  const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  const auto in_libc = [&](std::uintptr_t address, std::size_t size) {
+    return std::any_of(maps.begin(), maps.end(), [&](const MapEntry &map) {
+      return map.module_path == path && map.readable && map.start <= address &&
+             address < map.end && size <= map.end - address;
+    });
+  };
+  const auto bias = map_load_bias(maps, path);
+  if (!object || object->getELFFile().getHeader().e_machine != native_machine ||
+      !tracer::detail::matches_mapped_elf(*object, bias, [&](auto address, std::string_view expected) {
+        if (!in_libc(address, expected.size()))
+          return false;
+        std::vector<char> bytes(expected.size());
+        iovec local{bytes.data(), bytes.size()}, remote{reinterpret_cast<void *>(address), bytes.size()};
+        return linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) ==
+                   static_cast<ssize_t>(bytes.size()) &&
+               std::string_view(bytes.data(), bytes.size()) == expected;
+      }))
+    throw std::runtime_error("cannot verify the glibc image for the loader-ready environment");
+
+#if defined(__aarch64__)
+  constexpr auto glob_dat = R_AARCH64_GLOB_DAT;
+#else
+  constexpr auto glob_dat = R_X86_64_GLOB_DAT;
+#endif
+  // Read libc's relocated reference rather than assuming its own BSS owns
+  // the pointer. The executable may have a copy relocation for __environ.
+  std::optional<std::uintptr_t> relocation_slot;
+  for (const auto &section : object->sections()) {
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & SHF_ALLOC))
+      continue;
+    for (const auto &relocation : section.relocations()) {
+      if (relocation.getType() != glob_dat)
+        continue;
+      const auto symbol = relocation.getSymbol();
+      if (symbol == object->symbol_end())
+        continue;
+      auto name = symbol->getName();
+      if (!name)
+        throw std::runtime_error(llvm::toString(name.takeError()));
+      if (*name != "__environ")
+        continue;
+      if (relocation_slot || relocation.getOffset() > UINTPTR_MAX - bias)
+        throw std::runtime_error("invalid glibc __environ relocation");
+      relocation_slot = bias + relocation.getOffset();
+    }
+  }
+  std::uintptr_t slot = 0, current = 0;
+  if (!relocation_slot || !in_libc(*relocation_slot, sizeof(slot)))
+    throw std::runtime_error("cannot locate the relocated glibc __environ pointer");
+  read_remote_into(pid, *relocation_slot, &slot, sizeof(slot));
+  if (slot % alignof(std::uintptr_t) ||
+      std::none_of(maps.begin(), maps.end(), [&](const MapEntry &map) {
+        return map.readable && map.private_writable && !map.executable &&
+               map.start <= slot && slot < map.end && sizeof(current) <= map.end - slot;
+      }))
+    throw std::runtime_error("glibc __environ is outside writable target data");
+  read_remote_into(pid, slot, &current, sizeof(current));
+  if (!current)
+    write_remote(pid, slot, &envp, sizeof(envp));
+}
 
 bool startup_dependency(pid_t pid, const link_map *first, std::string_view selected) {
   std::set<std::uintptr_t> seen;
@@ -616,8 +751,6 @@ bool startup_dependency(pid_t pid, const link_map *first, std::string_view selec
   }
   return false;
 }
-
-std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps, const std::string &path);
 
 ExecutableEntry verify_launch_entry(pid_t pid, bool loader_ready) {
   verify_target_executable(pid);
@@ -698,7 +831,8 @@ ExecutableEntry verify_launch_entry(pid_t pid, bool loader_ready) {
   if (image.empty() || mapping == maps.end())
     throw std::runtime_error("AT_ENTRY disagrees with the executable ELF mapping");
   executable.seekg(static_cast<std::streamoff>(*entry_offset));
-  ExecutableEntry result{entry, std::vector<unsigned char>(syscall_stub.size()), debug_address, interpreter};
+  ExecutableEntry result{entry, std::vector<unsigned char>(syscall_stub.size()), debug_address,
+                         interpreter, loader_ready ? initial_environment(pid, maps) : 0};
   if (!executable.read(reinterpret_cast<char *>(result.bytes.data()), result.bytes.size()) ||
       read_remote(pid, entry, result.bytes.size()) != result.bytes)
     throw std::runtime_error("live executable entry differs from verified ELF bytes");
@@ -853,6 +987,59 @@ struct Process::PeerFreeze {
     return leader_ip > address && leader_ip < end;
   }
 
+#if defined(__x86_64__)
+  [[nodiscard]] bool may_have_active_frames(::tracer::compat::span<const CodeRange> ranges) const {
+    if (ranges.empty())
+      return false;
+    // Look for both current PCs and saved return/signal PCs. An incomplete
+    // stack read is a failed drain. Stale words can delay publication.
+    const auto mappings = read_maps(process.process_id_);
+    const auto inside = [&](std::uintptr_t value, bool saved_pc) {
+      return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
+        if (value < range.address || (value == range.address && !range.active_at_start))
+          return false;
+        const auto offset = value - range.address;
+        return offset < range.size || (saved_pc && offset == range.size && range.return_at_end);
+      });
+    };
+    const auto affected = [&](pid_t tid) {
+      const auto regs = object_target::read_registers(tid);
+      if (inside(regs.rip, false) || (regs.rsp & (sizeof(std::uintptr_t) - 1)))
+        return true;
+      const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto &map) {
+        return map.readable && regs.rsp >= map.start && regs.rsp < map.end;
+      });
+      if (mapping == mappings.end())
+        return true;
+      // On glibc x86-64, a default pthread's stack and thread descriptor
+      // share a mapping, with the FS base above the stack. Require this
+      // evidence before treating an unnamed mapping as the regular stack.
+      const bool pthread_stack = mapping->private_writable &&
+          (mapping->path.empty() || ::tracer::compat::starts_with(mapping->path, "[anon:glibc: pthread stack")) &&
+          regs.fs_base > regs.rsp && regs.fs_base < mapping->end;
+      if (mapping->path != "[stack]" && !pthread_stack)
+        return true;
+      std::array<std::uintptr_t, 512> words{};
+      for (auto cursor = static_cast<std::uintptr_t>(regs.rsp); cursor < mapping->end;) {
+        const auto count = std::min<std::size_t>(sizeof(words), mapping->end - cursor);
+        iovec local{words.data(), count};
+        iovec remote{reinterpret_cast<void *>(cursor), count};
+        const auto got = linux_api::process_vm_readv(process.process_id_, &local, 1, &remote, 1, 0);
+        if (got != static_cast<ssize_t>(count) ||
+            std::any_of(words.begin(), words.begin() + count / sizeof(words.front()),
+                        [&](auto value) { return inside(value, true); }))
+          return true;
+        cursor += count;
+      }
+      return false;
+    };
+    return affected(process.tid_) ||
+        std::any_of(peers.begin(), peers.end(), [&](const auto &peer) {
+          return peer.stopped && affected(peer.tid);
+        });
+  }
+#endif
+
   void promote(pid_t tid) {
     const auto selected = find(tid);
     if (selected == peers.end() || !selected->stopped) {
@@ -993,11 +1180,11 @@ private:
         }
         const unsigned int event = static_cast<unsigned int>(status) >> 16;
         const int signal = WSTOPSIG(status);
-        if (event == PTRACE_EVENT_STOP && (signal == SIGTRAP || patch_only)) {
+        if (event == tracer::injector::ptrace_event_stop && (signal == SIGTRAP || patch_only)) {
           peer.stopped = true;
           return;
         }
-        if (event == PTRACE_EVENT_STOP) {
+        if (event == tracer::injector::ptrace_event_stop) {
           peer.pending_signal = signal;
           throw IdlePointUnavailable(
               "peer thread is in a job-control group stop; refusing to thaw "
@@ -1150,8 +1337,9 @@ void Process::poison_process() noexcept {
 void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
-                     ::tracer::compat::span<const ApplicationModule> application_modules) {
-  attach_impl(process_id, application_modules, false);
+                     ::tracer::compat::span<const ApplicationModule> application_modules,
+                     pid_t excluded_tid, pid_t required_tid) {
+  attach_impl(process_id, application_modules, false, 0, 0, excluded_tid, required_tid);
 }
 
 void Process::attach_for_patch(pid_t process_id) {
@@ -1230,6 +1418,7 @@ void Process::adopt_executable_entry(object_launch::Child &child,
       }
       if (!startup_module.empty() && !startup_dependency(pid, debug.r_map, startup_module))
         throw std::runtime_error("selected startup module is outside the initial glibc link map");
+      initialize_loader_environment(pid, entry.environment);
     }
     ptrace_checked(PTRACE_SETOPTIONS, pid, nullptr,
                    reinterpret_cast<void *>(static_cast<std::uintptr_t>(PTRACE_O_EXITKILL)),
@@ -1242,7 +1431,8 @@ void Process::adopt_executable_entry(object_launch::Child &child,
 
 void Process::attach_impl(pid_t process_id,
                           ::tracer::compat::span<const ApplicationModule> application_modules,
-                          bool patch_only, std::uintptr_t rendezvous, std::size_t rendezvous_size) {
+                          bool patch_only, std::uintptr_t rendezvous, std::size_t rendezvous_size,
+                          pid_t excluded_tid, pid_t required_tid) {
 #if !defined(__linux__) || (!defined(__x86_64__) && !defined(__aarch64__))
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
@@ -1285,12 +1475,12 @@ void Process::attach_impl(pid_t process_id,
     stopped = true;
     tracee_stopped_ = true;
     const unsigned int event = static_cast<unsigned int>(status) >> 16;
-    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP && !patch_only) {
+    if (event == tracer::injector::ptrace_event_stop && WSTOPSIG(status) != SIGTRAP && !patch_only) {
       pending_signal_ = WSTOPSIG(status);
       throw IdlePointUnavailable(
           "target leader is in a job-control group stop; refusing injection");
     }
-    if (event != PTRACE_EVENT_STOP) {
+    if (event != tracer::injector::ptrace_event_stop) {
       // Preserve a genuine signal-delivery stop if one raced with interrupt.
       pending_signal_ = WSTOPSIG(status);
     }
@@ -1359,7 +1549,7 @@ void Process::attach_impl(pid_t process_id,
         throw IdlePointUnavailable("AArch64 idle sleep did not reach its return instruction");
       stopped = tracee_stopped_ = true;
       const bool stepped = completed_sleep_step(status);
-      if (!stepped && ((static_cast<unsigned int>(status) >> 16) != PTRACE_EVENT_STOP ||
+      if (!stepped && ((static_cast<unsigned int>(status) >> 16) != tracer::injector::ptrace_event_stop ||
                        WSTOPSIG(status) != SIGTRAP))
         pending_signal_ = WSTOPSIG(status);
       if (!stepped || register_ip(object_target::read_registers(tid_)) != *admitted_pc + svc.size())
@@ -1376,7 +1566,15 @@ void Process::attach_impl(pid_t process_id,
       std::string reason;
     };
     std::vector<Rejection> rejected;
-    auto eligible = [&](pid_t candidate_tid) {
+    auto eligible = [&](pid_t candidate_tid, int pending_signal) {
+      if (candidate_tid == excluded_tid || (required_tid && candidate_tid != required_tid)) {
+        rejected.push_back({candidate_tid, -1, "reserved for instruction tracing"});
+        return false;
+      }
+      if (required_tid && pending_signal) {
+        rejected.push_back({candidate_tid, -1, "selected control thread has a pending signal"});
+        return false;
+      }
       const long syscall_number = stopped_syscall(candidate_tid);
       const auto registers = object_target::read_registers(candidate_tid);
       if (candidate_tid != process_id_ && registers.fs_base == 0) {
@@ -1387,6 +1585,10 @@ void Process::attach_impl(pid_t process_id,
       if (syscall_number == SYS_nanosleep ||
           syscall_number == SYS_clock_nanosleep) {
         return true;
+      }
+      if (required_tid) {
+        rejected.push_back({candidate_tid, syscall_number, "selected control thread must be sleeping"});
+        return false;
       }
       if (syscall_number >= 0) {
         rejected.push_back({candidate_tid, syscall_number,
@@ -1403,11 +1605,11 @@ void Process::attach_impl(pid_t process_id,
       }
     };
 
-    if (!eligible(tid_)) {
+    if (!eligible(tid_, pending_signal_)) {
       PeerFreeze freeze(*this);
       pid_t selected_tid = -1;
       for (const auto &peer : freeze.peers) {
-        if (peer.stopped && eligible(peer.tid)) {
+        if (peer.stopped && eligible(peer.tid, peer.pending_signal)) {
           selected_tid = peer.tid;
           break;
         }
@@ -1459,7 +1661,7 @@ void Process::attach_impl(pid_t process_id,
           !(stepping_sleep && completed_sleep_step(recovery_status)) &&
 #endif
           ((static_cast<unsigned int>(recovery_status) >> 16) !=
-                          PTRACE_EVENT_STOP ||
+                          tracer::injector::ptrace_event_stop ||
                       WSTOPSIG(recovery_status) != SIGTRAP)) {
         pending_signal_ = WSTOPSIG(recovery_status);
       }
@@ -1609,6 +1811,12 @@ std::uintptr_t Process::instruction_pointer() const {
   return register_ip(object_target::read_registers(tid_));
 }
 
+bool Process::signal_blocked(int signal) const {
+  ensure_usable();
+  return signal > 0 && signal <= 64 &&
+         (read_signal_mask(tid_) & (std::uint64_t{1} << (signal - 1)));
+}
+
 void Process::remote_read(std::uintptr_t address, void *destination,
                           std::size_t size) const {
   ensure_usable();
@@ -1688,7 +1896,9 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
 
 bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                const std::function<void()> &validate_mappings,
-                               const std::function<void()> &on_commit) {
+                               const std::function<void()> &on_commit,
+                               ::tracer::compat::span<const CodeRange> drained_ranges,
+                               bool allow_already_replaced) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1712,7 +1922,24 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
       throw std::invalid_argument("patch_code_batch ranges overlap");
   }
 
+  std::vector<std::vector<unsigned char>> before;
+  before.reserve(patches.size());
+  for (const auto &patch : patches)
+    before.emplace_back(patch.size);
+  auto scratch = std::vector<unsigned char>(
+      std::max_element(patches.begin(), patches.end(), [](const auto &a, const auto &b) {
+        return a.size < b.size;
+      })->size);
   PeerFreeze peers(*this);
+#if defined(__x86_64__)
+  if (peers.may_have_active_frames(drained_ranges)) {
+    peers.release();
+    return false;
+  }
+#else
+  if (!drained_ranges.empty())
+    throw std::runtime_error("native stack drain is unavailable");
+#endif
   if (validate_mappings)
     validate_mappings();
   for (const auto &patch : patches) {
@@ -1722,37 +1949,39 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
     }
   }
 
-  std::vector<std::vector<unsigned char>> before;
-  before.reserve(patches.size());
-  for (const auto &patch : patches) {
-    before.push_back(read_remote(tid_, patch.address, patch.size));
-    if (std::memcmp(before.back().data(), patch.expected, patch.size) != 0)
-      throw std::runtime_error(
-          "patch_code_batch precondition did not match target bytes");
+  for (std::size_t i = 0; i < patches.size(); ++i) {
+    const auto &patch = patches[i];
+    read_remote_into(tid_, patch.address, before[i].data(), patch.size);
+    if (std::memcmp(before[i].data(), patch.expected, patch.size) != 0 &&
+        (!allow_already_replaced ||
+         std::memcmp(before[i].data(), patch.replacement, patch.size) != 0))
+      throw std::runtime_error("patch_code_batch precondition did not match target bytes");
   }
 
-  std::size_t attempted = 0;
+  std::vector<std::size_t> attempted;
+  attempted.reserve(patches.size());
   try {
     for (std::size_t i = 0; i < patches.size(); ++i) {
-      attempted = i + 1; // write_remote can fail after a partial word write.
+      if (std::memcmp(before[i].data(), patches[i].replacement, patches[i].size) == 0)
+        continue;
+      attempted.push_back(i); // write_remote can fail after a partial word write.
       write_remote(tid_, patches[i].address, patches[i].replacement,
                    patches[i].size);
-      const auto committed =
-          read_remote(tid_, patches[i].address, patches[i].size);
-      if (std::memcmp(committed.data(), patches[i].replacement,
+      read_remote_into(tid_, patches[i].address, scratch.data(), patches[i].size);
+      if (std::memcmp(scratch.data(), patches[i].replacement,
                       patches[i].size) != 0)
         throw std::runtime_error("patch_code_batch verification failed");
     }
   } catch (...) {
     const auto failure = std::current_exception();
     try {
-      while (attempted != 0) {
-        const auto i = --attempted;
+      while (!attempted.empty()) {
+        const auto i = attempted.back();
+        attempted.pop_back();
         write_remote(tid_, patches[i].address, before[i].data(),
                      before[i].size());
-        const auto restored =
-            read_remote(tid_, patches[i].address, before[i].size());
-        if (std::memcmp(restored.data(), before[i].data(), before[i].size()) !=
+        read_remote_into(tid_, patches[i].address, scratch.data(), before[i].size());
+        if (std::memcmp(scratch.data(), before[i].data(), before[i].size()) !=
             0)
           throw std::runtime_error(
               "patch_code_batch rollback verification failed");
@@ -1775,14 +2004,101 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
   return true;
 }
 
-void Process::remote_free(std::uintptr_t address, std::size_t size) {
+bool Process::retired_code_quiescent(const TracerRetiredCode &code) {
+  ensure_usable();
+  for (const auto &range : code.ranges)
+    if (!range.begin || range.begin >= range.end)
+      return false;
+  PeerFreeze peers(*this);
+  std::vector<std::pair<std::uintptr_t, std::uintptr_t>> readable;
+  std::ifstream maps("/proc/" + std::to_string(process_id_) + "/maps");
+  for (std::string line; std::getline(maps, line);) {
+    std::istringstream row(line);
+    std::uintptr_t begin = 0, end = 0;
+    char dash = 0;
+    std::string permissions;
+    if (row >> std::hex >> begin >> dash >> end >> permissions &&
+        dash == '-' && !permissions.empty() && permissions.front() == 'r')
+      readable.emplace_back(begin, end);
+  }
+  const auto references = [&](const void *data, std::size_t size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
+    for (std::size_t i = 0; i + sizeof(std::uintptr_t) <= size; i += sizeof(std::uintptr_t)) {
+      std::uintptr_t value = 0;
+      std::memcpy(&value, bytes + i, sizeof(value));
+      for (const auto &range : code.ranges)
+        if (value >= range.begin && value < range.end)
+          return true;
+    }
+    return false;
+  };
+  const auto clean = [&](pid_t tid, int pending) {
+    if (pending)
+      return false;
+    const auto registers = read_registers(tid);
+    if (references(&registers.general, sizeof(registers.general)) ||
+        references(registers.xstate.data(), registers.xstate.size()))
+      return false;
+    const auto sp = static_cast<std::uintptr_t>(object_target::sp(registers.general)) & ~std::uintptr_t{7};
+    const auto map = std::find_if(readable.begin(), readable.end(), [&](const auto &range) {
+      return range.first <= sp && sp < range.second;
+    });
+    if (map == readable.end() || map->second - sp > 128 * 1024)
+      return false;
+    const auto start = std::max(map->first, sp >= 128 ? sp - 128 : sp);
+    std::vector<unsigned char> stack(map->second - start);
+    iovec local{stack.data(), stack.size()};
+    iovec remote{reinterpret_cast<void *>(start), stack.size()};
+    return linux_api::process_vm_readv(process_id_, &local, 1, &remote, 1, 0) ==
+               static_cast<ssize_t>(stack.size()) && !references(stack.data(), stack.size());
+  };
+  const bool result = clean(tid_, pending_signal_) &&
+      std::all_of(peers.peers.begin(), peers.peers.end(), [&](const auto &peer) {
+        return !peer.stopped || clean(peer.tid, peer.pending_signal);
+      });
+  peers.release();
+  return result;
+}
+
+std::uintptr_t Process::remote_map_file(std::string_view path, std::size_t size) {
+  const auto scratch_size = path.size() + 1;
+  const auto scratch = remote_allocate(scratch_size);
+  std::uintptr_t fd = static_cast<std::uintptr_t>(-1);
+  std::uintptr_t address = 0;
+  try {
+    remote_write(scratch, path.data(), path.size()); // mmap supplies the trailing zero.
+    fd = remote_syscall(SYS_openat, {static_cast<std::uintptr_t>(AT_FDCWD), scratch,
+                                    O_RDONLY | O_CLOEXEC, 0, 0, 0});
+    address = remote_syscall(SYS_mmap, {0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0});
+    const auto closing = std::exchange(fd, static_cast<std::uintptr_t>(-1));
+    (void)remote_syscall(SYS_close, {closing, 0, 0, 0, 0, 0});
+    remote_free(scratch, scratch_size);
+    return address;
+  } catch (...) {
+    if (!unsafe()) {
+      try {
+        if (address)
+          remote_free(address, size);
+        if (fd != static_cast<std::uintptr_t>(-1))
+          (void)remote_syscall(SYS_close, {fd, 0, 0, 0, 0, 0});
+        remote_free(scratch, scratch_size);
+      } catch (...) {
+        mark_unsafe();
+      }
+    }
+    throw;
+  }
+}
+
+void Process::remote_free(std::uintptr_t address, std::size_t size,
+                          const std::function<void()> &verify) {
   ensure_usable();
   if (address == 0 || size == 0) {
     throw std::invalid_argument(
         "remote_free requires a nonzero address and size");
   }
   const std::array<std::uintptr_t, 6> arguments{address, size, 0, 0, 0, 0};
-  if (remote_syscall(SYS_munmap, arguments) != 0) {
+  if (remote_syscall(SYS_munmap, arguments, verify) != 0) {
     throw std::runtime_error(
         "remote munmap returned an unexpected nonzero result");
   }
@@ -1812,26 +2128,45 @@ std::uintptr_t Process::remote_allocate(std::size_t size) {
 
 std::uintptr_t
 Process::remote_syscall(long number,
-                        const std::array<std::uintptr_t, 6> &arguments) {
+                        const std::array<std::uintptr_t, 6> &arguments,
+                        const std::function<void()> &verify) {
   ensure_usable();
   if (patch_only_)
     throw std::logic_error("patch-only attachment cannot execute a remote syscall");
   PeerFreeze peers(*this);
+  if (verify)
+    verify();
   const auto saved = read_registers(tid_);
   const auto saved_signal_mask = read_signal_mask(tid_);
-  const auto ip = register_ip(saved.general);
   constexpr auto stub = syscall_stub;
+  const auto saved_ip = register_ip(saved.general);
+#if defined(__x86_64__)
+  // Keep the stub and ptrace read inside the word containing RIP. Move the
+  // stub to the word's start whenever it would cross a word boundary, which
+  // also prevents crossing an executable page boundary.
+  constexpr auto read_size = sizeof(long);
+  static_assert(stub.size() <= read_size);
+  const auto read_address = saved_ip - saved_ip % read_size;
+  const auto ip = saved_ip - read_address + stub.size() <= read_size
+                      ? saved_ip
+                      : read_address;
+#else
+  const auto ip = saved_ip;
+  const auto read_address = ip;
+  constexpr auto read_size = stub.size();
+#endif
   if (peers.contains_instruction(ip, stub.size())) {
     throw std::runtime_error("cannot install native syscall stub while a "
                              "thread is inside its bytes");
   }
-  const auto original = read_remote(tid_, ip, stub.size());
+  const auto original = read_remote(tid_, read_address, read_size);
   auto modified = saved;
 #if defined(__aarch64__)
   modified.syscall_number = -1;
   std::copy(arguments.begin(), arguments.end(), modified.general.regs);
   modified.general.regs[8] = static_cast<std::uint64_t>(number);
 #else
+  modified.general.rip = ip;
   modified.general.rax = static_cast<unsigned long long>(number);
   modified.general.orig_rax = static_cast<unsigned long long>(-1);
   modified.general.rdi = arguments[0];
@@ -1923,7 +2258,7 @@ Process::remote_syscall(long number,
       write_signal_mask(tid_, saved_signal_mask);
     }
     if (code_changed) {
-      write_remote(tid_, ip, original.data(), original.size());
+      write_remote(tid_, ip, original.data() + (ip - read_address), stub.size());
     }
     write_registers(tid_, saved);
   } catch (const std::exception &error) {
@@ -2140,6 +2475,7 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::invalid_argument(
         "symbol name must be nonempty and contain no NUL byte");
   }
+#if defined(__aarch64__)
   std::string symbol_name(name);
   const auto remote_maps = read_maps(process_id_);
   ::dlerror();
@@ -2266,6 +2602,30 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     }
   }
   return remote_symbol;
+#else
+  const auto entry = target_runtime_entry(process_id_, name);
+  decltype(entry.bytes) live{};
+  remote_read(entry.address, live.data(), live.size());
+  if (owned_patch) {
+    // A second shared probe sees this session's installed pthread adapter.
+    // Verify its live bytes before substituting the original entry for comparison.
+    if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
+        owned_patch->address < entry.address || owned_patch->address - entry.address > 4 ||
+        !owned_patch->size ||
+        owned_patch->size > live.size() - (owned_patch->address - entry.address)) {
+      throw std::runtime_error("invalid owned runtime patch identity");
+    }
+    const auto offset = owned_patch->address - entry.address;
+    if (std::memcmp(live.data() + offset, owned_patch->replacement, owned_patch->size) != 0) {
+      throw std::runtime_error("owned runtime patch bytes changed");
+    }
+    std::memcpy(live.data() + offset, owned_patch->expected, owned_patch->size);
+  }
+  if (live != entry.bytes) {
+    throw std::runtime_error("runtime entry instructions do not match");
+  }
+  return entry.address;
+#endif
 }
 
 } // namespace tracer::injector

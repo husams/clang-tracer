@@ -1,15 +1,16 @@
+#include "tracer/compat.hpp"
 #include "object_watch_plan.hpp"
 #include "object_code_cache_protocol.hpp"
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/LEB128.h>
 
 #include "debug_resolver.hpp"
+#include "admission.hpp"
 #include "proc_identity.hpp"
 #include "linux_syscalls.hpp"
 #include "native_detour.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <charconv>
 #include <cctype>
 #include <cstring>
@@ -44,6 +45,10 @@ namespace dw = llvm::dwarf;
 using llvm::DWARFDie;
 using llvm::object::ObjectFile;
 
+struct MissingElfSymbol : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 auto open_elf(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
@@ -59,20 +64,54 @@ std::string name(DWARFDie die) {
 }
 
 std::string leaf_name(const std::string &qualified_name) {
-  const auto scope = qualified_name.rfind("::");
+  std::size_t scope = std::string::npos;
+  unsigned depth = 0;
+  for (std::size_t index = 0; index < qualified_name.size(); ++index) {
+    const auto character = qualified_name[index];
+    if (character == '<')
+      ++depth;
+    else if (character == '>' && depth)
+      --depth;
+    else if (character == ':' && !depth && index + 1 < qualified_name.size() &&
+             qualified_name[index + 1] == ':') {
+      // A scope in a template argument is part of the record's leaf name.
+      scope = index++;
+    }
+  }
   return scope == std::string::npos ? qualified_name : qualified_name.substr(scope + 2);
 }
 
 std::string qualified(DWARFDie die) {
   if (!die)
     return {};
-  std::string result = name(die);
-  for (auto parent = die.getParent(); parent; parent = parent.getParent()) {
-    if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
-        parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
-      result = name(parent) + "::" + result;
-    } else if (parent.getTag() != dw::DW_TAG_compile_unit) {
-      return {};
+  const auto from_scope = [](DWARFDie current) {
+    std::string result = name(current);
+    for (auto parent = current.getParent(); parent; parent = parent.getParent()) {
+      if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
+          parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
+        result = name(parent) + "::" + result;
+      } else if (parent.getTag() != dw::DW_TAG_compile_unit &&
+                 parent.getTag() != dw::DW_TAG_type_unit) {
+        return std::string{};
+      }
+    }
+    return result;
+  };
+  auto result = from_scope(die);
+  // A DWARF4 type-unit DIE may be rooted at the type unit, with the source
+  // namespace recorded only on its specification in .debug_info.
+  llvm::SmallVector<DWARFDie, 4> pending{die};
+  std::set<DWARFDie> seen{die};
+  for (std::size_t index = 0; index < pending.size(); ++index) {
+    for (const auto attr : {dw::DW_AT_specification, dw::DW_AT_abstract_origin}) {
+      const auto related = pending[index].getAttributeValueAsReferencedDie(attr);
+      if (!related || !seen.insert(related).second)
+        continue;
+      pending.push_back(related);
+      const auto candidate = from_scope(related);
+      if (name(related) == name(die) && candidate.find("::") != std::string::npos &&
+          (result.find("::") == std::string::npos || candidate.size() > result.size()))
+        result = candidate;
     }
   }
   return result;
@@ -98,6 +137,64 @@ bool record(DWARFDie die) {
                  die.getTag() == dw::DW_TAG_union_type);
 }
 
+// A standard-library specialization can contain program-defined code when it
+// depends on an application type. Inspect the DWARF arguments and enclosing
+// records even when Clang emits simple template names.
+bool standard_library_type(DWARFDie die, unsigned depth = 0) {
+  if (!die || depth == 16)
+    return false;
+  switch (die.getTag()) {
+  case dw::DW_TAG_base_type:
+    return true;
+  case dw::DW_TAG_pointer_type:
+    if (!die.find(dw::DW_AT_type))
+      return true; // void *
+    [[fallthrough]];
+  case dw::DW_TAG_typedef:
+  case dw::DW_TAG_const_type:
+  case dw::DW_TAG_volatile_type:
+  case dw::DW_TAG_array_type:
+  case dw::DW_TAG_reference_type:
+  case dw::DW_TAG_rvalue_reference_type:
+  case dw::DW_TAG_template_type_parameter:
+    return standard_library_type(die.resolveReferencedType(dw::DW_AT_type), depth + 1);
+  case dw::DW_TAG_template_value_parameter:
+    return die.find(dw::DW_AT_const_value) &&
+        standard_library_type(die.resolveReferencedType(dw::DW_AT_type), depth + 1);
+  case dw::DW_TAG_GNU_template_parameter_pack:
+    return ::tracer::compat::ranges::all_of(die.children(), [&](DWARFDie argument) {
+      return standard_library_type(argument, depth + 1);
+    });
+  default:
+    break;
+  }
+  for (auto scope = die; scope; scope = scope.getParent()) {
+    if (scope.getTag() == dw::DW_TAG_namespace) {
+      if (name(scope) == "std" && scope.getParent().getTag() == dw::DW_TAG_compile_unit)
+        return true;
+      continue;
+    }
+    if (!record(scope) && scope.getTag() != dw::DW_TAG_enumeration_type)
+      return false;
+    bool saw_arguments = false;
+    for (const auto child : scope.children()) {
+      const auto tag = child.getTag();
+      if (tag == dw::DW_TAG_GNU_template_template_param)
+        return false;
+      if (tag != dw::DW_TAG_template_type_parameter &&
+          tag != dw::DW_TAG_template_value_parameter &&
+          tag != dw::DW_TAG_GNU_template_parameter_pack)
+        continue;
+      if (!standard_library_type(child, depth + 1))
+        return false;
+      saw_arguments = true;
+    }
+    if (!saw_arguments && name(scope).find('<') != std::string::npos)
+      return false;
+  }
+  return false;
+}
+
 std::optional<std::uint64_t> size_of(DWARFDie die) {
   if (!die)
     return std::nullopt;
@@ -109,6 +206,7 @@ std::optional<std::uint64_t> size_of(DWARFDie die) {
 
 DWARFDie find_record(llvm::DWARFContext &dwarf, const std::string &wanted,
                      llvm::DWARFUnit *preferred = nullptr) {
+  const auto wanted_leaf = leaf_name(wanted);
   std::vector<DWARFDie> pending;
   if (preferred) {
     pending.push_back(preferred->getUnitDIE(false));
@@ -121,7 +219,7 @@ DWARFDie find_record(llvm::DWARFContext &dwarf, const std::string &wanted,
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      if (record(child) && name(child) == leaf_name(wanted) &&
+      if (record(child) && name(child) == wanted_leaf &&
           qualified(child) == wanted && number(child, dw::DW_AT_byte_size)) {
         if (result)
           throw std::runtime_error("ambiguous DWARF record: " + wanted);
@@ -168,6 +266,69 @@ bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
   return false;
 }
 
+enum class CallerKind { unknown, constructor_or_destructor, ordinary };
+
+CallerKind classify_linkage_name(std::string_view linkage) {
+  if (!::tracer::compat::starts_with(linkage, "_Z")) {
+    if (linkage.empty() ||
+        !(std::isalpha(static_cast<unsigned char>(linkage.front())) || linkage.front() == '_') ||
+        !std::all_of(linkage.begin() + 1, linkage.end(), [](unsigned char c) {
+          return std::isalnum(c) || c == '_';
+        }))
+      return CallerKind::unknown;
+    return CallerKind::ordinary;
+  }
+  // Compiler-created cold and specialized clones keep the mangled callable
+  // before the first suffix, including its constructor/destructor variant.
+  const std::string storage(linkage.substr(0, linkage.find('.')));
+  llvm::ItaniumPartialDemangler parsed;
+  if (parsed.partialDemangle(storage.c_str()))
+    return CallerKind::unknown;
+  return parsed.isCtorOrDtor() ? CallerKind::constructor_or_destructor : CallerKind::ordinary;
+}
+
+CallerKind classify_dwarf_caller(DWARFDie function) {
+  if (function && function.getTag() == dw::DW_TAG_inlined_subroutine) {
+    auto origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
+    if (!origin)
+      origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
+    if (!origin)
+      return CallerKind::unknown;
+    function = origin;
+  }
+  while (function && function.getTag() != dw::DW_TAG_subprogram)
+    function = function.getParent();
+  if (!function)
+    return CallerKind::unknown;
+  llvm::SmallVector<DWARFDie, 4> declarations{function};
+  for (std::size_t index = 0; index < declarations.size(); ++index) {
+    const auto die = declarations[index];
+    for (const auto attr : {dw::DW_AT_abstract_origin, dw::DW_AT_specification})
+      if (auto related = die.getAttributeValueAsReferencedDie(attr);
+          related && std::find(declarations.begin(), declarations.end(), related) == declarations.end())
+        declarations.push_back(related);
+  }
+  for (const auto declaration : declarations)
+    if (const auto *linkage = declaration.getLinkageName())
+      return classify_linkage_name(linkage);
+  // A missing linkage name is not enough to classify the caller. The caller
+  // proof can fall back to one ELF function symbol covering the call site.
+  for (const auto declaration : declarations) {
+    if (declaration.findRecursively({dw::DW_AT_object_pointer}))
+      return CallerKind::unknown;
+    auto parent = declaration.getParent();
+    while (parent && parent.getTag() == dw::DW_TAG_namespace)
+      parent = parent.getParent();
+    if (record(parent)) {
+      const auto scope = name(parent);
+      const auto function_name = name(declaration);
+      if (function_name == scope || function_name == "~" + scope)
+        return CallerKind::constructor_or_destructor;
+    }
+  }
+  return CallerKind::unknown;
+}
+
 bool may_aggregate_initialize_base(DWARFDie derived) {
   const auto class_name = name(derived);
   const auto constructor = class_name.substr(0, class_name.find('<'));
@@ -191,18 +352,30 @@ bool may_aggregate_initialize_base(DWARFDie derived) {
 DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concrete) {
   DerivedTypes result;
   std::vector<DWARFDie> pending;
-  for (const auto &unit : dwarf.compile_units())
+  for (const auto &unit : dwarf.normal_units())
     pending.push_back(unit->getUnitDIE(false));
   while (!pending.empty()) {
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      if (child.getTag() == dw::DW_TAG_inheritance && qualified(type(child)) == concrete) {
-        result.present = true;
-        if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
-          result.may_construct_base_directly = true;
+      const auto tag = child.getTag();
+      if (tag == dw::DW_TAG_inheritance) {
+        // Signature references can resolve to a definition at the type-unit
+        // root. Its specification retains the enclosing namespace.
+        auto base = child.resolveReferencedType(dw::DW_AT_type);
+        if (const auto declaration = base ? base.getAttributeValueAsReferencedDie(dw::DW_AT_specification)
+                                          : DWARFDie{};
+            record(declaration))
+          base = declaration;
+        if (qualified(base) == concrete) {
+          result.present = true;
+          if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
+            result.may_construct_base_directly = true;
+        }
       }
-      if (record(child) || (child.getTag() == dw::DW_TAG_namespace && name(child) != "std"))
+      if (record(child) || (tag == dw::DW_TAG_namespace && name(child) != "std") ||
+          tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_lexical_block ||
+          tag == dw::DW_TAG_inlined_subroutine)
         pending.push_back(child);
     }
   }
@@ -217,15 +390,15 @@ std::string storage_spelling(std::string_view type, unsigned depth = 0) {
     return "?";
   type = type.substr(first, type.find_last_not_of(" \t") - first + 1);
   for (const std::string_view qualifier : {"const ", "volatile ", "class ", "struct "})
-    if (type.starts_with(qualifier))
+    if (::tracer::compat::starts_with(type, qualifier))
       return storage_spelling(type.substr(qualifier.size()), depth + 1);
   for (const std::string_view qualifier : {" const", " volatile"})
-    if (type.ends_with(qualifier))
+    if (::tracer::compat::ends_with(type, qualifier))
       return storage_spelling(type.substr(0, type.size() - qualifier.size()), depth + 1);
-  if (type.ends_with("*"))
+  if (::tracer::compat::ends_with(type, "*"))
     return "*" + storage_spelling(type.substr(0, type.size() - 1), depth + 1);
   const auto angle = type.find('<');
-  if (angle != std::string_view::npos && type.ends_with(">")) {
+  if (angle != std::string_view::npos && ::tracer::compat::ends_with(type, ">")) {
     std::string result(type.substr(0, angle));
     const auto args = type.substr(angle + 1, type.size() - angle - 2);
     std::size_t start = 0;
@@ -267,7 +440,7 @@ std::string storage_spelling(std::string_view type, unsigned depth = 0) {
         return std::isdigit(c) != 0;
       }))
     return "#" + std::string(type);
-  return std::string(type.starts_with("::") ? type.substr(2) : type);
+  return std::string(::tracer::compat::starts_with(type, "::") ? type.substr(2) : type);
 }
 
 std::string storage_type(DWARFDie die, unsigned depth = 0) {
@@ -450,13 +623,49 @@ void verify_receiver_storage(llvm::DWARFContext &dwarf, llvm::DWARFUnit *unit,
             return item.base() == base && (base ? item.type() : item.name()) == name_key;
           });
       const auto offset = number(child, dw::DW_AT_data_member_location);
-      if (found == layout->members().end() || found->needs_dynamic_location() ||
-          child.find(dw::DW_AT_bit_size) || !offset || *offset > UINT64_MAX / 8 ||
-          *offset * 8 != found->offset_bits() || found->type().find('?') != std::string::npos ||
-          found->type() != member_type || (!base && storage_size(type(child)) != found->bytes()))
-        throw std::runtime_error("source layout differs or is unverified for " + identity + "::" +
-            name_key + " (DWARF type " + member_type + ", source type " +
-            (found == layout->members().end() ? "<absent>" : found->type()) + ")");
+      const bool absent = found == layout->members().end();
+      const auto dwarf_bytes = base ? std::optional<std::uint64_t>{} : storage_size(type(child));
+      const bool dynamic = !absent && found->needs_dynamic_location();
+      const bool bitfield = child.find(dw::DW_AT_bit_size).has_value();
+      const bool bad_offset = !offset || *offset > UINT64_MAX / 8 ||
+          (!absent && *offset * 8 != found->offset_bits());
+      const bool unknown_source_type = !absent && found->type().find('?') != std::string::npos;
+      const bool type_mismatch = !absent && found->type() != member_type;
+      const bool size_mismatch = !base && !absent &&
+          (!dwarf_bytes || *dwarf_bytes != found->bytes());
+      if (absent || dynamic || bitfield || bad_offset || unknown_source_type ||
+          type_mismatch || size_mismatch) {
+        std::ostringstream message;
+        message << "source layout differs or is unverified for " << identity << "::" << name_key
+                << " (DWARF type " << member_type << ", source type "
+                << (absent ? "<absent>" : found->type());
+        if (!absent) {
+          message << ", DWARF offset_bits ";
+          if (!offset || *offset > UINT64_MAX / 8)
+            message << "<unavailable>";
+          else
+            message << *offset * 8;
+          message << ", source offset_bits " << found->offset_bits();
+          if (!base) {
+            message << ", DWARF bytes ";
+            if (dwarf_bytes)
+              message << *dwarf_bytes;
+            else
+              message << "<unavailable>";
+            message << ", source bytes " << found->bytes();
+          }
+          if (dynamic)
+            message << ", source location is dynamic";
+          if (bitfield)
+            message << ", DWARF member is a bitfield";
+          if (unknown_source_type)
+            message << ", source type contains an unverified '?' spelling";
+          if (type_mismatch)
+            message << ", canonical type spellings differ";
+        }
+        message << ')';
+        throw std::runtime_error(message.str());
+      }
     }
     if (actual_members.size() != static_cast<std::size_t>(layout->members_size()))
       throw std::runtime_error("source layout members differ from DWARF: " + identity);
@@ -512,8 +721,16 @@ Member member(DWARFDie parent, const std::string &wanted) {
   return matches.front();
 }
 
+struct LocatedUnion {
+  std::optional<Member> storage;
+  std::string path;
+};
+
 Member nested_member(DWARFDie parent, std::string_view path, bool &opaque_union,
-                     DWARFDie *direct_union = nullptr) {
+                     LocatedUnion *selected_union = nullptr) {
+  const auto original = path;
+  if (selected_union && parent.getTag() == dw::DW_TAG_union_type)
+    selected_union->storage = Member{parent, 0};
   std::uint64_t offset = 0;
   while (true) {
     opaque_union |= parent.getTag() == dw::DW_TAG_union_type;
@@ -522,11 +739,13 @@ Member nested_member(DWARFDie parent, std::string_view path, bool &opaque_union,
     if (selected.offset > UINT64_MAX - offset)
       throw std::runtime_error("nested object field offset overflows");
     offset += selected.offset;
-    if (split == std::string_view::npos) {
-      if (direct_union && parent.getTag() == dw::DW_TAG_union_type && selected.offset == 0)
-        *direct_union = parent;
-      return {selected.type, offset};
+    if (selected_union && !selected_union->storage && selected.type.getTag() == dw::DW_TAG_union_type) {
+      selected_union->storage = Member{selected.type, offset};
+      selected_union->path = original.substr(0, original.size() - path.size() +
+                                             std::min(split, path.size()));
     }
+    if (split == std::string_view::npos)
+      return {selected.type, offset};
     parent = selected.type;
     path.remove_prefix(split + 1);
   }
@@ -576,7 +795,7 @@ bool writer_receiver(DWARFDie function, std::uint64_t entry, const std::string &
     const auto encoding = storage_type(result);
     if (!scalar_result || !(encoding == "bool" || encoding == "signed32" || encoding == "unsigned32" ||
                            encoding == "signed64" || encoding == "unsigned64" ||
-                           encoding.starts_with("*") || encoding.starts_with("&")))
+                           ::tracer::compat::starts_with(encoding, "*") || ::tracer::compat::starts_with(encoding, "&")))
       return false; // A hidden result argument can change the receiver register.
   }
   for (const auto parameter : function.children()) {
@@ -657,11 +876,11 @@ struct InlineAnchors {
 };
 
 std::optional<InlineAnchors> verified_inline_region(const native_entry::Preview &body,
-    std::span<const InlineMutation::Range> ranges) {
+    ::tracer::compat::span<const InlineMutation::Range> ranges) {
   if (ranges.empty() || body.instructions.empty() || body.decode_failed || !body.diagnostic.empty())
     return std::nullopt;
   const auto containing = [&](std::uint64_t pc) {
-    return std::ranges::find_if(ranges, [&](const auto &range) {
+    return std::find_if(std::begin(ranges), std::end(ranges), [&](const auto &range) {
       return range.first <= pc && pc < range.second;
     });
   };
@@ -698,8 +917,8 @@ std::optional<InlineAnchors> verified_inline_region(const native_entry::Preview 
       edge(*inst.target);
   }
   if (entries.size() != 1 || exits.empty() ||
-      !std::ranges::includes(instructions, exits) ||
-      std::ranges::any_of(ranges, [&](const auto &range) {
+      !std::includes(instructions.begin(), instructions.end(), exits.begin(), exits.end()) ||
+      std::any_of(std::begin(ranges), std::end(ranges), [&](const auto &range) {
         return !instructions.count(range.first) || !boundaries.count(range.second);
       }))
     return std::nullopt;
@@ -762,7 +981,7 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
         }
         if (ranges->empty())
           throw std::runtime_error("inlined collection mutation has no verified code range");
-        std::ranges::sort(*ranges, {}, &llvm::DWARFAddressRange::LowPC);
+        std::sort(ranges->begin(), ranges->end(), [](const auto &a, const auto &b) { return a.LowPC < b.LowPC; });
         std::vector<InlineMutation::Range> code;
         for (const auto &range : *ranges) {
           if (range.LowPC >= range.HighPC || range.HighPC > UINT64_MAX - bias ||
@@ -784,7 +1003,7 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
         if (!anchors || !receiver)
           throw std::runtime_error("inlined collection mutation requires a verified receiver and continuation");
         const auto begin = anchors->begin;
-        const auto span = std::ranges::find_if(code, [&](const auto &range) {
+        const auto span = std::find_if(std::begin(code), std::end(code), [&](const auto &range) {
           return range.first <= begin && begin < range.second;
         });
         result.push_back({begin, span->second, receiver->first, receiver->second,
@@ -807,7 +1026,7 @@ DWARFDie first_type_parameter(DWARFDie type_info) {
 }
 
 bool verified_string_type(DWARFDie field) {
-  return qualified(field).starts_with("std::__cxx11::basic_string<char,") ||
+  return ::tracer::compat::starts_with(qualified(field), "std::__cxx11::basic_string<char,") ||
          qualified(field) == "std::__cxx11::basic_string<char>";
 }
 
@@ -847,13 +1066,13 @@ void inspect_variant_write(Layout &layout, DWARFDie field) {
   const auto selector = member(field, "_M_index");
   const auto selector_width = size_of(selector.type).value_or(0);
   if ((selector_width != 1 && selector_width != 2 && selector_width != 4) ||
-      !storage_type(selector.type).starts_with("unsigned"))
+      !::tracer::compat::starts_with(storage_type(selector.type), "unsigned"))
     throw std::runtime_error("cannot verify the std::variant active index");
   auto storage = member(field, "_M_u");
   layout.value_write.selector = selector.offset;
   layout.value_write.selector_width = selector_width;
   for (std::uint64_t index = 0;
-       qualified(storage.type).starts_with("std::__detail::__variant::_Variadic_union<");
+       ::tracer::compat::starts_with(qualified(storage.type), "std::__detail::__variant::_Variadic_union<");
        ++index) {
     // Recent libstdc++ versions keep a bool template argument even in
     // the terminal union. A complete terminal union contains no members.
@@ -891,7 +1110,7 @@ void set_field_layout(Layout &layout, DWARFDie field) {
   if (verified_string_type(field)) {
     complex.kind = ValueWriteKind::string;
     complex.string = inspect_string_write(field);
-  } else if (identity.starts_with("std::variant<")) {
+  } else if (::tracer::compat::starts_with(identity, "std::variant<")) {
     complex.kind = ValueWriteKind::variant;
     inspect_variant_write(layout, field);
   } else if (identity == "std::any") {
@@ -927,9 +1146,9 @@ void set_field_layout(Layout &layout, DWARFDie field) {
   using FieldType = Layout::FieldType;
   if (encoding == "signed32")
     layout.field_type = FieldType::int32;
-  else if (std::string_view(encoding).starts_with("signed"))
+  else if (::tracer::compat::starts_with(encoding, "signed"))
     layout.field_type = FieldType::signed_integer;
-  else if (std::string_view(encoding).starts_with("unsigned") || encoding == "char")
+  else if (::tracer::compat::starts_with(encoding, "unsigned") || encoding == "char")
     layout.field_type = FieldType::unsigned_integer;
   else if (encoding == "bool" && *bytes == 1)
     layout.field_type = FieldType::boolean;
@@ -940,9 +1159,126 @@ void set_field_layout(Layout &layout, DWARFDie field) {
   layout.field_width = *bytes;
 }
 
+std::optional<Layout> inspect_union_field(DWARFDie owner,
+    const clangtracer::v1::ObjectWatchRequest &request, const LocatedUnion &selected,
+    const Member &leaf, bool allow_legacy) {
+  if (!selected.storage) {
+    if (!request.union_tag().empty())
+      throw std::runtime_error("tagged capture requires --field to select union storage");
+    return std::nullopt;
+  }
+  const auto &storage = *selected.storage;
+  const auto size = size_of(storage.type).value_or(0);
+  if (!size || !request.owner_type().empty())
+    throw std::runtime_error("union watches require verified storage in a record, collection or pointee");
+  Layout result{};
+  result.scalar = storage.offset;
+  result.opaque_union = true;
+  result.union_path = selected.path;
+  using Type = UnionCase::Type;
+  auto &layout = result.value_write;
+  layout.kind = ValueWriteKind::union_storage;
+  layout.size = size;
+  // Keep the established event format for existing four-byte member watches.
+  const auto member_start = selected.path.empty() ? 0 : selected.path.size() + 1;
+  bool legacy = allow_legacy && !request.first_seen() &&
+      size == 4 && size_of(leaf.type) == 4 && leaf.offset == storage.offset &&
+      selected.path.size() < request.field().size() &&
+      request.field().find('.', member_start) == std::string::npos;
+  if (!request.union_tag().empty()) {
+    bool tag_in_union = false;
+    const auto tag = nested_member(owner, request.union_tag(), tag_in_union);
+    const auto tag_type = tag.type.getTag() == dw::DW_TAG_enumeration_type ? type(tag.type) : tag.type;
+    const auto encoding = storage_type(tag_type);
+    const auto width = size_of(tag_type).value_or(0);
+    const bool signed_tag = ::tracer::compat::starts_with(encoding, "signed");
+    if (tag_in_union || (width != 1 && width != 2 && width != 4 && width != 8) ||
+        !(signed_tag || ::tracer::compat::starts_with(encoding, "unsigned") || encoding == "bool") ||
+        (tag.offset < storage.offset + size && storage.offset < tag.offset + width))
+      throw std::runtime_error("union tag must be a verified nonoverlapping integral or enum field");
+    layout.selector_before = tag.offset < storage.offset;
+    layout.selector = layout.selector_before ? storage.offset - tag.offset : tag.offset - storage.offset;
+    layout.selector_width = width;
+    legacy = legacy && encoding == "unsigned32";
+    const auto mask = width == 8 ? UINT64_MAX : (std::uint64_t{1} << (8 * width)) - 1;
+    for (const auto &entry : request.union_cases()) {
+      if (entry.member().empty() || entry.member().size() > 512 ||
+          entry.member().find('\0') != std::string::npos)
+        throw std::runtime_error("invalid union case member name");
+      auto tag_bits = entry.has_tag_bits() ? entry.tag_bits() : entry.tag();
+      if (tag_bits > mask && !(signed_tag && (tag_bits | mask) == UINT64_MAX &&
+                               (tag_bits & (std::uint64_t{1} << (8 * width - 1)))))
+        throw std::runtime_error("union case tag exceeds the discriminator representation");
+      tag_bits &= mask;
+      if (encoding == "bool" && tag_bits > 1)
+        throw std::runtime_error("union case tag exceeds the bool representation");
+      bool nested_union = false;
+      const auto split = entry.member().find('.');
+      auto alternative = member(storage.type, entry.member().substr(0, split));
+      if (split != std::string::npos) {
+        const auto child = nested_member(alternative.type,
+            std::string_view(entry.member()).substr(split + 1), nested_union);
+        alternative = {child.type, alternative.offset + child.offset};
+      }
+      const auto bytes = storage_size(alternative.type).value_or(0);
+      const auto underlying = alternative.type.getTag() == dw::DW_TAG_enumeration_type ?
+          type(alternative.type) : alternative.type;
+      const auto scalar = storage_type(underlying);
+      auto kind = Type::opaque;
+      if (!nested_union && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8)) {
+        if (::tracer::compat::starts_with(scalar, "signed"))
+          kind = Type::signed_integer;
+        else if (::tracer::compat::starts_with(scalar, "unsigned"))
+          kind = Type::unsigned_integer;
+        else if (scalar == "float32" || scalar == "float64")
+          kind = Type::real;
+        else if (scalar == "bool")
+          kind = Type::boolean;
+      }
+      if (!bytes || alternative.offset > size || bytes > size - alternative.offset ||
+          !result.union_cases.emplace(tag_bits, UnionCase{entry.member(), kind,
+              kind == Type::opaque ? 0u : static_cast<unsigned>(bytes)}).second)
+        throw std::runtime_error("union cases require verified member ranges and distinct tags");
+      ValueWriteAlternative value{};
+      value.selector = tag_bits;
+      value.offset = alternative.offset;
+      value.size = bytes;
+      value.scalar = kind != Type::opaque;
+      result.value_alternatives.push_back(value);
+      legacy = legacy && alternative.offset == 0 && bytes == 4 &&
+          kind != Type::opaque && kind != Type::boolean;
+    }
+    if (legacy)
+      result.union_tag_offset = tag.offset;
+  }
+  if (legacy) {
+    layout = {};
+    result.value_alternatives.clear();
+    if (!result.union_tag_offset)
+      result.union_path.clear();
+  }
+  return result;
+}
+
+Layout inspect_value_field(DWARFDie parent, const clangtracer::v1::ObjectWatchRequest &request,
+                           bool whole_value = false) {
+  bool opaque = false;
+  LocatedUnion selected;
+  const auto field = whole_value ? Member{parent, 0} :
+      nested_member(parent, request.field(), opaque, &selected);
+  if (whole_value && parent.getTag() == dw::DW_TAG_union_type)
+    selected = {field, request.field()};
+  if (auto layout = inspect_union_field(parent, request, selected, field, false))
+    return std::move(*layout);
+  Layout result{};
+  result.scalar = field.offset;
+  set_field_layout(result, field.type);
+  return result;
+}
+
 Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto vector = member(owner, request.vector_field());
-  if (!qualified(vector.type).starts_with("std::vector<"))
+  if (!::tracer::compat::starts_with(qualified(vector.type), "std::vector<"))
     throw std::runtime_error("logical element capture requires a libstdc++ vector");
   const auto implementation = member(vector.type, "_M_impl");
   const auto begin = member(implementation.type, "_M_start");
@@ -955,16 +1291,21 @@ Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest 
       storage_type(begin.type) != storage_type(end.type) ||
       storage_type(begin.type) != storage_type(capacity.type))
     throw std::runtime_error("vector storage pointers or element layout could not be verified");
-  bool opaque_union = false;
-  const auto scalar = nested_member(element, request.field(), opaque_union);
   const auto key = member(element, request.element_key_field());
-  if (storage_type(key.type) != "unsigned32" || opaque_union)
-    throw std::runtime_error("logical vector requires a uint32 key and a non-union value");
-  Layout result{};
-  set_field_layout(result, scalar.type);
-  if (scalar.offset < key.offset + 4 && key.offset < scalar.offset + result.field_size())
+  if (storage_type(key.type) != "unsigned32")
+    throw std::runtime_error("logical vector requires a uint32 key");
+  auto result = inspect_value_field(element, request);
+  const auto overlaps_key = [&](auto offset, auto size) {
+    return offset < key.offset + 4 && key.offset < offset + size;
+  };
+  if (overlaps_key(result.scalar, result.field_size()))
     throw std::runtime_error("logical vector key and value overlap");
-  result.scalar = scalar.offset;
+  const auto &storage = result.value_write;
+  if (storage.kind == ValueWriteKind::union_storage && storage.selector_width) {
+    const auto tag = storage.selector_before ? result.scalar - storage.selector : result.scalar + storage.selector;
+    if (overlaps_key(tag, storage.selector_width))
+      throw std::runtime_error("logical vector key and union tag overlap");
+  }
   result.key_offset = key.offset;
   result.stride = *stride;
   result.vector_object = vector.offset;
@@ -1011,7 +1352,7 @@ DWARFDie container_node(DWARFDie container, DWARFDie pair, std::string_view pref
         pending.push_back(child);
       } else if (record(child) && size_of(child)) {
         const auto type_name = storage_type(child);
-        if (type_name == node_name || type_name.starts_with(node_name + "<")) {
+        if (type_name == node_name || ::tracer::compat::starts_with(type_name, node_name + "<")) {
           if (result)
             throw std::runtime_error("ambiguous libstdc++ container node layout");
           result = child;
@@ -1041,13 +1382,13 @@ Member pointee_storage(DWARFDie wrapper) {
     return {type(wrapper), 0};
   const auto identity = qualified(wrapper);
   const auto target = named_type(wrapper, "_Tp");
-  if (target && identity.starts_with("std::shared_ptr<")) {
+  if (target && ::tracer::compat::starts_with(identity, "std::shared_ptr<")) {
     const auto data = member(wrapper, "_M_ptr");
     if (pointer(data.type) && qualified(type(data.type)) == qualified(target))
       return {target, data.offset};
-  } else if (target && identity.starts_with("std::unique_ptr<") && size_of(wrapper) == 8) {
+  } else if (target && ::tracer::compat::starts_with(identity, "std::unique_ptr<") && size_of(wrapper) == 8) {
     const auto deleter = named_type(wrapper, "_Dp");
-    if (qualified(deleter).starts_with("std::default_delete<") &&
+    if (::tracer::compat::starts_with(qualified(deleter), "std::default_delete<") &&
         qualified(named_type(deleter, "_Tp")) == qualified(target)) {
       std::set<std::uint64_t> candidates;
       find_pointee(wrapper, qualified(target), 0, candidates, 32);
@@ -1061,7 +1402,7 @@ Member pointee_storage(DWARFDie wrapper) {
 void set_map_key(MapLayout &layout, const Member &key, std::uint64_t storage,
                  std::string_view requested) {
   const auto identity = qualified(key.type);
-  if (identity.starts_with("std::__cxx11::basic_string<char") &&
+  if (::tracer::compat::starts_with(identity, "std::__cxx11::basic_string<char") &&
       qualified(named_type(key.type, "_Traits")) == "std::char_traits<char>" &&
       qualified(named_type(key.type, "_Alloc")) == "std::allocator<char>") {
     const auto data = member(key.type, "_M_dataplus");
@@ -1119,8 +1460,8 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
     hash = named_type(table.type, "_Hash");
   if (!pointer(next_link.type) || storage_type(type(next_link.type)) != storage_type(before.type) ||
       storage_type(count.type) != "unsigned64" ||
-      !qualified(node).starts_with("std::__detail::_Hash_node<") ||
-      !qualified(pair).starts_with("std::pair<"))
+      !::tracer::compat::starts_with(qualified(node), "std::__detail::_Hash_node<") ||
+      !::tracer::compat::starts_with(qualified(pair), "std::pair<"))
     throw std::runtime_error("cannot verify the libstdc++ unordered-map node layout");
   const auto node_link = member(node, "_M_nxt");
   const auto storage = member(node, "_M_storage");
@@ -1129,20 +1470,16 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
       storage_type(node_link.type) != storage_type(next_link.type) ||
       node_link.offset != next_link.offset ||
       size_of(storage.type) != size_of(pair) ||
-      !qualified(equality).starts_with("std::equal_to<") ||
-      !qualified(hash).starts_with("std::hash<") ||
+      !::tracer::compat::starts_with(qualified(equality), "std::equal_to<") ||
+      !::tracer::compat::starts_with(qualified(hash), "std::hash<") ||
       qualified(named_type(equality, "_Tp")) != qualified(key.type) ||
       qualified(named_type(hash, "_Tp")) != qualified(key.type))
     throw std::runtime_error("cannot verify unordered-map storage or default key equivalence");
   const auto value = member(pair, "second");
-  bool opaque = false;
-  const auto field = request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
-       qualified(value.type).starts_with("std::variant<") || qualified(value.type) == "std::any") ?
-      Member{value.type, 0} : nested_member(value.type, request.field(), opaque);
-  if (opaque)
-    throw std::runtime_error("unordered-map write capture requires a non-union value");
-  Layout result{};
-  set_field_layout(result, field.type);
+  auto result = inspect_value_field(value.type, request,
+      request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
+          value.type.getTag() == dw::DW_TAG_union_type ||
+          ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any"));
   set_map_key(result.map, key, storage.offset, request.map_key());
   result.logical_map = true;
   result.map.hash = true;
@@ -1151,15 +1488,15 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
   result.map.root = result.map.header + next_link.offset;
   result.map.count = map.offset + table.offset + count.offset;
   result.vector_object = map.offset;
-  result.scalar = storage.offset + value.offset + field.offset;
+  result.scalar += storage.offset + value.offset;
   return result;
 }
 
 Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto map = member(owner, request.map_field());
-  if (qualified(map.type).starts_with("std::unordered_map<"))
+  if (::tracer::compat::starts_with(qualified(map.type), "std::unordered_map<"))
     return inspect_hash_map(map, request);
-  if (!qualified(map.type).starts_with("std::map<"))
+  if (!::tracer::compat::starts_with(qualified(map.type), "std::map<"))
     throw std::runtime_error("logical map capture requires a libstdc++ map");
   const auto tree = member(map.type, "_M_t");
   const auto implementation = member(tree.type, "_M_impl");
@@ -1172,26 +1509,23 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   const auto node = container_node(tree.type, pair, "std::_Rb_tree_node", "_Link_type");
   const auto comparator = named_type(tree.type, "_Compare");
   if (!record(node) || !record(pair) ||
-      !qualified(node).starts_with("std::_Rb_tree_node<") || !qualified(pair).starts_with("std::pair<") ||
-      !qualified(comparator).starts_with("std::less<") ||
+      !::tracer::compat::starts_with(qualified(node), "std::_Rb_tree_node<") || !::tracer::compat::starts_with(qualified(pair), "std::pair<") ||
+      !::tracer::compat::starts_with(qualified(comparator), "std::less<") ||
       !pointer(parent.type) || !pointer(left.type) || !pointer(right.type) ||
       storage_type(count.type) != "unsigned64")
     throw std::runtime_error("cannot verify the libstdc++ map tree, comparator or node layout");
   const auto storage = member(node, "_M_storage");
   const auto key = member(pair, "first");
   const auto value = member(pair, "second");
-  bool opaque_union = false;
-  const auto scalar = request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
-       qualified(value.type).starts_with("std::variant<") || qualified(value.type) == "std::any") ?
-      Member{value.type, 0} : nested_member(value.type, request.field(), opaque_union);
   if (!node_has_base(node, header.type) || size_of(storage.type) != size_of(pair) ||
-      qualified(named_type(comparator, "_Tp")) != qualified(key.type) ||
-      opaque_union)
-    throw std::runtime_error("logical map requires verified node storage and non-union value");
-  Layout result{};
-  set_field_layout(result, scalar.type);
+      qualified(named_type(comparator, "_Tp")) != qualified(key.type))
+    throw std::runtime_error("logical map requires verified node storage and key equivalence");
+  auto result = inspect_value_field(value.type, request,
+      request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
+          value.type.getTag() == dw::DW_TAG_union_type ||
+          ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any"));
   result.logical_map = true;
-  result.scalar = storage.offset + value.offset + scalar.offset;
+  result.scalar += storage.offset + value.offset;
   result.vector_object = map.offset;
   const auto tree_offset = map.offset + tree.offset + implementation.offset;
   result.map.header = tree_offset + header.offset;
@@ -1232,57 +1566,15 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
         break;
       path.remove_prefix(next + 2);
     }
-    bool opaque = false;
-    const auto field = nested_member(current, request.field(), opaque);
-    if (opaque)
-      throw std::runtime_error("pointee write capture requires a non-union field");
-    set_field_layout(result, field.type);
-    result.scalar = field.offset;
-    return result;
+    auto field = inspect_value_field(current, request);
+    field.pointer_offsets = std::move(result.pointer_offsets);
+    return field;
   }
   bool opaque_union = false;
-  DWARFDie direct_union;
-  const auto scalar = nested_member(concrete, request.field(), opaque_union, &direct_union);
-  if (opaque_union) {
-    if (!request.owner_type().empty() || size_of(scalar.type) != 4)
-      throw std::runtime_error("union watches require a standalone four-byte storage range");
-    Layout result{};
-    result.scalar = scalar.offset;
-    result.opaque_union = true;
-    if (!request.union_tag().empty()) {
-      bool tag_in_union = false;
-      const auto discriminator = nested_member(concrete, request.union_tag(), tag_in_union);
-      const auto tag_type = discriminator.type.getTag() == dw::DW_TAG_enumeration_type
-          ? type(discriminator.type) : discriminator.type;
-      if (!direct_union || tag_in_union || storage_type(tag_type) != "unsigned32" ||
-          std::max(discriminator.offset, scalar.offset) -
-              std::min(discriminator.offset, scalar.offset) < 4)
-        throw std::runtime_error("union tag must be a verified nonoverlapping uint32 field");
-      result.union_tag_offset = discriminator.offset;
-      for (const auto &entry : request.union_cases()) {
-        if (entry.member().empty() || entry.member().size() > 512 ||
-            entry.member().find('\0') != std::string::npos)
-          throw std::runtime_error("invalid union case member name");
-        const auto alternative = member(direct_union, entry.member());
-        const auto encoding = storage_type(alternative.type);
-        UnionCase::Type kind;
-        if (encoding == "signed32")
-          kind = UnionCase::Type::signed_integer;
-        else if (encoding == "unsigned32")
-          kind = UnionCase::Type::unsigned_integer;
-        else if (encoding == "float32")
-          kind = UnionCase::Type::real;
-        else
-          throw std::runtime_error("union case requires a signed, unsigned or floating 32-bit member");
-        if (alternative.offset || !result.union_cases.emplace(entry.tag(),
-            UnionCase{entry.member(), kind}).second)
-          throw std::runtime_error("overlapping union cases require distinct discriminator values");
-      }
-    }
-    return result;
-  }
-  if (!request.union_tag().empty())
-    throw std::runtime_error("tagged capture requires --field to select a union member");
+  LocatedUnion selected;
+  const auto scalar = nested_member(concrete, request.field(), opaque_union, &selected);
+  if (auto layout = inspect_union_field(concrete, request, selected, scalar, true))
+    return std::move(*layout);
   const auto signed_int32 = [](DWARFDie type) {
     return type.getTag() == dw::DW_TAG_base_type &&
         number(type, dw::DW_AT_byte_size) == 4 &&
@@ -1303,7 +1595,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
       if (child.getTag() == dw::DW_TAG_subprogram)
         virtual_member |= number(child, dw::DW_AT_virtuality).value_or(0) != 0;
       if (child.getTag() == dw::DW_TAG_member && child.find(dw::DW_AT_artificial) &&
-          (name(child).starts_with("_vptr.") || name(child).starts_with("_vptr$")) &&
+          (::tracer::compat::starts_with(name(child), "_vptr.") || ::tracer::compat::starts_with(name(child), "_vptr$")) &&
           number(child, dw::DW_AT_data_member_location) == 0 &&
           pointer(type(child)))
         primary_vptr = true;
@@ -1341,7 +1633,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   if (!request.snapshot_field().empty()) {
     const auto string = member(base, request.snapshot_field());
     const auto string_name = qualified(string.type);
-    if (!string_name.starts_with("std::__cxx11::basic_string<char,") &&
+    if (!::tracer::compat::starts_with(string_name, "std::__cxx11::basic_string<char,") &&
         string_name != "std::__cxx11::basic_string<char>")
       throw std::runtime_error("snapshot field must use the libstdc++ C++11 std::string ABI");
     const auto data = member(string.type, "_M_dataplus");
@@ -1357,7 +1649,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   }
 
   const auto vector = member(owner, request.collection());
-  if (!qualified(vector.type).starts_with("std::vector<"))
+  if (!::tracer::compat::starts_with(qualified(vector.type), "std::vector<"))
     throw std::runtime_error("owner field must be a libstdc++ vector");
   const auto implementation = member(vector.type, "_M_impl");
   const auto begin = member(implementation.type, "_M_start");
@@ -1365,7 +1657,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   const auto capacity = member(implementation.type, "_M_end_of_storage");
   const auto element = type(begin.type);
   if (!pointer(begin.type) || begin.type != end.type || begin.type != capacity.type ||
-      !qualified(element).starts_with("std::unique_ptr<"))
+      !::tracer::compat::starts_with(qualified(element), "std::unique_ptr<"))
     throw std::runtime_error("owner field must be a vector of libstdc++ unique_ptr");
   const auto stride = number(element, dw::DW_AT_byte_size);
   std::set<std::uint64_t> pointee;
@@ -1387,9 +1679,22 @@ struct Symbol {
   unsigned kind;
 };
 
+bool has_constructor_variant(const Symbol &symbol, std::string_view variant) {
+  for (auto position = symbol.linkage.find(variant); position != std::string::npos;
+       position = symbol.linkage.find(variant, position + variant.size())) {
+    auto other = symbol.linkage;
+    other[position + 1] = variant == "C1E" ? '2' : '1';
+    // The C1/C2 discriminator does not affect the demangled signature.
+    // A matching substring inside a C++ identifier does.
+    if (llvm::demangle(other) == symbol.demangled)
+      return true;
+  }
+  return false;
+}
+
 bool operator_delete_name(std::string_view linkage) {
   const auto name = llvm::demangle(linkage);
-  return name.starts_with("operator delete(") || name.find("::operator delete(") != std::string::npos;
+  return ::tracer::compat::starts_with(name, "operator delete(") || name.find("::operator delete(") != std::string::npos;
 }
 
 void append_symbols(const ObjectFile &object, std::vector<Symbol> &symbols) {
@@ -1425,6 +1730,8 @@ Range select(const std::vector<Symbol> &symbols, const std::string &name,
     if (symbol.kind == kind && matches(symbol))
       candidates.insert(symbol.range);
   }
+  if (candidates.empty())
+    throw MissingElfSymbol("missing or ambiguous object watch ELF symbol: " + name);
   if (candidates.size() != 1)
     throw std::runtime_error("missing or ambiguous object watch ELF symbol: " + name);
   return *candidates.begin();
@@ -1441,8 +1748,30 @@ std::string writer_module(std::uint32_t pid, const std::string &executable,
     if (selector == path || selector == std::filesystem::path(path).filename())
       candidates.push_back(path);
   if (candidates.size() != 1)
-    throw std::runtime_error("--module must identify one live ELF by path or basename");
+    throw std::runtime_error("--module must identify one live ELF by path or basename; "
+        "prepare shared writer plans with --executable APP --module LIB");
   return candidates.front();
+}
+
+bool is_shared_library(const llvm::object::ELF64LEObjectFile &object) {
+  const auto &elf = object.getELFFile();
+  if (elf.getHeader().e_type != llvm::ELF::ET_DYN)
+    return false;
+  auto programs = elf.program_headers();
+  if (!programs)
+    throw std::runtime_error(llvm::toString(programs.takeError()));
+  if (std::any_of(programs->begin(), programs->end(), [](const auto &program) {
+        return program.p_type == llvm::ELF::PT_INTERP;
+      }))
+    return false;
+  // Static PIE has no interpreter. The PIE flag distinguishes it from a
+  // shared object even when the linker gives both an ELF entry address.
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic)
+    throw std::runtime_error(llvm::toString(dynamic.takeError()));
+  return std::none_of(dynamic->begin(), dynamic->end(), [](const auto &entry) {
+    return entry.getTag() == llvm::ELF::DT_FLAGS_1 && (entry.getVal() & llvm::ELF::DF_1_PIE);
+  });
 }
 // Read the call-site table used by the Itanium C++ unwinder on ELF. The
 // common GCC and Clang form uses the FDE entry as LPStart and ULEB128 or
@@ -1561,7 +1890,7 @@ struct Plan::Image {
         continue;
       const auto number = name.substr(suffix + 5);
       if (number.empty() || (number.size() > 1 && number.front() == '.' &&
-          std::ranges::all_of(number.substr(1), [](char ch) { return ch >= '0' && ch <= '9'; })))
+          std::all_of(std::begin(number.substr(1)), std::end(number.substr(1)), [](char ch) { return ch >= '0' && ch <= '9'; })))
         hot_names.insert(name.substr(0, suffix));
     }
     if (hot_names.empty())
@@ -1661,10 +1990,10 @@ struct Plan::Image {
       // stubs. Match their GOT slots by relocation, independent of order.
       for (std::size_t offset = 0; offset + 16 <= contents->size(); offset += 16) {
         const auto stub = contents->substr(offset, 16);
-        if (!stub.starts_with("\xf3\x0f\x1e\xfa"))
+        if (!::tracer::compat::starts_with(stub, "\xf3\x0f\x1e\xfa"))
           continue;
         const auto jump = stub[4] == '\xf2' ? 5 : 4; // Optional BND prefix.
-        if (!stub.substr(jump).starts_with("\xff\x25"))
+        if (!::tracer::compat::starts_with(stub.substr(jump), "\xff\x25"))
           continue;
         std::int32_t displacement;
         std::memcpy(&displacement, stub.data() + jump + 2, sizeof(displacement));
@@ -1676,8 +2005,35 @@ struct Plan::Image {
   }
 #endif
 
+  std::map<std::string, std::uint64_t> plt_entries() const {
+    std::map<std::string, std::uint64_t> result;
+    if (!bias)
+      return result;
+    const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*executable.getBinary());
+    const auto triple = llvm::sys::getDefaultTargetTriple();
+    std::string error;
+    const auto *target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target)
+      return result;
+    const std::unique_ptr<llvm::MCSubtargetInfo> sub(target->createMCSubtargetInfo(triple, "generic", ""));
+    if (!sub)
+      return result;
+    for (const auto &entry : object.getPltEntries(*sub)) {
+      if (!entry.Symbol || entry.Address > std::numeric_limits<std::uint64_t>::max() - *bias)
+        continue;
+      llvm::object::SymbolRef symbol(*entry.Symbol, &object);
+      auto name = symbol.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        continue;
+      }
+      result.emplace(name->str(), *bias + entry.Address);
+    }
+    return result;
+  }
+
   bool is_delete_target(std::uint64_t address) const {
-    if (std::ranges::any_of(symbols, [&](const auto &symbol) {
+    if (std::any_of(std::begin(symbols), std::end(symbols), [&](const auto &symbol) {
           return symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
               operator_delete_name(symbol.linkage);
         }))
@@ -1772,7 +2128,7 @@ struct Plan::Image {
           return false;
         const auto symbol = compact(s.demangled);
         return symbol == normalized ||
-            (normalized.find('(') == std::string::npos && symbol.starts_with(normalized + "("));
+            (normalized.find('(') == std::string::npos && ::tracer::compat::starts_with(symbol, normalized + "("));
       });
     }
     if (selector.find('(') != std::string::npos || selector.find("::") != std::string::npos) {
@@ -1818,9 +2174,17 @@ std::pair<std::uint64_t, std::size_t> Plan::application_range(
 }
 
 Plan::Plan(std::uint32_t pid, std::string executable,
-           const clangtracer::v1::ObjectWatchRequest &request)
+           const clangtracer::v1::ObjectWatchRequest &request,
+           bool verify_method_lifetimes)
     : module(writer_module(pid, executable, request.code_module())) {
   using Request = clangtracer::v1::ObjectWatchRequest;
+  if (!pid && request.code_module().empty()) {
+    const auto binary = open_elf(executable);
+    const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+    if (is_shared_library(object))
+      throw std::invalid_argument("%object prepare --module names a shared ELF without a program interpreter; "
+          "use --executable APP --module LIB");
+  }
   if (request.follow_calls() && (request.backend() != Request::CODE_CACHE ||
                                 request.mode() != Request::WRITES))
     throw std::invalid_argument("runtime call following requires code-cache write capture");
@@ -1828,7 +2192,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       (request.pointee_field().size() > 512 || request.pointee_field().find('\0') != std::string::npos ||
        !request.first_seen() || request.mutation_symbol().empty() || request.writer_entry() ||
        !request.vector_field().empty() || !request.map_field().empty() ||
-       !request.owner_type().empty() || !request.code_module().empty() || !request.union_tag().empty() ||
+       !request.owner_type().empty() || !request.code_module().empty() ||
        (request.synchronization() != Request::THREAD_CONFINED &&
         request.synchronization() != Request::CALLER_LOCK)))
     throw std::invalid_argument("pointee capture requires a standalone writer, mutation and synchronization policy");
@@ -1836,18 +2200,481 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   image_ = std::make_unique<Image>(pid, module, module == executable);
   if (module != executable)
     main_ = std::make_unique<Image>(pid, executable, true);
-  const auto writer = image_->function(pid, request.code_symbol(),
-      request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+  const auto &concrete_type = request.concrete_type();
+  const auto concrete_leaf = leaf_name(concrete_type);
+  const auto constructor_name = concrete_type + "::" + concrete_leaf + "(";
+  const auto destructor_name = concrete_type + "::~" + concrete_leaf + "(";
+  const auto duplicate_lifetime_coverage = [&] {
+    const auto definitions = [&](const Image &image) {
+      std::map<std::string, std::set<Range>> result;
+      for (const auto &symbol : image.symbols) {
+        if (symbol.kind != llvm::ELF::STT_FUNC ||
+            (!::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+             !::tracer::compat::starts_with(symbol.demangled, destructor_name)))
+          continue;
+        const bool ctor = ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+            (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
+        const bool dtor = ::tracer::compat::starts_with(symbol.demangled, destructor_name) &&
+            (::tracer::compat::contains(symbol.linkage, "D0Ev") || ::tracer::compat::contains(symbol.linkage, "D1Ev") ||
+             ::tracer::compat::contains(symbol.linkage, "D2Ev"));
+        if (ctor || dtor)
+          result[symbol.linkage].insert(symbol.range);
+      }
+      return result;
+    };
+    const auto normalize_path = [](const std::string &path) {
+      std::error_code error;
+      const auto canonical = std::filesystem::weakly_canonical(path, error);
+      return error ? path : canonical.string();
+    };
+    const auto selected_path = normalize_path(image_->path);
+    const auto selected_definitions = definitions(*image_);
+    if (selected_definitions.empty())
+      return std::string{};
+    std::set<std::string> same_image_duplicates;
+    std::set<std::pair<std::string, std::string>> cross_image_duplicates;
+    for (const auto &[linkage, ranges] : selected_definitions)
+      if (ranges.size() > 1)
+        same_image_duplicates.insert(linkage);
+
+    std::set<std::string> wanted;
+    for (const auto &[linkage, ranges] : selected_definitions)
+      wanted.insert(linkage);
+    std::string incomplete_scan;
+    const auto check_other_image = [&](const std::string &path,
+                                       const std::map<std::string, std::set<Range>> &other) {
+      for (const auto &definition : selected_definitions) {
+        const auto &linkage = definition.first;
+        const auto found = other.find(linkage);
+        if (found != other.end())
+          cross_image_duplicates.emplace(linkage, path);
+      }
+      for (const auto &[linkage, ranges] : other)
+        if (::tracer::compat::contains(wanted, linkage) && ranges.size() > 1)
+          same_image_duplicates.insert(linkage);
+    };
+    if (main_ && normalize_path(main_->path) != selected_path) {
+      const auto main_definitions = definitions(*main_);
+      check_other_image(main_->path, main_definitions);
+    }
+    const auto app_module_definitions = [&](const std::string &path) {
+      std::map<std::string, std::set<Range>> result;
+      auto binary = open_elf(path);
+      const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+      const auto add = [&](const auto &symbol) {
+        const llvm::object::ELFSymbolRef elf(symbol);
+        if (elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
+          return;
+        auto linkage = symbol.getName();
+        auto address = symbol.getAddress();
+        auto flags = symbol.getFlags();
+        if (!linkage || !address || !flags) {
+          if (!linkage) llvm::consumeError(linkage.takeError());
+          if (!address) llvm::consumeError(address.takeError());
+          if (!flags) llvm::consumeError(flags.takeError());
+          return;
+        }
+        const auto name = linkage->str();
+        if (!::tracer::compat::contains(wanted, name) || !*address ||
+            (*flags & llvm::object::SymbolRef::SF_Undefined))
+          return;
+        result[name].insert({*address, elf.getSize()});
+      };
+      for (const auto &symbol : object.symbols())
+        add(symbol);
+      for (const auto &symbol : object.getDynamicSymbolIterators())
+        add(symbol);
+      return result;
+    };
+    if (pid) {
+      try {
+#if defined(__aarch64__)
+        // The CFI admission module is x86-only. Keep the cross-image check on
+        // AArch64 using the existing module reader, including runtime images.
+        const auto modules = client::list_debug_module_mappings(pid, {}, true);
+        for (const auto &path : modules.modules()) {
+#else
+        for (const auto &path : injector::mapped_application_files(static_cast<pid_t>(pid))) {
+#endif
+          const auto normalized = normalize_path(path);
+          if (normalized == selected_path || (main_ && normalized == normalize_path(main_->path)))
+            continue;
+          try {
+            check_other_image(path, app_module_definitions(path));
+          } catch (const std::exception &error) {
+            if (incomplete_scan.empty())
+              incomplete_scan = "could not inspect mapped application module " + path + ": " + error.what();
+          }
+        }
+      } catch (const std::exception &error) {
+        incomplete_scan = "could not enumerate mapped application modules: " + std::string(error.what());
+      }
+    }
+    if (!cross_image_duplicates.empty()) {
+      const auto &[linkage, path] = *cross_image_duplicates.begin();
+      if (main_ && normalize_path(path) == normalize_path(main_->path))
+        return "same lifetime symbol is defined in both the executable and selected module (" +
+            llvm::demangle(linkage) + "); object identities remain provisional";
+      return "same lifetime symbol is defined in selected module " + image_->path +
+          " and mapped application module " + path + " (" + llvm::demangle(linkage) +
+          "); object identities remain provisional";
+    }
+    if (!same_image_duplicates.empty())
+      return "lifetime symbol has multiple definitions in one image (" +
+          llvm::demangle(*same_image_duplicates.begin()) + "); object identities remain provisional";
+    if (!incomplete_scan.empty())
+      return incomplete_scan + "; object identities remain provisional";
+    return std::string{};
+  };
+  if (request.lifetimes_only() || (request.staged_registration() && verify_method_lifetimes))
+    lifetime_coverage_diagnostic = duplicate_lifetime_coverage();
+
+  const auto prove_complete_constructor_callers = [&](const std::vector<std::uint64_t> &entries,
+                                                       bool aggregate_base_possible) {
+    std::set<std::uint64_t> proven;
+    if (entries.empty() || aggregate_base_possible || !lifetime_coverage_diagnostic.empty())
+      return proven;
+    // PLT symbol enumeration needs the executable's runtime bias. A method
+    // registration may reach this proof before any executable boundary has
+    // otherwise caused its image to be bound.
+    if (main_ && !main_->bias) {
+      const auto symbol = ::tracer::compat::ranges::find_if(main_->symbols, [](const auto &candidate) {
+        return candidate.kind == llvm::ELF::STT_FUNC && candidate.range.second;
+      });
+      if (symbol != main_->symbols.end()) {
+        try {
+          main_->bind(pid, symbol->range);
+        } catch (const std::exception &) {
+          // Executable binding supplies optional caller/PLT evidence. Failure
+          // must leave that evidence unavailable rather than reject the watch.
+        }
+      }
+    }
+    const auto classify_elf_caller = [](const Image &caller_image, std::uint64_t call) {
+      if (!caller_image.bias || call < *caller_image.bias)
+        return CallerKind::unknown;
+      const auto address = call - *caller_image.bias;
+      std::set<std::pair<std::string, Range>> symbols;
+      for (const auto &symbol : caller_image.symbols) {
+        if (symbol.kind == llvm::ELF::STT_FUNC && symbol.range.second &&
+            address >= symbol.range.first && address - symbol.range.first < symbol.range.second) {
+          if (classify_linkage_name(symbol.linkage) == CallerKind::constructor_or_destructor)
+            return CallerKind::constructor_or_destructor;
+          symbols.emplace(symbol.linkage, symbol.range);
+        }
+      }
+      if (symbols.size() != 1)
+        return CallerKind::unknown;
+      return classify_linkage_name(symbols.begin()->first);
+    };
+    const bool application_type = !::tracer::compat::starts_with(concrete_type, "std::");
+    std::map<std::string, bool> defined_records;
+    const auto unresolved_records = [&](DWARFDie function) {
+      std::vector<DWARFDie> scopes{function};
+      while (!scopes.empty()) {
+        const auto scope = scopes.back();
+        scopes.pop_back();
+        for (const auto child : scope.children()) {
+          const auto tag = child.getTag();
+          if (tag == dw::DW_TAG_lexical_block || tag == dw::DW_TAG_inlined_subroutine)
+            scopes.push_back(child);
+          if (tag != dw::DW_TAG_variable && tag != dw::DW_TAG_formal_parameter)
+            continue;
+          auto referred = child.resolveReferencedType(dw::DW_AT_type);
+          bool indirect = false;
+          std::set<DWARFDie> seen;
+          while (referred && seen.insert(referred).second) {
+            const auto kind = referred.getTag();
+            if (kind == dw::DW_TAG_pointer_type || kind == dw::DW_TAG_reference_type ||
+                kind == dw::DW_TAG_rvalue_reference_type) {
+              indirect = true;
+            } else if (kind != dw::DW_TAG_typedef && kind != dw::DW_TAG_const_type &&
+                       kind != dw::DW_TAG_volatile_type && kind != dw::DW_TAG_array_type) {
+              break;
+            }
+            referred = referred.resolveReferencedType(dw::DW_AT_type);
+          }
+          if (!record(referred) || !referred.find(dw::DW_AT_declaration))
+            continue;
+          const auto identity = qualified(referred);
+          if (identity.empty())
+            return true;
+          // ::tm is reserved by the C++ library. The other two names are
+          // glibc's reserved global record tags for FILE and DIR.
+          if (indirect && (identity == "tm" || identity == "_IO_FILE" ||
+                           identity == "__dirstream"))
+            continue;
+          if (application_type && ::tracer::compat::starts_with(identity, "std::")) {
+            if (standard_library_type(referred))
+              continue;
+            // A same-named DIE can describe another specialization when
+            // the producer omits template arguments from DW_AT_name.
+            return true;
+          }
+          auto [known, inserted] = defined_records.try_emplace(identity, false);
+          if (inserted) {
+            for (const auto *image : {image_.get(), main_.get()}) {
+              if (!image)
+                continue;
+              try {
+                known->second = static_cast<bool>(find_record(*image->dwarf, identity));
+              } catch (const std::runtime_error &) {
+                continue;
+              }
+              if (known->second)
+                break;
+            }
+          }
+          if (!known->second)
+            return true;
+        }
+      }
+      return false;
+    };
+    std::set<std::uint64_t> verified_plt_calls;
+    for (const auto &[entry, calls] : direct_redirects(entries, true, false, true,
+                                                        &verified_plt_calls)) {
+      for (const auto call : calls) {
+        const auto *caller_image = image_for(call);
+        if (!caller_image)
+          continue;
+        const auto address = caller_image->bias && call >= *caller_image->bias ?
+            call - *caller_image->bias : 0;
+        const auto debug = caller_image->dwarf->getDIEsForAddress(address);
+        const bool complete_plt_call = ::tracer::compat::contains(verified_plt_calls, call);
+        // A direct call to an aliased entry may come from an inlined base
+        // initializer. A physical symbol alone cannot rule that out.
+        if (!complete_plt_call && (!debug.CompileUnit || !debug.FunctionDIE))
+          continue;
+        llvm::SmallVector<DWARFDie, 4> inlined;
+        if (debug.CompileUnit)
+          debug.CompileUnit->getInlinedChainForAddress(address, inlined);
+        const auto elf_kind = classify_elf_caller(*caller_image, call);
+        if (elf_kind == CallerKind::constructor_or_destructor)
+          continue;
+        auto caller_kind = debug.FunctionDIE ? classify_dwarf_caller(debug.FunctionDIE) : CallerKind::unknown;
+        if (caller_kind == CallerKind::unknown) {
+          if (!complete_plt_call &&
+              !debug.FunctionDIE.findRecursively({dw::DW_AT_type, dw::DW_AT_prototyped,
+                                                 dw::DW_AT_frame_base}))
+            continue;
+          caller_kind = elf_kind;
+        }
+        if (caller_kind != CallerKind::ordinary ||
+            ::tracer::compat::ranges::any_of(inlined, [](DWARFDie frame) {
+              // A physical caller symbol cannot identify an inlined frame.
+              // Require positive DWARF identity for every inlined frame.
+              return frame.getTag() == dw::DW_TAG_inlined_subroutine &&
+                  classify_dwarf_caller(frame) != CallerKind::ordinary;
+            }) || (!complete_plt_call && unresolved_records(debug.FunctionDIE)))
+          continue;
+        const auto return_pc = call + object_cache::direct_call_width;
+        complete_constructor_returns.emplace(entry, return_pc);
+        if (const auto target = constructor_tail_target(entry))
+          complete_constructor_returns.emplace(target, return_pc);
+        proven.insert(entry);
+      }
+    }
+    return proven;
+  };
+
+  if (request.lifetimes_only()) {
+    lifetimes_only = true;
+    const auto &concrete = concrete_type;
+    const auto leaf = leaf_name(concrete);
+    const auto is_constructor = [&](const Symbol &symbol) {
+      return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
+    };
+    auto *const lifetime_image = image_.get();
+    const auto constructor = ::tracer::compat::ranges::find_if(lifetime_image->symbols, is_constructor);
+    if (constructor == lifetime_image->symbols.end() && main_ &&
+        ::tracer::compat::ranges::any_of(main_->symbols, is_constructor))
+      throw std::runtime_error("lifetime-only constructor is defined in the executable, not the selected module; "
+                               "cross-image admission is not enabled for " + concrete);
+    if (constructor == lifetime_image->symbols.end())
+      throw std::runtime_error("no verified constructor entries for lifetime-only type " + concrete);
+    for (const auto &entry : lifetime_image->symbols) {
+      if (!is_constructor(entry))
+        continue;
+      const auto site = lifetime_image->dwarf->getDIEsForAddress(entry.range.first);
+      const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
+      std::set<DWARFDie> seen;
+      if (has_virtual_members_or_bases(type, seen))
+        throw std::runtime_error("lifetime-only identity cannot establish complete-object ownership for a polymorphic type");
+    }
+    if (derived_types(*lifetime_image->dwarf, concrete).present ||
+        (main_ && derived_types(*main_->dwarf, concrete).present))
+      throw std::runtime_error("lifetime-only identity cannot disambiguate known derived construction of " +
+                               concrete + "; register the complete derived type until constructor coverage is available");
+    const auto add_lifecycle = [&](const Symbol &symbol, Boundary role, bool uncertain,
+                                   bool deleting = false) {
+      const auto pc = lifetime_image->bind(pid, symbol.range);
+      const auto decoded = native_entry::scan(pc,
+          lifetime_image->code(pc).substr(0, std::min<std::uint64_t>(symbol.range.second, 15)));
+      if (decoded.instructions.empty())
+        throw std::runtime_error("cannot decode a verified object lifetime entry: " + symbol.demangled);
+      auto [site, inserted] = sites.try_emplace(pc,
+          Site{std::string(lifetime_image->code(pc).substr(0, decoded.instructions.front().size)),
+               role, std::nullopt, uncertain, 0, deleting});
+      if (!inserted) {
+        if (site->second.boundary != role)
+          throw std::runtime_error("constructor and destructor entries overlap");
+        site->second.uncertain_complete &= uncertain;
+        site->second.deleting_destructor |= deleting;
+      }
+      boundaries.emplace(pc, symbol.range.second);
+      virtual_destructor |= deleting;
+    };
+
+    std::set<Range> destructors, deleting_destructors;
+    std::set<Range> base_destructors;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D1Ev"))
+        destructors.insert(symbol.range);
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev"))
+        deleting_destructors.insert(symbol.range);
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D2Ev"))
+        base_destructors.insert(symbol.range);
+    }
+    if (destructors.empty())
+      destructors = base_destructors;
+    const bool destructor_coverage = !destructors.empty();
+    if (!destructor_coverage) {
+      if (!lifetime_coverage_diagnostic.empty())
+        lifetime_coverage_diagnostic += "; ";
+      lifetime_coverage_diagnostic += "no verified complete or base destructor entries for " + concrete +
+          "; object identities remain provisional";
+    }
+    bool provisional_lifetime_identity = !lifetime_coverage_diagnostic.empty();
+    std::map<std::string, std::set<std::uint64_t>> base_constructor_entries;
+    for (const auto &symbol : lifetime_image->symbols)
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C2E"))
+        base_constructor_entries[symbol.demangled].insert(symbol.range.first);
+    std::set<std::uint64_t> caller_proof_constructors;
+    std::set<std::string> complete_constructor_overloads;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          has_constructor_variant(symbol, "C1E"))
+        complete_constructor_overloads.insert(symbol.demangled);
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C1E")) {
+        const auto base = base_constructor_entries.find(symbol.demangled);
+        const bool aliases_base_entry = base != base_constructor_entries.end() &&
+            ::tracer::compat::contains(base->second, symbol.range.first);
+        const bool uncertain = aliases_base_entry || provisional_lifetime_identity;
+        add_lifecycle(symbol, Boundary::construct, uncertain);
+        if (aliases_base_entry && !provisional_lifetime_identity)
+          caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
+      }
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || ::tracer::compat::starts_with(symbol.demangled, constructor_name) == false ||
+          symbol.linkage.find('.') != std::string::npos || !has_constructor_variant(symbol, "C2E"))
+        continue;
+      // A C2 entry is not proof of complete-object construction, even when
+      // this class has no virtual bases: a derived constructor can call the
+      // same entry for its base subobject. A separate C1 entry can establish
+      // complete construction; C2 remains uncertain.
+      add_lifecycle(symbol, Boundary::construct, true);
+      const auto complete = ::tracer::compat::ranges::find_if(lifetime_image->symbols, [&](const auto &candidate) {
+        return candidate.kind == llvm::ELF::STT_FUNC &&
+            candidate.demangled == symbol.demangled &&
+            candidate.linkage.find('.') == std::string::npos &&
+            has_constructor_variant(candidate, "C1E") && candidate.range.first == symbol.range.first;
+      });
+      if (!provisional_lifetime_identity && complete == lifetime_image->symbols.end() &&
+          !::tracer::compat::contains(complete_constructor_overloads, symbol.demangled))
+        caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
+    }
+    const std::vector<std::uint64_t> constructors_requiring_caller_proof(
+        caller_proof_constructors.begin(), caller_proof_constructors.end());
+    const auto proven_complete_callers = prove_complete_constructor_callers(
+        constructors_requiring_caller_proof, false);
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
+      return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
+    });
+    if (!provisional_lifetime_identity && proven_complete_callers.empty() &&
+        !has_complete_constructor_entry) {
+      lifetime_coverage_diagnostic = "no verified complete-object constructor calls for " + concrete +
+          "; object identities remain provisional";
+      provisional_lifetime_identity = true;
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || !::tracer::compat::starts_with(symbol.demangled, destructor_name) ||
+          symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (::tracer::compat::contains(symbol.linkage, "D1Ev"))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
+      else if (::tracer::compat::contains(symbol.linkage, "D2Ev") && destructors.count(symbol.range))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
+      else if (::tracer::compat::contains(symbol.linkage, "D0Ev") && deleting_destructors.count(symbol.range))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity, true);
+    }
+    if (!provisional_lifetime_identity && ::tracer::compat::ranges::none_of(sites, [](const auto &entry) {
+          return entry.second.boundary == Boundary::destroy && !entry.second.deleting_destructor;
+        }))
+      throw std::runtime_error("lifetime-only type has no complete destructor entry: " + concrete);
+    bias = *lifetime_image->bias;
+    return;
+  }
+
+  Range writer;
+  bool missing_elf_symbol = false;
+  try {
+    try {
+      writer = image_->function(pid, request.code_symbol(),
+          request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+    } catch (const MissingElfSymbol &) {
+      missing_elf_symbol = true;
+      throw;
+    }
+  } catch (const std::exception &error) {
+    const std::string message = error.what();
+    const bool missing_main_match = pid && !main_ && request.code_module().empty() &&
+        (missing_elf_symbol ||
+         ::tracer::compat::starts_with(message, "no supported matching callable in mapped ELF debug information"));
+    if (!missing_main_match)
+      throw;
+    std::set<std::string> matches;
+    for (const auto &path : client::list_debug_modules(pid)) {
+      if (path == executable)
+        continue;
+      try {
+        Image candidate(pid, path, false);
+        (void)candidate.function(pid, request.code_symbol(),
+            request.backend() == Request::CODE_CACHE);
+        matches.insert(path);
+      } catch (const std::exception &) {
+        // Other modules are only diagnostic candidates; keep the main-image error.
+      }
+    }
+    if (matches.size() == 1)
+      throw std::runtime_error("writer is in shared module " + *matches.begin() +
+          "; use --module \"" + *matches.begin() + "\"");
+    if (matches.size() > 1)
+      throw std::runtime_error("writer matches multiple shared modules; specify --module with one mapped ELF");
+    throw;
+  }
   writer_start = image_->bind(pid, writer);
   bias = *image_->bias;
   const auto writer_debug = image_->dwarf->getDIEsForAddress(writer.first);
   const auto &concrete = request.concrete_type();
   const auto leaf = leaf_name(concrete);
   const auto owns_lifetime = [&](const Image &image) {
-    return std::ranges::any_of(image.symbols, [&](const auto &symbol) {
+    return std::any_of(std::begin(image.symbols), std::end(image.symbols), [&](const auto &symbol) {
       return symbol.kind == llvm::ELF::STT_FUNC &&
-          symbol.demangled.starts_with(concrete + "::" + leaf + "(") &&
-          (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
+          ::tracer::compat::starts_with(symbol.demangled, concrete + "::" + leaf + "(") &&
+          ((symbol.linkage.find("C1E") != std::string::npos) || (symbol.linkage.find("C2E") != std::string::npos));
     });
   };
   const bool standalone_shared = main_ && request.borrow_caller().empty() &&
@@ -1860,8 +2687,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       std::set<llvm::DWARFUnit *> constructor_units;
       for (const auto &symbol : image_->symbols) {
         if (symbol.kind != llvm::ELF::STT_FUNC ||
-            !symbol.demangled.starts_with(concrete + "::" + leaf + "(") ||
-            !symbol.linkage.contains(variant))
+            !::tracer::compat::starts_with(symbol.demangled, concrete + "::" + leaf + "(") ||
+            symbol.linkage.find(variant) == std::string::npos)
           continue;
         if (const auto entry = image_->dwarf->getDIEsForAddress(symbol.range.first); entry.CompileUnit)
           constructor_units.insert(entry.CompileUnit);
@@ -1880,10 +2707,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   else
     layout = inspect_layout(*image_->dwarf, request, layout_unit, *lifetime.dwarf);
   if (layout.value_write.active()) {
-    if (!request.first_seen() || !request.owner_type().empty() ||
-        (request.synchronization() != Request::THREAD_CONFINED &&
+    const bool union_storage = layout.value_write.kind == ValueWriteKind::union_storage;
+    if ((!union_storage && !request.first_seen()) || !request.owner_type().empty() ||
+        ((!union_storage || layout.value_write.selector_width ||
+          (request.first_seen() && request.backend() == Request::CODE_CACHE && !request.no_values())) &&
+         request.synchronization() != Request::THREAD_CONFINED &&
          request.synchronization() != Request::CALLER_LOCK))
-      throw std::invalid_argument("complex value writes require a scoped writer and declared synchronization");
+      throw std::invalid_argument("complex value writes require verified lifetime and synchronization");
     if (layout.value_write.kind == ValueWriteKind::any) {
       const auto &value = layout.value_write;
       constexpr std::string_view internal = "std::any::_Manager_internal<";
@@ -1893,9 +2723,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       std::map<std::uint64_t, ValueWriteAlternative> managers;
       for (const auto &symbol : image_->symbols) {
         const auto name = std::string_view(symbol.demangled);
-        const bool indirect = name.starts_with(external);
+        const bool indirect = ::tracer::compat::starts_with(name, external);
         if (symbol.kind != llvm::ELF::STT_FUNC ||
-            !(indirect || name.starts_with(internal)) ||
+            !(indirect || ::tracer::compat::starts_with(name, internal)) ||
             name.find(">::_S_manage(") == name.npos || symbol.range.first > UINT64_MAX - bias)
           continue;
         const auto address = bias + symbol.range.first;
@@ -1912,7 +2742,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
             declaration.getName(llvm::DINameKind::LinkageName) != symbol.linkage)
           continue;
         const auto manager = declaration.getParent();
-        if (!qualified(manager).starts_with(indirect ? external : internal))
+        if (!::tracer::compat::starts_with(qualified(manager), indirect ? external : internal))
           continue;
         const auto type = first_type_parameter(manager);
         const auto bytes = size_of(type).value_or(0);
@@ -2003,8 +2833,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   const auto add_boundary = [&](Image &boundary_image, Boundary role, const std::string &prefix,
                                 std::string_view variant = {}, bool required = true) {
     const auto matches_prefix = [&](const Symbol &symbol) {
-      return symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(prefix + "(") &&
+      return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, prefix + "(") &&
           symbol.linkage.find('.') == std::string::npos;
+    };
+    const auto matches_variant = [&](const Symbol &symbol, std::string_view value) {
+      if (verify_method_lifetimes && role == Boundary::construct && !value.empty())
+        return has_constructor_variant(symbol, value);
+      return ::tracer::compat::contains(symbol.linkage, value);
     };
     const auto base_variant = variant == "C1E" ? "C2E" : variant == "D1Ev" ? "D2Ev" : "";
     std::set<Range> ranges, base_aliases;
@@ -2012,22 +2847,23 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     for (const auto &symbol : boundary_image.symbols) {
       if (!matches_prefix(symbol))
         continue;
-      if (variant.empty() || symbol.linkage.contains(variant)) {
+      if (variant.empty() || matches_variant(symbol, variant)) {
         ranges.insert(symbol.range);
         complete_overloads.insert(symbol.demangled);
       }
-      if (known_derived && role == Boundary::construct &&
-          symbol.linkage.find("C2E") != std::string::npos)
+      if ((known_derived || (request.staged_registration() && verify_method_lifetimes)) &&
+          role == Boundary::construct &&
+          matches_variant(symbol, "C2E"))
         base_aliases.insert(symbol.range);
     }
     if (*base_variant) {
       // Clang may emit only the base variant for an inline definition. It
       // has the complete-object ABI only when there is no virtual base/VTT.
       const auto missing_complete = [&](const Symbol &symbol) {
-        return matches_prefix(symbol) && symbol.linkage.contains(base_variant) &&
-            !complete_overloads.contains(symbol.demangled);
+        return matches_prefix(symbol) && matches_variant(symbol, base_variant) &&
+            !complete_overloads.count(symbol.demangled);
       };
-      if (std::ranges::any_of(boundary_image.symbols, missing_complete)) {
+      if (std::any_of(std::begin(boundary_image.symbols), std::end(boundary_image.symbols), missing_complete)) {
         std::set<DWARFDie> seen;
         auto *unit = &boundary_image == image_.get() ? layout_unit : nullptr;
         if (!has_virtual_bases(find_record(*boundary_image.dwarf, concrete, unit), seen))
@@ -2039,7 +2875,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if ((required && ranges.empty()) || (role != Boundary::construct && ranges.size() > 1))
       throw std::runtime_error("object watch boundary is missing or ambiguous: " + prefix);
     for (const auto &range : ranges) {
-      const auto pc = install_boundary(boundary_image, role, range, prefix, base_aliases.count(range) != 0);
+      const bool incomplete_staged_coverage = request.staged_registration() && verify_method_lifetimes &&
+          role == Boundary::construct && !lifetime_coverage_diagnostic.empty();
+      const auto pc = install_boundary(boundary_image, role, range, prefix,
+          incomplete_staged_coverage || base_aliases.count(range) != 0);
       if (variant == "D0Ev") {
         virtual_destructor = true;
         sites.at(pc).deleting_destructor = true;
@@ -2086,7 +2925,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         if (argument && (argument.getTag() == dw::DW_TAG_reference_type ||
                          argument.getTag() == dw::DW_TAG_rvalue_reference_type))
           argument = type(argument);
-        if (record(argument) && qualified(argument).starts_with("std::unique_ptr<")) {
+        if (record(argument) && ::tracer::compat::starts_with(qualified(argument), "std::unique_ptr<")) {
           std::set<std::uint64_t> offsets;
           find_pointee(argument, request.base_type(), 0, offsets, 32);
           ownership_argument |= offsets == std::set<std::uint64_t>{layout.pointee} &&
@@ -2159,7 +2998,26 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         }))
       delegating_constructor_tails.emplace(pc, *tail.target);
   }
-  if (known_derived && !writer_derived.may_construct_base_directly &&
+  if (request.staged_registration() && verify_method_lifetimes) {
+    std::vector<std::uint64_t> caller_proof_constructors;
+    for (const auto &[pc, site] : sites)
+      if (site.boundary == Boundary::construct &&
+          (site.uncertain_complete || delegating_constructor_tails.count(pc)))
+        caller_proof_constructors.push_back(pc);
+    const auto proven = prove_complete_constructor_callers(caller_proof_constructors,
+        writer_derived.may_construct_base_directly || main_derived.may_construct_base_directly);
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
+      return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
+    });
+    if (lifetime_coverage_diagnostic.empty() && proven.empty() && !has_complete_constructor_entry &&
+        !caller_proof_constructors.empty())
+      lifetime_coverage_diagnostic = "no verified complete-object constructor calls for " + concrete +
+          "; object identities remain provisional";
+    if (!lifetime_coverage_diagnostic.empty())
+      for (auto &[pc, site] : sites)
+        if (site.boundary == Boundary::construct)
+          site.uncertain_complete = true;
+  } else if (known_derived && !writer_derived.may_construct_base_directly &&
       !main_derived.may_construct_base_directly) {
     std::vector<std::uint64_t> aliases;
     for (const auto &[pc, site] : sites)
@@ -2179,12 +3037,12 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         debug.CompileUnit->getInlinedChainForAddress(address, chain);
         // Aggregate initialization can call a base constructor directly. Only
         // classify callers when DWARF also rules out known aggregate candidates.
-        if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
+        if (chain.empty() || std::any_of(std::begin(chain), std::end(chain), [](const auto die) {
               const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
               if (!linkage)
                 return true;
               llvm::ItaniumPartialDemangler parsed;
-              return parsed.partialDemangle(linkage) ? std::string_view(linkage).starts_with("_Z") :
+              return parsed.partialDemangle(linkage) ? ::tracer::compat::starts_with(std::string_view(linkage), "_Z") :
                   parsed.isCtorOrDtor();
             }))
           continue;
@@ -2208,7 +3066,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       const auto writer_body = native_entry::scan(writer_start, code(writer_start).substr(0, writer.second));
       std::set<Range> mutations;
       const auto add_mutation = [&](std::string selector) {
-        const bool destroys = selector.starts_with("destroy=");
+        const bool destroys = ::tracer::compat::starts_with(selector, "destroy=");
         if (destroys) {
           if (!request.logical_updates())
             throw std::invalid_argument("destroy= requires --mode logical-writes");
@@ -2222,7 +3080,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         } catch (const std::runtime_error &) {
           // A selected mutation may exist only as DWARF inline instances.
         }
-        const bool direct = mutation && std::ranges::any_of(writer_body.instructions, [&](const auto &inst) {
+        const bool direct = mutation && std::any_of(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &inst) {
           return inst.flow == native_entry::Flow::call && inst.target == bias + mutation->first;
         });
         if (destroys && !direct)
@@ -2231,19 +3089,19 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           const auto inlined = inline_mutations_in(writer_debug.FunctionDIE, bias, selector,
                                                    container_name, writer_body);
           for (const auto &region : inlined) {
-            if (std::ranges::any_of(inline_mutations, [&](const auto &prior) {
+            if (std::any_of(std::begin(inline_mutations), std::end(inline_mutations), [&](const auto &prior) {
                   const auto &other = prior.second;
                   const auto reaches = [](const auto &range, const auto &continuations) {
-                    const auto next = std::ranges::lower_bound(continuations, range.first);
+                    const auto next = std::lower_bound(continuations.begin(), continuations.end(), range.first);
                     return next != continuations.end() && *next < range.second;
                   };
-                  return std::ranges::any_of(region.continuations, [&](const auto pc) {
-                    return std::ranges::binary_search(other.continuations, pc);
-                  }) || std::ranges::any_of(other.ranges, [&](const auto &previous) {
+                  return std::any_of(std::begin(region.continuations), std::end(region.continuations), [&](const auto pc) {
+                    return std::binary_search(other.continuations.begin(), other.continuations.end(), pc);
+                  }) || std::any_of(std::begin(other.ranges), std::end(other.ranges), [&](const auto &previous) {
                     return reaches(previous, region.continuations);
-                  }) || std::ranges::any_of(region.ranges, [&](const auto &range) {
+                  }) || std::any_of(std::begin(region.ranges), std::end(region.ranges), [&](const auto &range) {
                     return reaches(range, other.continuations) ||
-                        std::ranges::any_of(other.ranges, [&](const auto &previous) {
+                        std::any_of(std::begin(other.ranges), std::end(other.ranges), [&](const auto &previous) {
                           return range.first < previous.second && previous.first < range.second;
                         });
                   });
@@ -2253,7 +3111,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
             if (request.logical_updates())
               mutation_selectors.emplace(region.begin, selector);
             const auto install_anchor = [&](std::uint64_t pc) {
-              const auto inst = std::ranges::find_if(writer_body.instructions, [&](const auto &candidate) {
+              const auto inst = std::find_if(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &candidate) {
                 return candidate.address == pc;
               });
               auto &site = sites.try_emplace(pc, Site{std::string(code(pc).substr(0, inst->size)),
@@ -2292,7 +3150,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto bytes = code(start).substr(0, length);
     if (bytes.size() != length || length > UINT64_MAX - start)
       throw std::runtime_error("writer function exceeds its ELF text section");
-    if (std::ranges::any_of(writer_ranges, [&](const auto &prior) {
+    if (std::any_of(std::begin(writer_ranges), std::end(writer_ranges), [&](const auto &prior) {
           return prior.first < start + length && start < prior.first + prior.second.size();
         }))
       throw std::invalid_argument("selected writer functions overlap");
@@ -2300,8 +3158,17 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto decoded = native_entry::scan(start, bytes);
     if (decoded.decode_failed || !decoded.diagnostic.empty())
       throw std::runtime_error("cannot decode the selected writer function");
+    if (shared_writer() && request.backend() == Request::CODE_CACHE && !request.follow_calls() &&
+        std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto &inst) {
+          return inst.flow == native_entry::Flow::call;
+        }))
+      throw std::runtime_error("shared writer in " + module +
+          " contains calls; " +
+          (follow_calls_eligible(request)
+               ? "use --follow-calls --module \"" + module + "\""
+               : "--follow-calls is unavailable for this watch scope"));
     auto previous_end = start;
-    const auto indirect = std::ranges::find_if(decoded.instructions, [](const auto &instruction) {
+    const auto indirect = std::find_if(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &instruction) {
       return instruction.flow == native_entry::Flow::branch && !instruction.target;
     });
     const bool has_indirect = indirect != decoded.instructions.end();
@@ -2361,7 +3228,18 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto extra = image_->function(pid, selector);
     if (auto *unit = image_->dwarf->getDIEsForAddress(extra.first).CompileUnit) {
       const auto other = inspect_layout(*image_->dwarf, request, unit, *lifetime.dwarf);
-      if (other.scalar != layout.scalar || other.atomic != layout.atomic ||
+      const auto &value = layout.value_write;
+      const auto &candidate = other.value_write;
+      const bool same_storage = candidate.kind == value.kind && candidate.size == value.size &&
+          candidate.selector == value.selector && candidate.selector_width == value.selector_width &&
+          candidate.selector_before == value.selector_before &&
+          std::equal(layout.value_alternatives.begin(), layout.value_alternatives.end(),
+                     other.value_alternatives.begin(), other.value_alternatives.end(),
+                     [](const auto &first, const auto &second) {
+                       return first.selector == second.selector && first.offset == second.offset &&
+                              first.size == second.size && first.scalar == second.scalar;
+                     });
+      if (!same_storage || other.scalar != layout.scalar || other.atomic != layout.atomic ||
           other.field_type != layout.field_type || other.field_width != layout.field_width ||
           other.opaque_union != layout.opaque_union || other.union_tag_offset != layout.union_tag_offset ||
           other.union_cases != layout.union_cases)
@@ -2395,9 +3273,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         const auto overlaps = [&](std::uint64_t pc, std::size_t width) {
           return pc < callee + size && callee < pc + width;
         };
-        if (std::ranges::any_of(boundaries, [&](const auto &item) {
+        if (std::any_of(std::begin(boundaries), std::end(boundaries), [&](const auto &item) {
               return overlaps(item.first, item.second);
-            }) || std::ranges::any_of(writer_ranges, [&](const auto &item) {
+            }) || std::any_of(std::begin(writer_ranges), std::end(writer_ranges), [&](const auto &item) {
               return overlaps(item.first, item.second.size());
             }))
           continue;
@@ -2406,9 +3284,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           continue;
         const auto child = native_entry::scan(callee, callee_bytes);
         if (child.decode_failed || !child.diagnostic.empty() ||
-            std::ranges::any_of(child.instructions, [](const auto &inst) {
+            std::any_of(std::begin(child.instructions), std::end(child.instructions), [](const auto &inst) {
               return inst.flow == Flow::branch && !inst.target;
-            }) || std::ranges::none_of(child.instructions, [](const auto &inst) {
+            }) || std::none_of(std::begin(child.instructions), std::end(child.instructions), [](const auto &inst) {
               return inst.flow == Flow::call;
             }))
           continue;
@@ -2427,6 +3305,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       throw std::runtime_error("object watch sites overlap");
     previous_end = pc + site.bytes.size();
   }
+}
+
+bool Plan::follow_calls_eligible(const clangtracer::v1::ObjectWatchRequest &request) const {
+  using Request = clangtracer::v1::ObjectWatchRequest;
+  return request.backend() == Request::CODE_CACHE && request.mode() == Request::WRITES &&
+      !(request.first_seen() && !layout.value_write.active()) && !request.writer_entry() &&
+      !caller_start && request.owner_type().empty() && !layout.logical_collection();
 }
 
 Plan::~Plan() = default;
@@ -2558,14 +3443,52 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
 
 std::map<std::uint64_t, std::vector<std::uint64_t>>
 Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only,
-                       bool require_complete) const {
+                       bool require_complete, bool match_constructor_plt,
+                       std::set<std::uint64_t> *verified_plt_calls) const {
   Redirects result;
   for (auto entry : entries)
     result.try_emplace(entry);
+  std::map<std::string, std::uint64_t> complete_constructor_targets;
+  if (match_constructor_plt) {
+    for (const auto entry : entries) {
+      const auto *image = image_for(entry);
+      if (!image || !image->bias || entry < *image->bias)
+        continue;
+      const auto address = entry - *image->bias;
+      for (const auto &symbol : image->symbols)
+        if (symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
+            symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C1E"))
+          complete_constructor_targets.emplace(symbol.linkage, entry);
+    }
+  }
+  std::map<std::uint64_t, std::uint64_t> plt_aliases;
+  if (match_constructor_plt && !complete_constructor_targets.empty()) {
+    for (const auto *callers : {image_.get(), main_.get()}) {
+      if (!callers)
+        continue;
+      for (const auto &[linkage, address] : callers->plt_entries()) {
+        const auto target = complete_constructor_targets.find(linkage);
+        if (target == complete_constructor_targets.end() || ::tracer::compat::contains(result, address))
+          continue;
+        plt_aliases.emplace(address, target->second);
+        result.try_emplace(address);
+      }
+    }
+  }
   const auto edges = calls_only ? DirectEdges::calls : DirectEdges::redirects;
   find_direct_redirects(*image_, result, edges, require_complete);
   if (main_)
     find_direct_redirects(*main_, result, edges, require_complete);
+  for (const auto &[alias, target] : plt_aliases) {
+    auto found = result.find(alias);
+    if (found == result.end())
+      continue;
+    if (verified_plt_calls)
+      verified_plt_calls->insert(found->second.begin(), found->second.end());
+    auto &calls = result[target];
+    calls.insert(calls.end(), found->second.begin(), found->second.end());
+    result.erase(found);
+  }
   for (auto &[entry, sites] : result) {
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
@@ -2594,7 +3517,7 @@ std::string Plan::runtime_scope_code(const std::string &path,
   for (const auto pc : inspect(original))
     entries.try_emplace(pc);
   find_direct_redirects(runtime, entries, DirectEdges::redirects);
-  if (std::ranges::any_of(entries, [](const auto &item) { return !item.second.empty(); }))
+  if (std::any_of(std::begin(entries), std::end(entries), [](const auto &item) { return !item.second.empty(); }))
     throw std::runtime_error("an application edge enters a runtime scope redirect");
   return std::string(original);
 }
@@ -2757,7 +3680,8 @@ std::size_t Plan::redirect_padding(std::uint64_t function_start, std::uint64_t p
   std::vector<std::uint64_t> addresses;
   for (auto pc = patch + 1; pc < end + padding; ++pc)
     addresses.push_back(pc);
-  if (std::ranges::any_of(direct_redirects(addresses), [](const auto &entry) {
+  const auto redirects = direct_redirects(addresses);
+  if (std::any_of(redirects.begin(), redirects.end(), [](const auto &entry) {
         return !entry.second.empty();
       }))
     return 0;
@@ -2979,7 +3903,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
   Image image(0, module, primary, false);
   const auto &object = *image.executable.getBinary();
 #if defined(__aarch64__)
-  if (!prepared.target_triple().starts_with("aarch64-") ||
+  if (!::tracer::compat::starts_with(prepared.target_triple(), "aarch64-") ||
       prepared.target_triple().find("linux") == std::string::npos ||
       llvm::cast<ObjectFile>(object).getArch() != llvm::Triple::aarch64)
     throw std::runtime_error("snapshot method requires an AArch64 Linux ELF and receiver ABI");
@@ -3016,7 +3940,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
   const auto decoded = native_entry::scan(pc, code);
   if (decoded.decode_failed || !decoded.diagnostic.empty() || decoded.instructions.empty())
     throw std::runtime_error("snapshot method has no verified AArch64 instruction boundaries");
-  const auto entry_index = decoded.instructions.front().text.starts_with("bti") ? 1U : 0U;
+  const auto entry_index = ::tracer::compat::starts_with(decoded.instructions.front().text, "bti") ? 1U : 0U;
   if (entry_index >= decoded.instructions.size())
     throw std::runtime_error("snapshot method has no instruction after its AArch64 landing pad");
   const auto &entry = decoded.instructions[entry_index];
@@ -3027,7 +3951,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
     throw std::runtime_error("snapshot method has no relocatable AArch64 entry instruction");
   const auto patch_offset = entry.address - pc;
 #else
-  const std::span<const std::uint8_t> bytes_at_entry{
+  const ::tracer::compat::span<const std::uint8_t> bytes_at_entry{
       reinterpret_cast<const std::uint8_t *>(code.data()), code.size()};
   native_detour::Patch patch;
   std::string error;
@@ -3061,9 +3985,11 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
 clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   clangtracer::v1::ObjectWatchPlan plan;
   plan.set_executable_build_id((main_ ? *main_ : *image_).build_id);
-  plan.set_writer_build_id(image_->build_id);
   plan.set_executable_sha256((main_ ? *main_ : *image_).sha256);
-  plan.set_binary_sha256(image_->sha256);
+  const auto *binding_image = lifetimes_only && !boundaries.empty() ?
+      image_for(boundaries.begin()->first) : image_.get();
+  plan.set_writer_build_id(binding_image ? binding_image->build_id : image_->build_id);
+  plan.set_binary_sha256(binding_image ? binding_image->sha256 : image_->sha256);
   *plan.mutable_source_writers() = source_writers;
   plan.set_field_offset(layout.scalar);
   for (const auto offset : layout.pointer_offsets)
@@ -3071,8 +3997,8 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   constexpr const char *types[]{"signed int32", "signed integer", "unsigned integer",
                                 "boolean", "floating point"};
   constexpr const char *complex_types[]{"", "std::string storage", "std::variant storage",
-                                        "std::any storage"};
-  plan.set_field_encoding(layout.value_write.active() ?
+                                        "std::any storage", "union storage"};
+  plan.set_field_encoding(lifetimes_only ? "lifetime identity only" : layout.value_write.active() ?
       complex_types[static_cast<unsigned>(layout.value_write.kind)] :
       layout.union_tag_offset ? "tagged union" :
       layout.opaque_union ? "opaque union bytes" :
@@ -3105,10 +4031,18 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
       continue;
     constexpr const char *roles[] = {"construct", "destroy", "owner add", "get", "remove", "snapshot",
                                     "writer scope", "container mutation"};
-    add(pc, code(pc).substr(0, boundaries.at(pc)),
-        site.uncertain_complete ? "construct (complete/base alias)" :
-        site.deleting_destructor ? "destroy (deleting)" :
-                                  roles[static_cast<unsigned>(*site.boundary)]);
+    std::string role;
+    if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::construct)
+      role = "construct (provisional: incomplete lifetime coverage)";
+    else if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::destroy)
+      role = "destroy (coverage incomplete)";
+    else if (site.uncertain_complete)
+      role = "construct (complete/base alias)";
+    else if (site.deleting_destructor)
+      role = "destroy (deleting)";
+    else
+      role = roles[static_cast<unsigned>(*site.boundary)];
+    add(pc, code(pc).substr(0, boundaries.at(pc)), role.c_str());
   }
   return plan;
 }
@@ -3170,7 +4104,7 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
     return result;
   };
   const auto expected = keys(prepared.bindings(), true);
-  const bool legacy = std::ranges::none_of(prepared.bindings(), [](const auto &binding) {
+  const bool legacy = std::none_of(std::begin(prepared.bindings()), std::end(prepared.bindings()), [](const auto &binding) {
     return binding.role() == "destroy (deleting)";
   });
   // Older packages recorded D0 as a generic destructor or omitted it.
@@ -3184,6 +4118,7 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
 
 std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const Layout &layout) {
   const auto prefix = request.concrete_type() + "::";
+  const auto &field = layout.union_path.empty() ? request.field() : layout.union_path;
   if (layout.logical_map) {
     std::ostringstream path;
     path << prefix << request.map_field() << '[';
@@ -3191,26 +4126,28 @@ std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const
       path << request.map_key();
     else
       path << std::quoted(request.map_key());
-    path << "]." << request.field();
+    path << "]." << field;
     return path.str();
   }
   if (layout.logical_vector)
     return prefix + request.vector_field() + "[" + request.element_key_field() + "=" +
-           std::to_string(request.element_key()) + "]." + request.field();
+           std::to_string(request.element_key()) + "]." + field;
   if (!layout.pointer_offsets.empty())
-    return prefix + request.pointee_field() + "->" + request.field();
+    return prefix + request.pointee_field() + "->" + field;
   if (layout.union_tag_offset)
     return prefix + request.field().substr(0, request.field().rfind('.'));
-  return prefix + (layout.opaque_union ? "<storage>" : request.field());
+  return prefix + (layout.opaque_union && layout.union_path.empty() ? "<storage>" : field);
 }
 
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next) {
+  if (layout.value_write.kind == ValueWriteKind::union_storage)
+    return;
   if (!layout.opaque_union) {
     using FieldType = Layout::FieldType;
     const auto capture = [&](std::uint64_t bits, bool before) {
       if (layout.field_type == FieldType::int32) {
-        const auto value = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(bits));
+        const auto value = ::tracer::compat::bit_cast<std::int32_t>(static_cast<std::uint32_t>(bits));
         if (before)
           event.set_old_integer(value);
         else
@@ -3221,7 +4158,7 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
       switch (layout.field_type) {
       case FieldType::signed_integer: {
         const auto shift = 64 - layout.field_width * 8;
-        const auto shifted = std::bit_cast<std::int64_t>(bits << shift);
+        const auto shifted = ::tracer::compat::bit_cast<std::int64_t>(bits << shift);
         value.set_signed_value(shifted >> shift);
         break;
       }
@@ -3238,8 +4175,8 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
         break;
       case FieldType::real:
         value.set_real_value(layout.field_width == 4 ?
-            std::bit_cast<float>(static_cast<std::uint32_t>(bits)) :
-            std::bit_cast<double>(bits));
+            ::tracer::compat::bit_cast<float>(static_cast<std::uint32_t>(bits)) :
+            ::tracer::compat::bit_cast<double>(bits));
         break;
       case FieldType::int32:
         break;
@@ -3273,7 +4210,7 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
         event.set_new_bytes(&bits, sizeof(bits));
       return;
     }
-    const auto &[member, type] = alternative->second;
+    const auto &[member, type, width] = alternative->second;
     auto &value = before ? *event.mutable_snapshot_before() : *event.mutable_snapshot_after();
     if (before)
       event.set_old_union_member(member);
@@ -3281,13 +4218,16 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
       event.set_new_union_member(member);
     switch (type) {
     case UnionCase::Type::signed_integer:
-      value.set_signed_value(std::bit_cast<std::int32_t>(bits));
+      value.set_signed_value(::tracer::compat::bit_cast<std::int32_t>(bits));
       break;
     case UnionCase::Type::unsigned_integer:
       value.set_unsigned_value(bits);
       break;
     case UnionCase::Type::real:
-      value.set_real_value(std::bit_cast<float>(bits));
+      value.set_real_value(::tracer::compat::bit_cast<float>(bits));
+      break;
+    case UnionCase::Type::boolean:
+    case UnionCase::Type::opaque:
       break;
     }
   };
@@ -3295,12 +4235,78 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
   capture(next, false);
 }
 
+void set_union_write(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                     const UnionWriteState &before, const UnionWriteState &after) {
+  if (layout.value_write.kind != ValueWriteKind::union_storage)
+    return;
+  if (!layout.value_write.selector_width) {
+    if (event.has_old_bytes() || event.has_new_bytes())
+      event.set_diagnostic("untagged union storage; active member unavailable");
+    return;
+  }
+  const auto capture = [&](const auto &side, bool old) {
+    if (!side.tag)
+      return;
+    if (old) {
+      event.mutable_storage_write()->set_before_discriminator(*side.tag);
+      if (*side.tag <= UINT32_MAX)
+        event.set_old_union_tag(*side.tag);
+    } else {
+      event.mutable_storage_write()->set_after_discriminator(*side.tag);
+      if (*side.tag <= UINT32_MAX)
+        event.set_new_union_tag(*side.tag);
+    }
+    const auto selected = layout.union_cases.find(*side.tag);
+    if (selected == layout.union_cases.end())
+      return;
+    const auto &alt = selected->second;
+    if (old)
+      event.set_old_union_member(alt.member);
+    else
+      event.set_new_union_member(alt.member);
+    // Publishing a tag alone does not prove that its new alternate object
+    // has already been initialized. Pair typed values only under a stable tag.
+    if (!side.scalar || before.tag != after.tag)
+      return;
+    const auto bits = *side.scalar;
+    auto &value = old ? *event.mutable_snapshot_before() : *event.mutable_snapshot_after();
+    switch (alt.type) {
+    case UnionCase::Type::signed_integer: {
+      const auto shift = 64 - alt.width * 8;
+      value.set_signed_value(::tracer::compat::bit_cast<std::int64_t>(bits << shift) >> shift);
+      break;
+    }
+    case UnionCase::Type::unsigned_integer:
+      value.set_unsigned_value(bits);
+      break;
+    case UnionCase::Type::real:
+      value.set_real_value(alt.width == 4 ?
+          ::tracer::compat::bit_cast<float>(static_cast<std::uint32_t>(bits)) : ::tracer::compat::bit_cast<double>(bits));
+      break;
+    case UnionCase::Type::boolean:
+      if (bits <= 1)
+        value.set_boolean_value(bits != 0);
+      else
+        value.set_bytes_value(&bits, 1);
+      break;
+    case UnionCase::Type::opaque:
+      break;
+    }
+  };
+  capture(before, true);
+  capture(after, false);
+  if ((event.has_old_bytes() || event.has_new_bytes()) &&
+      (!before.tag || !after.tag || !layout.union_cases.count(*before.tag) ||
+       !layout.union_cases.count(*after.tag)))
+    event.set_diagnostic("union discriminator is unreadable or unregistered");
+}
+
 void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
                        const ValueStoreBytes *before, const ValueStoreBytes *after) {
   using Region = clangtracer::v1::ObjectObservation::StorageWrite;
   auto &store = *event.mutable_storage_write();
   constexpr Region::Region regions[]{Region::REGION_UNSPECIFIED, Region::REPRESENTATION,
-                                      Region::STRING_DATA, Region::ANY_PAYLOAD};
+                                      Region::STRING_DATA, Region::ANY_PAYLOAD, Region::UNION_TAG};
   store.set_region(regions[static_cast<unsigned>(write.region)]);
   store.set_address(write.address);
   store.set_offset(write.offset);

@@ -1,6 +1,8 @@
 #include "cpp_resolver.hpp"
 #include "header_context.hpp"
 #include "prepared_types.hpp"
+#include "snapshot_limits.hpp"
+#include "snapshot_members.hpp"
 #include "prepared_adapter.hpp"
 #include "prepared_contract.hpp"
 #include "prepared_header_search.hpp"
@@ -9,6 +11,8 @@
 #include "../include/tracer/receiver_abi.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
+
+#include <llvm/Demangle/Demangle.h>
 
 #ifndef TRACER_CLANG_RESOURCE_DIR
 #error                                                                                             \
@@ -20,6 +24,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <iterator>
+#include <cstdio>
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
@@ -64,13 +70,7 @@ namespace {
 namespace fs = std::filesystem;
 namespace api = clangtracer::v1;
 
-constexpr std::size_t kMaxTranslationUnits = 256;
-constexpr std::size_t kMaxExplicitSources = 128;
-constexpr std::size_t kMaxArguments = 8;
-constexpr std::size_t kMaxReceiverFields = 128;
 constexpr std::size_t kMaxReceiverSourcePath = 4096;
-constexpr std::size_t kMaxReceiverArguments = 512;
-constexpr std::size_t kMaxReceiverArgumentBytes = 65536;
 
 std::string trim(std::string value) {
   const auto first =
@@ -142,7 +142,10 @@ void validate_snapshot_environment(clang::ASTContext &ast) {
         "snapshot return type requires pointer-sized Itanium vtable entries");
 }
 
-void validate_snapshot_candidate(const clang::CXXRecordDecl *snapshot_record) {
+// The prepared adapter declares nested classes publicly, so a private nested
+// implementation class can be named there even though the header cannot.
+void validate_snapshot_candidate(const clang::CXXRecordDecl *snapshot_record,
+                                 bool allow_private_nested = false) {
   if (!snapshot_record || !snapshot_record->isCompleteDefinition() ||
       snapshot_record->isUnion() || snapshot_record->isDependentType() ||
       snapshot_record->isAbstract() || !snapshot_record->getIdentifier() ||
@@ -150,7 +153,7 @@ void validate_snapshot_candidate(const clang::CXXRecordDecl *snapshot_record) {
       snapshot_record->getFormalLinkage() != clang::Linkage::External)
     throw std::invalid_argument(
         "snapshot return type must name a complete, concrete, externally visible record");
-  for (auto *record = snapshot_record; record;
+  for (auto *record = snapshot_record; record && !allow_private_nested;
        record = llvm::dyn_cast<clang::CXXRecordDecl>(record->getDeclContext())) {
     const auto access = record->getAccess();
     if (access != clang::AS_none && access != clang::AS_public)
@@ -196,7 +199,7 @@ const clang::CXXRecordDecl *snapshot_record_type(clang::QualType type) {
 std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
     clang::ASTContext &ast, const clang::CXXRecordDecl *base,
     const std::vector<const clang::CXXRecordDecl *> &definitions,
-    bool include_base) {
+    bool include_base, bool allow_private_nested = false) {
   if (!base || !base->isPolymorphic())
     return {};
   try {
@@ -220,7 +223,7 @@ std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
          })))
       continue;
     try {
-      validate_snapshot_candidate(record);
+      validate_snapshot_candidate(record, allow_private_nested);
     } catch (const std::invalid_argument &) {
       continue;
     }
@@ -367,7 +370,8 @@ std::vector<const clang::CXXRecordDecl *> discover_member_types(
 
 PreparedSnapshots prepare_snapshot_roots(
     clang::ASTContext &ast, const clang::FunctionDecl &function,
-    const clang::CXXMethodDecl *method) {
+    const clang::CXXMethodDecl *method, int level,
+    const tracer::SnapshotLimits &limits) {
   std::vector<const clang::CXXRecordDecl *> roots;
   const auto add = [&](clang::QualType type) {
     if (const auto *record = snapshot_record_type(type))
@@ -396,14 +400,122 @@ PreparedSnapshots prepare_snapshot_roots(
     return left->getCanonicalDecl() == right->getCanonicalDecl();
   }), roots.end());
 
+  // level 3 follows pointer and reference members by the pointee's exact type
+  // and then follows the pointee's own members; level 2 admits an opaque
+  // implementation pointer of the result; level 1 admits derived classes of a
+  // polymorphic result member; level 0 follows nothing automatically.
+  const bool extended = level >= 3;
+  const bool exact_pointees = level >= 2;
+  const unsigned follow_depth = limits.follow_depth;
+  std::map<const clang::CXXRecordDecl *, unsigned> depth_of;
+  std::deque<const clang::CXXRecordDecl *> pending;
+  for (const auto *root : roots) {
+    depth_of.emplace(root->getCanonicalDecl(), 0);
+    pending.push_back(root);
+  }
   std::set<const clang::CXXRecordDecl *> roots_seen;
-  std::vector<const clang::CXXRecordDecl *> pending = roots;
   std::vector<SnapshotRoot> root_policies;
+  const auto enqueue = [&](const clang::CXXRecordDecl *record, unsigned depth) {
+    if (!record || depth > follow_depth ||
+        !depth_of.emplace(record->getCanonicalDecl(), depth).second)
+      return;
+    pending.push_back(record);
+  };
+  // Pointer and reference members, and those of nested records and smart
+  // pointer pointees, whose pointee can be captured. Anything else stays
+  // address-only.
+  const auto discover = [&](const clang::CXXRecordDecl *root, unsigned depth,
+                            SnapshotRoot &policy) {
+    bool capped_reported = false, nested_reported = false;
+    const auto walk = [&](auto &&self, const clang::CXXRecordDecl *record,
+                          const std::string &prefix, unsigned nesting) -> void {
+      for (const auto *field : snapshot_members::fields(record)) {
+        if (snapshot_members::find(record, field->getName()) != field)
+          continue;
+        if (policy.members.size() >= limits.record_members) {
+          if (snapshot_members::followable(field->getType()) && !capped_reported) {
+            capped_reported = true;
+            std::fprintf(stderr,
+                         "prepare: %s has more followable members than --record-members "
+                         "(%u); the rest stay address-only\n",
+                         root->getQualifiedNameAsString().c_str(), limits.record_members);
+          }
+          continue;
+        }
+        const auto type = field->getType();
+        const auto path = prefix + field->getNameAsString();
+        if (snapshot_members::followable(type)) {
+          switch (snapshot_members::classify(type)) {
+          case snapshot_members::Referent::record: {
+            const auto *pointee = snapshot_members::referent_record(type);
+            if (!pointee || pointee->isUnion() || pointee->isInStdNamespace())
+              break;
+            try {
+              // The capture reads the pointee's out-of-line storage only where
+              // it can check it. A pointee holding anything else is followed
+              // only with evidence that it is a live object: a polymorphic
+              // pointee whose RTTI matches a derived class, or the declared
+              // class of an owner-held implementation pointer.
+              const bool safe = snapshot_members::checked_safe(tracer::prepared::record_type(ast, pointee));
+              std::vector<const clang::CXXRecordDecl *> member_types;
+              if (pointee->isPolymorphic()) {
+                const bool opaque = ast.getSourceManager().isBeforeInTranslationUnit(
+                    field->getLocation(), pointee->getLocation());
+                member_types = discover_dynamic_types(ast, pointee, definitions, safe || opaque, true);
+              } else if (safe) {
+                validate_snapshot_candidate(pointee, true);
+                member_types = {pointee};
+              }
+              if (member_types.empty())
+                break;
+              for (const auto *member_type : member_types)
+                enqueue(member_type, depth + 1);
+              policy.members.push_back({path, std::move(member_types), true});
+            } catch (const std::invalid_argument &) {
+            }
+            break;
+          }
+          case snapshot_members::Referent::text:
+          case snapshot_members::Referent::scalar:
+            policy.members.push_back({path, {}, true});
+            break;
+          case snapshot_members::Referent::other:
+            break;
+          }
+        } else {
+          const clang::CXXRecordDecl *inner = snapshot_members::smart_record(type);
+          const bool smart = inner != nullptr;
+          if (!inner) {
+            inner = type.getCanonicalType()->getAsCXXRecordDecl();
+            inner = inner ? inner->getDefinition() : nullptr;
+            if (inner && (inner->isInStdNamespace() || inner->isUnion() || inner->isDependentType()))
+              inner = nullptr;
+          }
+          if (inner && nesting < limits.nested_depth) {
+            self(self, inner, path + (smart ? ".*." : "."), nesting + 1);
+          } else if (inner && !nested_reported) {
+            const auto inner_fields = snapshot_members::fields(inner);
+            if (std::any_of(inner_fields.begin(), inner_fields.end(), [](const auto *inner_field) {
+                  return snapshot_members::followable(inner_field->getType());
+                })) {
+              nested_reported = true;
+              std::fprintf(stderr,
+                           "prepare: %s has pointer members nested more than --nested-depth "
+                           "(%u) levels inside it; they stay address-only\n",
+                           root->getQualifiedNameAsString().c_str(), limits.nested_depth);
+            }
+          }
+        }
+      }
+    };
+    walk(walk, root, "", 0);
+  };
   while (!pending.empty()) {
-    const auto *root = pending.back();
-    pending.pop_back();
+    const auto *root = pending.front();
+    pending.pop_front();
     if (!root || !roots_seen.insert(root->getCanonicalDecl()).second)
       continue;
+    const auto depth = depth_of[root->getCanonicalDecl()];
     SnapshotRoot policy;
     policy.record = root;
     if (dynamic_result_root &&
@@ -412,22 +524,13 @@ PreparedSnapshots prepare_snapshot_roots(
     const auto policy_fields = policies.policies.find(root->getCanonicalDecl());
     if (policy_fields != policies.policies.end()) {
       for (const auto &field_name : policy_fields->second) {
-        const clang::FieldDecl *field = nullptr;
-        for (const auto *candidate : root->fields())
-          if (candidate->getNameAsString() == field_name) {
-            field = candidate;
-            break;
-          }
-        if (!field)
-          throw std::invalid_argument("FollowPointers field is not a direct member of " +
+        std::vector<snapshot_members::Step> steps;
+        if (!snapshot_members::resolve(root, field_name, steps))
+          throw std::invalid_argument(
+              "FollowPointers field must name a non-volatile raw record pointer or reference of " +
               root->getQualifiedNameAsString() + ": " + field_name);
-        const auto field_type = field->getType();
-        if (field_type.isVolatileQualified() || !field_type->isPointerType() ||
-            field_type->getPointeeType().isVolatileQualified())
-          throw std::invalid_argument("FollowPointers field must be a non-volatile raw record pointer: " +
-                                      field_name);
-        const auto *pointee = field_type->getPointeeType()->getAsCXXRecordDecl();
-        pointee = pointee ? pointee->getDefinition() : nullptr;
+        const auto field_type = steps.back().field->getType();
+        const auto *pointee = snapshot_members::referent_record(field_type);
         if (!pointee)
           throw std::invalid_argument("FollowPointers pointee is incomplete in prepare inputs: " +
                                       field_name);
@@ -436,9 +539,31 @@ PreparedSnapshots prepare_snapshot_roots(
           throw std::invalid_argument(
               "FollowPointers polymorphic pointee has no eligible concrete type in prepare inputs: " +
               field_name);
+        for (const auto *member_type : member_types)
+          if (extended)
+            enqueue(member_type, depth + 1);
         policy.members.push_back({field_name, std::move(member_types), false});
       }
-    } else if (!policies.any_policies.count(root->getCanonicalDecl()) && result_record &&
+    } else if (extended && depth < follow_depth && !root->isUnion() &&
+               !root->isInStdNamespace()) {
+      discover(root, depth, policy);
+    } else if (extended && follow_depth > 0 && depth >= follow_depth && !root->isUnion() &&
+               !root->isInStdNamespace()) {
+      // Reached through the last followed level: say what stays address-only.
+      static std::set<std::string> reported;
+      const auto fields = snapshot_members::fields(root);
+      if (std::any_of(fields.begin(), fields.end(),
+                      [](const auto *field) {
+                        return snapshot_members::followable(field->getType()) &&
+                               snapshot_members::classify(field->getType()) ==
+                                   snapshot_members::Referent::record;
+                      }) &&
+          reported.insert(root->getQualifiedNameAsString()).second)
+        std::fprintf(stderr,
+                     "prepare: pointer members of %s are address-only: it is %u levels "
+                     "below a captured record (--follow-depth, TRACER_PREPARE_FOLLOW_DEPTH)\n",
+                     root->getQualifiedNameAsString().c_str(), follow_depth);
+    } else if (!extended && level >= 1 && result_record &&
                result_record->getCanonicalDecl() == root->getCanonicalDecl()) {
       for (const auto *field : root->fields()) {
         const auto field_type = field->getType();
@@ -449,7 +574,13 @@ PreparedSnapshots prepare_snapshot_roots(
         pointee = pointee ? pointee->getDefinition() : nullptr;
         if (!pointee || !pointee->isPolymorphic())
           continue;
-        auto member_types = discover_dynamic_types(ast, pointee, definitions, false);
+        // A destroyed object keeps the vptr of its own class, so only an
+        // owner-held implementation pointer (pointee defined after the field)
+        // is admitted by its exact type.
+        const bool opaque = exact_pointees &&
+            ast.getSourceManager().isBeforeInTranslationUnit(field->getLocation(),
+                                                             pointee->getLocation());
+        auto member_types = discover_dynamic_types(ast, pointee, definitions, opaque);
         if (!member_types.empty())
           policy.members.push_back(
               {field->getNameAsString(), std::move(member_types), true});
@@ -695,6 +826,36 @@ std::vector<std::string> split_parameters(std::string_view text) {
   return result;
 }
 
+// The class of a template class constructor or destructor selector ("ns::Box<int>::Box" and
+// "ns::Box<int>::~Box" give "ns::Box<int>"), or an empty string for any other selector.
+std::string template_cdtor_class(const std::string &qualified) {
+  int depth = 0;
+  std::vector<std::size_t> cuts;
+  for (std::size_t i = 0; i + 1 < qualified.size(); ++i) {
+    if (qualified[i] == '<') ++depth;
+    else if (qualified[i] == '>') --depth;
+    else if (depth == 0 && qualified[i] == ':' && qualified[i + 1] == ':') {
+      cuts.push_back(i);
+      ++i;
+    }
+  }
+  if (cuts.empty())
+    return {};
+  const auto last = qualified.substr(cuts.back() + 2);
+  const auto owner = qualified.substr(0, cuts.back());
+  auto previous = owner.substr(cuts.size() > 1 ? cuts[cuts.size() - 2] + 2 : 0);
+  if (const auto lt = previous.find('<'); lt != std::string::npos)
+    previous.resize(lt);
+  return (!last.empty() && last[0] == '~') || last == previous ? owner : std::string();
+}
+
+// A linkage symbol that names a constructor or destructor entry point.
+bool cdtor_linkage_symbol(const std::string &text) {
+  llvm::ItaniumPartialDemangler demangler;
+  return text.size() > 2 && text.compare(0, 2, "_Z") == 0 &&
+         !demangler.partialDemangle(text.c_str()) && demangler.isCtorOrDtor();
+}
+
 Selector parse_selector(const std::string& text) {
   Selector selector;
   auto open = std::string::npos;
@@ -779,7 +940,6 @@ struct Candidate {
   bool is_const = false;
   bool is_volatile = false;
   clang::RefQualifierKind ref_qualifier = clang::RQ_None;
-  std::string snapshot_result_root;
   api::ProbeSpec spec;
   std::string unsupported_reason;
   bool selected_by_type = false;
@@ -794,7 +954,10 @@ struct FrozenInvocation {
   api::PreparedInjector prepared_profile;
   std::string adapter_symbol;
   bool select_template = false;
+  bool instantiate_members = false;  // template class constructor/destructor selection
   bool pointer_layouts = true;
+  int member_level = 3;
+  api::SnapshotLimits limits;
   bool receiver_storage = false;
 };
 
@@ -911,6 +1074,9 @@ public:
       , translation_unit_(std::move(translation_unit))
       , target_triple_(std::move(target_triple)), sema_(sema) {}
 
+  // A constructor or destructor of a class template is found in an explicit instantiation.
+  bool shouldVisitTemplateInstantiations() const { return invocation_.instantiate_members; }
+
   bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
     if (invocation_.select_template)
       return true;
@@ -947,13 +1113,6 @@ public:
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
 
     Candidate candidate;
-    if (!invocation_.adapter_symbol.empty()) {
-      const auto result_type = declaration->getReturnType();
-      if (result_type->isPointerType() || result_type->isReferenceType())
-        if (const auto *record = snapshot_record_type(result_type))
-          candidate.snapshot_result_root = tracer::prepared::type_name(
-              *context_, tracer::prepared::record_type(*context_, record));
-    }
     candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
     candidate.selected_by_type = selected_by_type;
     candidate.requires_typed_adapter = tracer::prepared::template_instance(*declaration) ||
@@ -1019,10 +1178,6 @@ public:
       if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
       }
-      if (llvm::isa<clang::CXXConstructorDecl>(declaration) ||
-          llvm::isa<clang::CXXDestructorDecl>(declaration)) {
-        throw std::runtime_error("constructors and destructors are unsupported");
-      }
       if (declaration->getFormalLinkage() != clang::Linkage::External) {
         throw std::runtime_error("callables with internal or non-external linkage are unsupported");
       }
@@ -1039,9 +1194,6 @@ public:
       }
       if (prototype->isVariadic()) {
         throw std::runtime_error("variadic callables are unsupported");
-      }
-      if (declaration->getNumParams() > kMaxArguments) {
-        throw std::runtime_error("callables with more than eight arguments are unsupported");
       }
       if (prototype->hasExtParameterInfos()) {
         for (const auto& info : prototype->getExtParameterInfos()) {
@@ -1061,14 +1213,19 @@ public:
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
-          const auto snapshots = prepare_snapshot_roots(*context_, *declaration, method);
-          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
+          const auto snapshots = prepare_snapshot_roots(
+              *context_, *declaration, method,
+              invocation_.pointer_layouts ? invocation_.member_level
+                                          : std::min(invocation_.member_level, 1),
+              tracer::resolve_limits(&invocation_.limits, nullptr));
+          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *sema_, *header_search_,
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts,
               snapshots.types);
           auto &package = *candidate.spec.mutable_prepared();
           package = invocation_.prepared_profile;
           package.set_target_triple(context_->getTargetInfo().getTriple().str());
           package.set_adapter_declarations(std::move(adapter.source));
+          *package.mutable_snapshot_limits() = invocation_.limits;
           for (const auto *snapshot_type : snapshots.types)
             tracer::prepared::describe_record(*context_, *snapshot_type,
                 *package.add_snapshot_types());
@@ -1078,6 +1235,16 @@ public:
             *package.add_snapshot_records() = record;
           for (const auto &header : adapter.standard_headers)
             package.add_adapter_standard_headers(header);
+          // A captured C string is read as a string view or string.
+          const bool text_member = std::any_of(
+              snapshots.records.begin(), snapshots.records.end(), [](const auto &record) {
+                return std::any_of(record.automatic_members().begin(),
+                                   record.automatic_members().end(), [](const auto &member) {
+                                     return member.dynamic_types_size() == 0;
+                                   });
+              });
+          if (text_member && !adapter.standard_headers.count("string"))
+            package.add_adapter_standard_headers("string");
         }
       } else {
         auto *signature = candidate.spec.mutable_signature();
@@ -1108,7 +1275,7 @@ public:
     if (!invocation_.prepared_headers.empty()) {
       auto arguments = tracer::prepared::toolchain_arguments(invocation_.prepared_profile,
           {runtime::jit_flags.begin(), runtime::jit_flags.end()});
-      arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+      arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
           "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
       const auto &abi_options = invocation_.prepared_profile.adapter_abi_options();
       arguments.insert(arguments.end(), abi_options.begin(), abi_options.end());
@@ -1138,12 +1305,6 @@ private:
       return;
     }
     const auto fields = record->fields();
-    if (std::distance(fields.begin(), fields.end()) >
-        static_cast<std::ptrdiff_t>(kMaxReceiverFields)) {
-      unavailable("receiver class has more than 128 fields");
-      return;
-    }
-
     const auto& source_manager = context_->getSourceManager();
     const auto main_file = source_manager.getMainFileID();
     const auto main_location = source_manager.getLocForStartOfFile(main_file);
@@ -1154,19 +1315,9 @@ private:
       unavailable("resolver did not capture the translation unit compiler invocation");
       return;
     }
-    std::size_t total_argument_bytes = 0;
-    for (const auto& argument : invocation_.arguments) {
-      if (argument.size() + 1 > kMaxReceiverArgumentBytes - total_argument_bytes) {
-        unavailable("translation unit invocation exceeds receiver metadata limits");
-        return;
-      }
-      total_argument_bytes += argument.size() + 1;
-    }
     if (source_path.empty() || source_path.size() >= kMaxReceiverSourcePath ||
-        invocation_.working_directory.empty() || invocation_.source_argument.empty() ||
-        invocation_.arguments.size() > kMaxReceiverArguments ||
-        total_argument_bytes > kMaxReceiverArgumentBytes) {
-      unavailable("translation unit invocation exceeds receiver metadata limits");
+        invocation_.working_directory.empty() || invocation_.source_argument.empty()) {
+      unavailable("translation unit invocation is incomplete");
       return;
     }
     for (const auto* field : fields) {
@@ -1215,10 +1366,6 @@ private:
         resolved_field->set_access(record->isClass() ? "private" : "public");
         break;
       }
-    }
-    if (receiver->ByteSizeLong() > kMaxReceiverArgumentBytes) {
-      candidate.spec.clear_receiver();
-      candidate.spec.set_receiver_unavailable_reason("receiver metadata exceeds 64 KiB");
     }
   }
 
@@ -1489,9 +1636,6 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
                                       const std::string& compilation_database,
                                       const std::vector<std::string>& sources) {
   const auto selector = parse_selector(name);
-  if (sources.size() > kMaxExplicitSources) {
-    throw std::runtime_error("too many --source entries (maximum 128)");
-  }
   auto database = load_database(compilation_database);
   std::vector<std::string> source_files;
   if (sources.empty()) {
@@ -1523,10 +1667,6 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
   source_files.erase(std::unique(source_files.begin(), source_files.end()), source_files.end());
   if (source_files.empty()) {
     throw std::runtime_error("compilation database contains no source files");
-  }
-  if (source_files.size() > kMaxTranslationUnits) {
-    throw std::runtime_error("compilation database has more than 256 source "
-                             "files; restrict with --source");
   }
 
   const fs::path resource_dir(TRACER_CLANG_RESOURCE_DIR);
@@ -1654,8 +1794,8 @@ std::vector<api::ObjectWatchRequest::SourceWriter> discover_object_writers(
       const auto *method = operation->getMethodDecl();
       if (method) {
         const auto name = method->getNameAsString();
-        if (name == "store" || name == "exchange" || name.starts_with("fetch_") ||
-            name.starts_with("compare_exchange_"))
+        if (name == "store" || name == "exchange" || ::tracer::compat::starts_with(name, "fetch_") ||
+            ::tracer::compat::starts_with(name, "compare_exchange_"))
           record(operation->getImplicitObjectArgument());
       }
       return true;
@@ -1690,8 +1830,15 @@ std::vector<api::ObjectWatchRequest::SourceWriter> discover_object_writers(
 ResolvedCallable resolve_header_callable(const std::string& name,
                                          const api::ProbeSpec& headers,
                                          const PreparedHeaderCommand& command,
-                                         bool pointer_layouts, bool receiver_storage) {
+                                         bool pointer_layouts, int member_level,
+                                         const api::SnapshotLimits& limits, bool receiver_storage) {
   const auto selector = parse_selector(name);
+  if (cdtor_linkage_symbol(selector.qualified_name))
+    throw std::invalid_argument(
+        "a prepared package binds the complete-object constructor or destructor (C1/D1) of a C++ "
+        "selector; the deleting destructor (D0) and base-object (C2/D2) entry points cannot be "
+        "prepared from source. Probe them by linkage symbol on the DWARF path "
+        "(%probe inject SYMBOL)");
   if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
   // Use the SDK fallback unless the database names a different installed
@@ -1701,8 +1848,13 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::error_code path_error;
   const bool installed_driver = fs::path(command.driver).is_absolute() &&
       fs::is_regular_file(command.driver, path_error);
-  const bool alternate_driver = installed_driver &&
-      !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
+  const bool alternate_driver = installed_driver && [&] {
+    const auto selected = fs::canonical(command.driver, path_error);
+    if (path_error)
+      return false;
+    const auto builtin = fs::canonical(TRACER_PREPARE_BUILD_CXX, path_error);
+    return !path_error && selected != builtin;
+  }();
   FrozenInvocation invocation;
   auto &profile = invocation.prepared_profile;
   profile.set_format_version(tracer::prepared::typed_version);
@@ -1765,7 +1917,18 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const auto angle = selector.qualified_name.find('<');
   const bool select_template = angle != std::string::npos &&
       selector.qualified_name.find('>', angle) != std::string::npos;
-  if (select_template) {
+  // `&Class<T>::Class` and `&Class<T>::~Class` are ill-formed, so a constructor or destructor
+  // of a class template is selected from the implicit instantiation of the class. That declares
+  // the members without compiling the bodies of unrelated ones, which an explicit instantiation
+  // would (an unused `T copy() const` of a move-only `T` is valid until it is instantiated).
+  const auto cdtor_class = select_template ? template_cdtor_class(selector.qualified_name)
+                                           : std::string();
+  const bool cdtor_selector = !cdtor_class.empty();
+  if (select_template && cdtor_selector) {
+    const auto qualified = cdtor_class.rfind("::", 0) == 0 ? cdtor_class : "::" + cdtor_class;
+    code += "\nstatic_assert(sizeof(" + qualified + ") > 0);\n";
+    arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
+  } else if (select_template) {
     if (name.find_first_of("#;{}\\\r\n") != std::string::npos)
       throw std::invalid_argument("invalid character in prepared template selector");
     std::string parameters;
@@ -1798,8 +1961,11 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   tool.mapVirtualFile(source, code);
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
-  invocation.select_template = select_template;
+  invocation.select_template = select_template && !cdtor_selector;
+  invocation.instantiate_members = select_template && cdtor_selector;
   invocation.pointer_layouts = pointer_layouts;
+  invocation.member_level = member_level;
+  invocation.limits = limits;
   invocation.receiver_storage = receiver_storage;
   invocation.prepared_headers.assign(headers.include_headers().begin(),
                                      headers.include_headers().end());
@@ -1825,7 +1991,7 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   const auto selector = parse_selector(name);
   auto arguments = tracer::prepared::toolchain_arguments(adapter,
       {runtime::jit_flags.begin(), runtime::jit_flags.end()});
-  arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+  arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
       "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
   arguments.insert(arguments.end(), adapter.adapter_abi_options().begin(),
                    adapter.adapter_abi_options().end());
@@ -1878,7 +2044,6 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
         }))
       throw std::runtime_error("prepared snapshot policy has an incompatible dynamic type index");
   };
-  std::vector<std::uint32_t> automatic_snapshot_roots;
   for (const auto &policy : adapter.snapshot_records()) {
     if (policy.type_index() >= snapshot_types.size() ||
         !snapshot_roots.insert(policy.type_index()).second)
@@ -1892,17 +2057,12 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
                                      bool automatic) {
       if (member.field().empty())
         throw std::runtime_error("prepared snapshot member has an empty field name");
-      const clang::FieldDecl *field = nullptr;
-      for (const auto *candidate : root->fields())
-        if (candidate->getNameAsString() == member.field()) {
-          field = candidate;
-          break;
-        }
       if (member.erased_any()) {
+        const auto *field = snapshot_members::find(root, member.field());
         const auto *erased = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
         if (automatic || !erased || erased->getQualifiedNameAsString() != "std::any" ||
             field->getType().isVolatileQualified() || member.dynamic_types().empty())
-          throw std::runtime_error("prepared erased snapshot requires a direct std::any member and payloads");
+          throw std::runtime_error("prepared erased snapshot requires a std::any member and payloads");
         std::set<std::uint32_t> unique;
         for (const auto index : member.dynamic_types()) {
           if (index >= snapshot_types.size() || !unique.insert(index).second)
@@ -1911,24 +2071,24 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
         }
         return;
       }
-      if (!field || field->getType().isVolatileQualified() ||
-          !field->getType()->isPointerType() ||
-          field->getType()->getPointeeType().isVolatileQualified())
-        throw std::runtime_error("prepared snapshot member is not a direct raw record pointer");
-      const auto *base = field->getType()->getPointeeType()->getAsCXXRecordDecl();
-      base = base ? base->getDefinition() : nullptr;
+      std::vector<snapshot_members::Step> steps;
+      if (!snapshot_members::resolve(root, member.field(), steps))
+        throw std::runtime_error("prepared snapshot member is not a raw pointer or reference path");
+      const auto *field = steps.back().field;
+      const auto kind = snapshot_members::classify(field->getType());
+      if (kind == snapshot_members::Referent::text ||
+          kind == snapshot_members::Referent::scalar) {
+        if (!member.dynamic_types().empty())
+          throw std::runtime_error("prepared snapshot member of a non-record pointee has layouts");
+        return;
+      }
+      const auto *base = snapshot_members::referent_record(field->getType());
       if (!base)
         throw std::runtime_error("prepared snapshot member pointee is incomplete");
       if (member.dynamic_types().empty())
         throw std::runtime_error("prepared snapshot member has no admitted pointee layouts");
-      if (automatic && !base->isPolymorphic())
-        throw std::runtime_error("automatic snapshot member pointee must be polymorphic");
       for (const auto type_index : member.dynamic_types()) {
         validate_dynamic_edge(base, type_index, base->isPolymorphic());
-        if (automatic &&
-            snapshot_types[type_index]->getCanonicalDecl() == base->getCanonicalDecl())
-          throw std::runtime_error(
-              "automatic snapshot member must have a concrete derived pointee layout");
         if (!base->isPolymorphic() &&
             snapshot_types[type_index]->getCanonicalDecl() != base->getCanonicalDecl())
           throw std::runtime_error(
@@ -1938,7 +2098,6 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
     if (!policy.automatic_members().empty()) {
       if (!policy.members().empty())
         throw std::runtime_error("prepared snapshot record mixes automatic and explicit members");
-      automatic_snapshot_roots.push_back(policy.type_index());
     }
     for (const auto &member : policy.members())
       validate_member(member, false);
@@ -1962,15 +2121,6 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   const std::string failure = "generated prepared adapter does not reproduce the target ABI and layout";
   if (candidate == candidates.end())
     throw std::runtime_error(failure + " for '" + name + "'");
-  if (!automatic_snapshot_roots.empty()) {
-    if (candidate->snapshot_result_root.empty())
-      throw std::runtime_error("automatic snapshot members require a pointer or reference result record");
-    for (const auto type_index : automatic_snapshot_roots)
-      if (adapter.snapshot_types(static_cast<int>(type_index)).record_name() !=
-          candidate->snapshot_result_root)
-        throw std::runtime_error(
-            "automatic prepared snapshot member is not on the result root record");
-  }
   const auto &expected = original.spec.debug_info();
   const auto &actual = candidate->spec.debug_info();
   const auto &expected_signature = original.spec.signature();

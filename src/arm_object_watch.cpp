@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "arm_object_watch.hpp"
 
 #include "debug_resolver.hpp"
@@ -30,27 +31,31 @@ using namespace std::chrono_literals;
 api::ObjectWatchStatus preview_snapshots(const api::ObjectWatchRequest &request, std::uint32_t pid,
                                         const std::string &executable) {
   using Request = api::ObjectWatchRequest;
-  if (request.methods().empty() || request.methods_size() > 16 || request.concrete_type().empty() ||
-      request.no_values() || request.stack_depth() > 64 || request.snapshot_fields_size() > 128 ||
-      request.snapshot_keys_size() > 128 || request.snapshot_max_depth() > context_engine::max_capture_depth ||
+  if (request.methods().empty() || request.concrete_type().empty() || request.no_values() ||
+      request.stack_depth() > 64 ||
+      request.snapshot_max_depth() > context_engine::max_capture_depth ||
       request.snapshot_max_bytes() > max_snapshot_bytes || request.max_instances() > 65536 ||
-      request.max_elements() > context_engine::max_capture_items || request.max_string_bytes() > max_snapshot_bytes ||
-      request.writer_tid() || request.writer_entry() || request.first_seen() || request.follow_calls() ||
+      request.max_elements() > context_engine::max_capture_items ||
+      request.max_string_bytes() > max_snapshot_bytes || request.writer_tid() ||
+      request.writer_entry() || request.first_seen() || request.follow_calls() ||
       request.runtime_limit() || request.event_buffer() || request.syscall_output() ||
       request.cfi_stack() || request.serialize_wait_us() || !request.shared_file().empty() ||
       request.backend() != Request::PTRACE || request.overflow_policy() != Request::DROP_NEW ||
-      !request.application_rendezvous().empty() ||
-      !request.owner_add().empty() || !request.owner_get().empty() ||
-      !request.owner_remove().empty() || !request.owner_snapshot().empty() ||
-      !request.base_type().empty() || !request.owner_type().empty() || !request.code_symbol().empty() ||
-      !request.collection().empty() || !request.vector_field().empty() || !request.map_field().empty() ||
-      !request.pointee_field().empty() || !request.async_signals().empty() ||
-      request.snapshot_module().size() > 4096 || request.snapshot_module().find('\0') != std::string::npos ||
+      !request.application_rendezvous().empty() || !request.owner_add().empty() ||
+      !request.owner_get().empty() || !request.owner_remove().empty() ||
+      !request.owner_snapshot().empty() || !request.base_type().empty() ||
+      !request.owner_type().empty() || !request.code_symbol().empty() ||
+      !request.collection().empty() || !request.vector_field().empty() ||
+      !request.map_field().empty() || !request.pointee_field().empty() ||
+      !request.async_signals().empty() || request.snapshot_module().size() > 4096 ||
+      request.snapshot_module().find('\0') != std::string::npos ||
       (pid && !request.has_prepared_bindings()) ||
       (request.synchronization() != Request::THREAD_CONFINED &&
        request.synchronization() != Request::CALLER_LOCK &&
-       request.synchronization() != Request::STABLE_AT_BOUNDARIES))
-    throw std::invalid_argument("method snapshots require prepared methods and declared synchronization");
+       request.synchronization() != Request::STABLE_AT_BOUNDARIES)) {
+    throw std::invalid_argument(
+        "method snapshots require prepared methods and declared synchronization");
+  }
   std::set<std::string> fields;
   for (const auto &field : request.snapshot_fields())
     if (field.empty() || field.size() > 512 || field.find('\0') != std::string::npos || !fields.insert(field).second)
@@ -67,10 +72,10 @@ api::ObjectWatchStatus preview_snapshots(const api::ObjectWatchRequest &request,
   std::set<std::uint64_t> entries;
   for (const auto &method : request.methods()) {
     auto receiver = std::string_view(method.header_types().record_name());
-    if (receiver.starts_with("::"))
+    if (::tracer::compat::starts_with(receiver, "::"))
       receiver.remove_prefix(2);
     auto selected = std::string_view(request.concrete_type());
-    if (selected.starts_with("::"))
+    if (::tracer::compat::starts_with(selected, "::"))
       selected.remove_prefix(2);
     if (!prepared::is_typed_version(method.format_version()) || method.ByteSizeLong() > 65536 ||
         method.module_sha256().size() != 32 || method.signature().kind() != api::METHOD ||
@@ -141,7 +146,7 @@ void validate(api::ObjectWatchRequest &request) {
   const bool synchronized = request.synchronization() == Request::THREAD_CONFINED ||
                             request.synchronization() == Request::CALLER_LOCK;
   if (tagged != !request.union_cases().empty() || request.union_cases_size() > 128 ||
-      (tagged && (!synchronized || ownership || logical_range)))
+      (tagged && (!synchronized || ownership)))
     throw std::invalid_argument("tagged union capture requires declared synchronization and tag cases");
   if (ownership != !request.base_type().empty() || ownership != !request.collection().empty() ||
       (ownership && request.first_seen()) ||

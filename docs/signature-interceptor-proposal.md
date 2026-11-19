@@ -180,7 +180,7 @@ If required debug information is still missing, try matching existing headers th
 
 # Compiler options and application headers
 
-Allow each validation or injection request to carry `compile_options` as an ordered list of compiler arguments. Support application include paths, preprocessor definitions and undefinitions, forced includes and the requested C++ language standard, for example `-I/app/include`, `-DAPP_FEATURE=1`, `-include` followed by a header path, and `-std=c++23`. Pass arguments directly to the compiler without shell interpretation.
+Allow each validation or injection request to carry `compile_options` as an ordered list of compiler arguments. Support application include paths, preprocessor definitions and undefinitions, forced includes and the requested C++ language standard, for example `-I/app/include`, `-DAPP_FEATURE=1`, `-include` followed by a header path, and `-std=c++20`. Pass arguments directly to the compiler without shell interpretation.
 
 Headers and include paths refer to files on the server host. A remote client's local path is not automatically available there. An optional compilation database can supply application build settings; combine the selected entry with the engine's required settings and explicit request options, and report the effective options. Diagnose options that conflict with the target ABI or required wrapper configuration.
 
@@ -215,7 +215,7 @@ The client additions below are implemented in this worktree; use matching update
 compile_options = [
     "-I/app/include",
     "-DAPP_FEATURE=1",
-    "-std=c++23",
+    "-std=c++20",
 ]
 
 report = client.validate_probe(

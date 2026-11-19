@@ -11,15 +11,27 @@ service Tracer {
   rpc ValidateProbe(ValidateProbeRequest) returns (ValidationReport);
   rpc AddProbe(AddProbeRequest) returns (Probe);
   rpc ReloadProbe(ReloadProbeRequest) returns (ReloadProbeResponse);
+  rpc AgentPlugin(AgentPluginRequest) returns (AgentPluginResponse);
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
+  rpc AllocateMemory(AllocateMemoryRequest) returns (MemoryAllocation);
+  rpc FreeMemory(FreeMemoryRequest) returns (MemoryAllocation);
+  rpc LoadTargetLibrary(LoadTargetLibraryRequest) returns (TargetLibrary);
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
+  rpc ApplyMemoryPatch(ApplyMemoryPatchRequest) returns (MemoryPatch);
+  rpc RestoreMemoryPatch(RestoreMemoryPatchRequest) returns (MemoryPatch);
+  rpc StartPageMonitor(StartPageMonitorRequest) returns (PageMonitorResult);
+  rpc StopPageMonitor(StopPageMonitorRequest) returns (PageMonitorResult);
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
+  rpc StartInstructionTrace(StartInstructionTraceRequest) returns (InstructionTrace);
+  rpc StopInstructionTrace(StopInstructionTraceRequest) returns (InstructionTrace);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
+  rpc LiveUpdate(LiveUpdateRequest) returns (LiveUpdateStatus);
   rpc ObjectWatch(ObjectWatchRequest) returns (ObjectWatchStatus);
+  rpc ObjectProbe(ObjectProbeRequest) returns (ObjectProbeStatus);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -52,6 +64,8 @@ enum TracePhase {
   TRACE_PHASE_UNSPECIFIED = 0;
   PRE = 1;
   POST = 2;
+  EXCEPTION = 3;
+  AGENT_OBSERVER = 4;
 }
 message Signature {
   CallableKind kind = 1;
@@ -170,6 +184,24 @@ message PreparedSnapshotRecord {
   // Separate field so older prepared adapters ignore inferred captures.
   repeated PreparedSnapshotMember automatic_members = 4;
 }
+// Limits of followed-member capture. An absent field selects the default. The
+// ranges are in snapshot_limits.hpp; "unlimited" on the command line is sent as
+// the option's largest value.
+message SnapshotLimits {
+  // Prepare time: what the package contains.
+  optional uint32 follow_depth = 1;
+  optional uint32 follow_members = 2;
+  optional uint32 record_members = 3;
+  optional uint32 nested_depth = 4;
+  // Run time: what one capture may cost.
+  optional uint32 string_bytes = 5;
+  optional uint32 vector_elements = 6;
+  optional uint32 checked_reads = 7;
+  optional uint32 member_reserve = 8;
+  optional uint32 arena_bytes = 9;
+  optional uint32 slice_bytes = 10;
+}
+
 message PreparedStorageRecord {
   string name = 1;
   uint64 bytes = 2;
@@ -206,7 +238,8 @@ message PreparedInjector {
   repeated DebugInfo snapshot_return_types = 20; // Deterministically ordered discovered implementation layouts.
   repeated DebugInfo snapshot_types = 21; // Generic prepared snapshot type registry; aliases SnapshotTypeN.
   repeated PreparedSnapshotRecord snapshot_records = 22; // Type and pointer-field snapshot policy.
-  repeated PreparedStorageRecord receiver_storage = 23; // Donor layout evidence for object watches.
+  SnapshotLimits snapshot_limits = 23; // Limits chosen at prepare time.
+  repeated PreparedStorageRecord receiver_storage = 24; // Donor layout evidence for object watches.
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.
@@ -233,23 +266,30 @@ message ProbeSpec {
   PreparedInjector prepared = 18;
   repeated string extra_compile_arguments = 19; // Validated additive flags.
   bool extra_compile_arguments_checked = 20;
-  // Fields 21-26 are in use by the C++17 port.
+  bool allow_argument_overrides = 25;
+  bool allow_result_override = 26;
+  bool allow_replacement = 21;
+  bool reclaimable = 22; // Trusted observer declares no escaping JIT addresses or TLS.
+  bool allow_call_original = 23;
+  bool trace_exceptions = 24;
   bool snapshot_return_pointee = 27; // Opt-in: callback may snapshot a live raw returned record.
+  SnapshotLimits snapshot_limits = 28; // Run-time overrides of the prepared limits.
   // Omitted retains the existing entry-only behavior for older callers.
-  string native_backend = 28; // "auto" or "entry".
-  string direct_caller = 29; // Optional named caller for an auto call-site patch.
-  bool snapshot_receiver_at_return = 30; // Opt-in, for methods with a stable receiver at return.
-  uint32 snapshot_max_items = 31;
-  uint32 snapshot_max_string_bytes = 32;
-  uint32 snapshot_max_depth = 33;
-  uint32 snapshot_max_bytes = 34;
-  bool snapshot_report_unavailable = 35;
+  string native_backend = 37; // "auto" or "entry".
+  string direct_caller = 38; // Optional named caller for an auto call-site patch.
+  bool snapshot_receiver_at_return = 39; // Opt-in, for methods with a stable receiver at return.
+  uint32 snapshot_max_items = 40;
+  uint32 snapshot_max_string_bytes = 41;
+  uint32 snapshot_max_depth = 42;
+  uint32 snapshot_max_bytes = 43;
+  bool snapshot_report_unavailable = 44;
   message SnapshotRttiRange {
     uint64 begin = 1;
     uint64 end = 2;
   }
-  repeated SnapshotRttiRange snapshot_rtti_ranges = 36;
-  repeated string snapshot_receiver_fields = 37; // Receiver fields used by object watch comparison.
+  repeated SnapshotRttiRange snapshot_rtti_ranges = 45;
+  repeated string snapshot_receiver_fields = 46; // Receiver fields used by object watch comparison.
+  uint64 object_watch_id = 47; // Assigned by the server for grouped methods.
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -272,6 +312,7 @@ message JitRuntimeProfile {
   // The agent build default. Probe-specific flags and target signatures are
   // checked independently. Presence distinguishes the old ABI from unknown.
   optional bool libstdcxx_default_cxx11_abi = 9;
+  bool scalar_overrides_supported = 10;
 }
 message Session {
   string id = 1;
@@ -291,6 +332,7 @@ message Session {
   uint64 process_start_time = 7; // Linux /proc start time in clock ticks.
   JitRuntimeProfile jit_runtime = 8;
   string executable = 9;
+  ObjectProbeStatus object_probe = 10; // Registration disposition returned at detach.
 }
 message AddProbeRequest {
   string session_id = 1;
@@ -324,6 +366,12 @@ message ValidateProbeRequest {
   PreparedInjector prepared = 11;
   string translation_unit = 12; // Optional entry in the server-host compilation database.
   repeated string extra_compile_arguments = 13;
+  bool allow_argument_overrides = 18;
+  bool allow_result_override = 19;
+  bool allow_replacement = 14;
+  bool reclaimable = 15;
+  bool allow_call_original = 16;
+  bool trace_exceptions = 17;
 }
 message ValidationDiagnostic {
   string stage = 1;
@@ -358,10 +406,16 @@ message Probe {
   uint64 replaces_probe_id = 14;
   uint64 superseded_by_probe_id = 15;
   bool draining = 16; // Superseded entry, still accepting events from its invocations.
-  string backend = 17;
-  string backend_reason = 18;
-  uint64 patch_address = 19;
-  uint64 relay_address = 20;
+  bool allow_argument_overrides = 17;
+  bool allow_result_override = 18;
+  bool allow_replacement = 19;
+  bool reclaimed = 20;
+  bool allow_call_original = 21;
+  bool trace_exceptions = 22;
+  string backend = 23;
+  string backend_reason = 24;
+  uint64 patch_address = 25;
+  uint64 relay_address = 26;
 }
 message ReloadProbeRequest {
   string session_id = 1;
@@ -370,19 +424,67 @@ message ReloadProbeRequest {
 }
 message ReloadProbeResponse {
   Probe probe = 1;
-  uint32 retained_limit = 2;
+  uint32 retained_limit = 2; // Zero means no fixed probe limit.
   optional uint32 agent_retained = 3;
 }
 message RemoveProbeRequest {
   string session_id = 1;
   uint64 probe_id = 2;
 }
+message AgentPluginObject {
+  string source_path = 1;
+  string sdk_directory = 2;
+  string fingerprint = 3;
+  string checksum = 4;
+  bytes object = 5;
+}
+
+message AgentPluginFile {
+  string path = 1; // Relative to the package, delivered as a JIT input.
+  bytes contents = 2;
+}
+
+message AgentPluginPackage {
+  repeated AgentPluginFile files = 1;
+  repeated string sources = 2; // Relative paths of translation units in files.
+  string compile_commands = 3; // Absolute path on the target host.
+  string translation_unit = 4; // Absolute path on the target host.
+  repeated string extra_flags = 5;
+}
+
+message AgentPluginRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    LOAD = 1;
+    RELOAD = 2;
+    RUN = 3;
+    LOAD_PACKAGE = 4;
+    RELOAD_PACKAGE = 5;
+  }
+  string session_id = 1;
+  Operation operation = 2;
+  string plugin_id = 3;
+  bytes source = 4;
+  string command = 5;
+  AgentPluginObject repl_object = 6;
+  string expected_executable = 7; // Required for package activation or reload.
+  AgentPluginPackage package = 8;
+}
+
+message AgentPluginResponse {
+  uint64 generation = 1;
+  bool cache_hit = 2;
+  uint64 value = 3;
+  bool reused_repl_object = 4;
+}
+
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }
 message ListModulesRequest {
   string session_id = 1;
   bool include_mappings = 2;
+  string elf_path = 3; // Exact path in the mapped module snapshot.
 }
 message ModuleMapping {
   string path = 1;
@@ -397,6 +499,14 @@ message ListModulesResponse {
   repeated string modules = 1;
   repeated ModuleMapping mappings = 2;
   string mapping_token = 3;
+  repeated ModuleElfEntry elf_entries = 4;
+}
+message ModuleElfEntry {
+  enum Kind { IMPORT = 0; EXPORT = 1; SECTION = 2; }
+  Kind kind = 1;
+  string name = 2;
+  uint64 elf_address = 3;
+  uint64 size = 4;
 }
 message ListMemoryMappingsRequest { string session_id = 1; }
 message MemoryMapping {
@@ -421,6 +531,116 @@ message ReadMemoryRequest {
 message ReadMemoryResponse {
   uint64 address = 1;
   bytes data = 2; // On success, exactly size bytes owned by the response.
+}
+message ApplyMemoryPatchRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  string module = 3;
+  oneof operation {
+    ExecutablePatch executable = 4;
+    ImportSlotHook import_slot = 5;
+    WritablePatch writable = 6;
+  }
+}
+message AllocateMemoryRequest { string session_id = 1; uint32 size = 2; }
+message FreeMemoryRequest { string session_id = 1; uint64 allocation_id = 2; }
+message MemoryAllocation {
+  uint64 id = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool freed = 4;
+}
+message LoadTargetLibraryRequest { string session_id = 1; string path = 2; }
+message TargetLibrary { string path = 1; }
+message WritablePatch {
+  uint64 address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message ExecutablePatch {
+  uint64 elf_address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message ImportSlotHook {
+  string symbol = 1;
+  uint64 expected_target = 2;
+  uint64 replacement_target = 3;
+  string abi = 4;
+}
+message RestoreMemoryPatchRequest {
+  string session_id = 1;
+  uint64 patch_id = 2;
+}
+message MemoryPatch {
+  uint64 id = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool restored = 4;
+}
+message StartPageMonitorRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint32 tid = 3;
+  uint64 address = 4;
+  uint32 size = 5;
+  uint32 timeout_seconds = 6;
+}
+message StopPageMonitorRequest { string session_id = 1; }
+message PageMonitorResult {
+  uint32 tid = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool expired = 4;
+  message Access {
+    uint64 address = 1;
+    uint64 pc = 2;
+    bool write = 3;
+  }
+  repeated Access accesses = 5;
+}
+message StartInstructionTraceRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint32 tid = 3;
+  uint64 address = 4;
+  uint32 size = 5;
+  uint32 max_records = 6;
+  uint32 timeout_seconds = 7;
+  bool registers = 8;
+  string callback_library = 9;
+  uint64 memory_address = 10;
+  uint32 memory_size = 11;
+  bool discover_calls = 12;
+}
+message StopInstructionTraceRequest { string session_id = 1; }
+message InstructionTrace {
+  enum Reason {
+    RUNNING = 0;
+    STOPPED = 1;
+    LIMIT = 2;
+    TIMEOUT = 3;
+  }
+  uint32 tid = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  Reason reason = 4;
+  repeated uint64 pcs = 5;
+  repeated InstructionDetail details = 6; // One per PC when an extension is enabled.
+  repeated uint64 call_targets = 7; // One executed call destination per PC in discovery mode.
+  bool discover_calls = 8;
+}
+message InstructionRecording {
+  fixed64 magic = 1;
+  uint32 version = 2;
+  InstructionTrace trace = 3;
+}
+message InstructionDetail {
+  repeated fixed64 registers = 1; // RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8 through R15.
+  optional fixed64 callback_value = 2;
+  uint64 memory_address = 3;
+  uint32 memory_size = 4;
+  uint32 memory_access = 5; // Bit 0 read, bit 1 write.
 }
 message ScanMemoryRequest {
   string session_id = 1;
@@ -540,6 +760,8 @@ message BulkTraceCandidate {
     PREPARED_REQUIRED = 2;
     UNSUPPORTED = 3;
     AMBIGUOUS = 4;
+    // Another selected symbol at the same runtime entry is the primary and gets the probe.
+    ALIAS = 5;
   }
   FunctionSymbol function = 1;
   AbiStatus abi_status = 2;
@@ -548,10 +770,10 @@ message BulkTraceCandidate {
 message PreviewBulkTraceResponse {
   repeated BulkTraceCandidate candidates = 1;
   repeated string unmatched_exact_selectors = 2;
-  uint32 retained_limit = 3;
+  uint32 retained_limit = 3; // Zero means no fixed probe limit.
   uint32 session_retained = 4;
   optional uint32 agent_retained = 5;
-  optional uint32 available_slots = 6;
+  optional uint32 available_slots = 6; // Unset when there is no fixed limit.
 }
 message ApplyBulkTraceRequest {
   string session_id = 1;
@@ -574,6 +796,7 @@ message BulkTraceEntry {
     ROLLED_BACK = 4;
     REMOVED = 5;
     RESTORE_PENDING = 6;
+    ALIASED = 7; // Covered by the probe on the primary symbol at the same entry.
   }
   FunctionSymbol function = 1;
   Status status = 2;
@@ -708,10 +931,11 @@ message ObjectWatchRequest {
   string map_field = 39;
   string map_key = 40;
   uint32 event_buffer = 41; // Native code-cache ring size, zero selects the default.
-  string union_tag = 42; // Nonoverlapping uint32 or uint32-backed enum discriminator.
+  string union_tag = 42; // Verified nonoverlapping integral or enum discriminator.
   message UnionCase {
     uint32 tag = 1;
     string member = 2;
+    optional uint64 tag_bits = 3; // Wide discriminator or sign-extended negative literal.
   }
   repeated UnionCase union_cases = 43;
   repeated uint32 async_signals = 44; // Existing application handlers bridged by the native cache.
@@ -732,6 +956,53 @@ message ObjectWatchRequest {
   string owner_remove = 58;
   string owner_snapshot = 59;
   bool logical_updates = 60; // Compare the selected identity at verified mutation boundaries.
+  bool lifetimes_only = 61; // Code-cache lifecycle planning without a writer.
+  bool staged_registration = 62; // Internal use by ObjectProbe. Published as a group.
+}
+
+// Source-first type registration saved by the REPL before attaching.
+message ObjectProbePackageData {
+  uint32 version = 1;
+  string qualified_type = 2;
+  repeated string methods = 3;
+  repeated string fields = 4;
+  repeated string writer_selectors = 5;
+  bytes callback_source = 6;
+  bool allow_dwarf_writer_fallback = 7;
+  repeated string includes = 8;
+  string compilation_database = 9;
+  string translation_unit = 10;
+  repeated string extra_arguments = 11;
+  repeated PreparedInjector prepared_methods = 12;
+}
+
+message ObjectProbeRequest {
+  enum Action { PREVIEW = 0; START = 1; STATUS = 2; STOP = 3; }
+  string session_id = 1;
+  Action action = 2;
+  uint64 registration_id = 3;
+  ObjectWatchRequest watch = 4;
+  repeated PreparedInjector methods = 5;
+  string callback_source = 6;
+  string method_module = 7;
+  ObjectProbeBinding preview = 8;
+}
+
+message ObjectProbeBinding {
+  ObjectWatchPlan watch = 1;
+  // Includes resolved receiver layout and live entry identity.
+  repeated DebugInfo methods = 2;
+  repeated ObjectWatchPlan.Binding method_patches = 3;
+}
+
+message ObjectProbeStatus {
+  uint64 registration_id = 1;
+  bool active = 2;
+  bool restoration_pending = 3;
+  ObjectWatchStatus watch = 4;
+  repeated Probe methods = 5;
+  ObjectProbeBinding binding = 6;
+  string diagnostic = 7;
 }
 
 message ObjectWatchPlan {
@@ -798,6 +1069,8 @@ message ObjectWatchStatus {
   bool external_write_order_unknown = 27;
   uint32 static_fragments = 28;
   uint32 static_reclaimed = 29;
+  uint64 runtime_gap_hits = 30; // Includes repeated runtime dispatch gaps.
+  uint64 helper_reentries = 31; // Tracer-internal hook entries excluded from capture.
 }
 
 message ObjectObservation {
@@ -939,11 +1212,14 @@ message ObjectObservation {
       REPRESENTATION = 1;
       STRING_DATA = 2;
       ANY_PAYLOAD = 3;
+      UNION_TAG = 4;
     }
     Region region = 1;
     uint64 address = 2; // First affected byte of the selected field or payload.
     uint64 offset = 3; // From the start of the reported region.
     uint32 size = 4;
+    optional uint64 before_discriminator = 5;
+    optional uint64 after_discriminator = 6;
   }
   StorageWrite storage_write = 43;
 }
@@ -977,4 +1253,142 @@ message TraceEvent {
   PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
   ObjectObservation object_observation = 25;
   bool receiver_sampled_at_return = 26;
+  bool callback_error = 27; // The user callback failed for this invocation.
+  string callback_error_message = 28;
+  uint64 object_probe_registration_id = 29; // Zero for events outside an object-probe registration.
+  AgentLatencyEvent agent_latency = 30;
+}
+
+message AgentLatencyEvent {
+  string plugin_id = 1;
+  uint64 elapsed_ns = 2;
+}
+
+// Source snapshots and in-target compilation are separate from publication.
+message LiveUpdateRequest {
+  enum Action {
+    UPDATE = 0;
+    PREVIEW = 1;
+    STATUS = 2;
+    REVERT = 3;
+    MOCK = 4;
+    UPDATE_DATA = 5;
+    SCAN_HEAP = 6;
+    RECOVER = 7;
+  }
+  message Source {
+    string path = 1;
+    bytes contents = 2;
+  }
+  message Option {
+    string name = 1;
+    string value = 2;
+  }
+  string session_id = 1;
+  Action action = 2;
+  repeated Source sources = 3;
+  string compilation_database = 4;
+  string build_manifest = 5;
+  uint64 revision = 6;
+  uint64 retention_limit = 7;
+  repeated string arguments = 8;
+  repeated Option options = 9;
+  bool has_exact_revision = 10;
+  optional uint64 preview_revision = 11;
+  optional uint64 payload_limit = 12;
+}
+
+message LiveUpdateStatus {
+  enum State {
+    PLANNED = 0;
+    APPLIED = 1;
+    BLOCKED = 2;
+    STALE = 3;
+    RESTORATION_REQUIRED = 4;
+    UNCHANGED = 5;
+    REVERTED = 6;
+    CURRENT = 7;
+  }
+  message Candidate {
+    State state = 1;
+    string symbol = 2;
+    string signature = 3;
+    string source = 4;
+    string module = 5;
+    uint64 address = 6;
+    string diagnostic = 7;
+  }
+  State state = 1;
+  uint64 active_revision = 2;
+  uint64 retained_generations = 3;
+  uint64 retention_limit = 4;
+  repeated Candidate candidates = 5;
+  string diagnostic = 6;
+  repeated string notes = 7;
+  uint64 operation_token = 8;
+}
+
+// Private payload for the versioned target agent entry.
+message LiveJitInput {
+  message CompileUnit {
+    string path = 1;
+    string directory = 2;
+    repeated string compiler_arguments = 3;
+    bool reuse_stream_initializer = 4;
+    bool reuse_global_lifecycle = 5;
+  }
+  repeated LiveUpdateRequest.Source sources = 1;
+  repeated CompileUnit units = 2;
+  message Import {
+    string name = 1;
+    uint64 address = 2;
+  }
+  repeated Import imports = 3;
+  repeated string entry_symbols = 4;
+  repeated string compiler_arguments = 5;
+  bool resolve_standard_runtime = 6;
+}
+
+message LiveAgentExtension {
+  enum Action {
+    DATA_UPDATE = 0;
+    HEAP_SCAN = 1;
+    MANAGED_UPDATE = 2;
+    MANAGED_REVERT = 3;
+    MANAGED_RECOVER = 4;
+  }
+  Action action = 1;
+  string session = 2;
+  uint64 process_start = 3;
+  string module = 4;
+  string build_id = 5;
+  LiveJitInput update = 6;
+  LiveJitInput discovery = 7;
+  string discovery_function = 8;
+  uint64 address = 9;
+  repeated string scan_ids = 10;
+  repeated string types = 11;
+  uint64 registry = 12;
+  string hook_file = 13;
+  string hook_function = 14;
+  string hook_type = 15;
+  uint64 revision = 16;
+  int64 deadline_nanoseconds = 17;
+  uint64 retention_limit = 18;
+  bool publish_native = 19;
+  string selection_module = 20;
+}
+
+message LiveBuildManifest {
+  // Paths are relative to source_root. Snapshots preserve the same layout.
+  message Input {
+    string path = 1;
+    string sha256 = 2;
+  }
+  string source_root = 1;
+  string snapshot_root = 2;
+  string module = 3;
+  string module_sha256 = 4;
+  string compilation_database_sha256 = 5;
+  repeated Input inputs = 6;
 }

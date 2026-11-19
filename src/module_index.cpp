@@ -391,10 +391,34 @@ ModuleType ModuleIndex::find_type(const std::string &name) const {
 }
 
 ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
-  return exact<ModuleSymbol>(path_,
+  // Names for one address and kind (identical C1/C2 or D1/D2 bodies, folded or aliased
+  // functions) are one callable, not an ambiguity: pick the name that has debug information,
+  // then the lowest id. Different addresses stay ambiguous and are chosen with --id.
+  auto db = connect(path_);
+  auto stmt = statement(db.get(),
       "SELECT data FROM symbols WHERE name=?1 OR linkage=?1 OR selector=?2 OR "
-      "(version<>'' AND linkage||'@'||version=?1)",
-      name, symbol, "symbol", normalize_selector(name));
+      "(version<>'' AND linkage||'@'||version=?1)");
+  sql_bind(stmt.get(), 1, name);
+  sql_bind(stmt.get(), 2, normalize_selector(name));
+  std::vector<ModuleSymbol> rows;
+  while (step(stmt.get())) rows.push_back(decode(column(stmt.get(), 0), symbol));
+  if (rows.empty()) throw std::invalid_argument("unknown symbol: " + name);
+  if (rows.size() > 1) {
+    const bool aliases = std::all_of(rows.begin(), rows.end(), [&](const ModuleSymbol &row) {
+      return row.address != 0 && row.address == rows.front().address &&
+             row.kind == rows.front().kind;
+    });
+    if (!aliases) {
+      std::string ids = rows.front().id;
+      for (std::size_t i = 1; i < rows.size(); ++i) ids += ", " + rows[i].id;
+      throw std::invalid_argument("ambiguous_symbol: " + name + " (" + ids + ")");
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const ModuleSymbol &l, const ModuleSymbol &r) {
+      if (l.has_debug != r.has_debug) return l.has_debug;
+      return l.id < r.id;
+    });
+  }
+  return rows.front();
 }
 
 ModuleType ModuleIndex::get_type(const std::string &id) const {

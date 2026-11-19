@@ -22,10 +22,12 @@
 
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Object/BuildID.h>
+#include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/Error.h>
 
 #include "agent_runtime_profile.hpp"
+#include "admission.hpp"
 #include "entry_trap.hpp"
 #include "injector.hpp"
 #include "linux_syscalls.hpp"
@@ -88,23 +90,68 @@ void copy_signature(const clangtracer::v1::Signature &signature,
   request.result = static_cast<ValueType>(signature.result());
   request.argument_count =
       static_cast<std::uint32_t>(signature.arguments_size());
-  for (int i = 0; i < signature.arguments_size(); ++i) {
-    request.arguments[i] = static_cast<ValueType>(signature.arguments(i));
-  }
 }
 
-std::string configured_agent_build_id(const std::string &path) {
+struct AgentBootstrap {
+  std::string build_id;
+  std::vector<std::string> dependencies;
+};
+
+AgentBootstrap configured_agent(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
     throw AgentRuntimeIncompatible("cannot read configured agent ELF: " +
                                    llvm::toString(binary.takeError()));
   const auto *object =
-      llvm::dyn_cast<llvm::object::ObjectFile>(binary->getBinary());
-  const auto id = object ? llvm::object::getBuildID(object)
-                         : llvm::ArrayRef<std::uint8_t>{};
+      llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!object || object->getELFFile().getHeader().e_machine != llvm::ELF::EM_X86_64) {
+    throw AgentRuntimeIncompatible("configured agent is not a Linux x86-64 ELF");
+  }
+  const auto id = llvm::object::getBuildID(object);
   if (id.empty())
     throw AgentRuntimeIncompatible("configured agent has no ELF build ID");
-  return llvm::toHex(id, /*LowerCase=*/true);
+  AgentBootstrap result{llvm::toHex(id, /*LowerCase=*/true), {}};
+  const auto &elf = object->getELFFile();
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic) {
+    throw AgentRuntimeIncompatible("cannot read agent dependencies: " +
+                                   llvm::toString(dynamic.takeError()));
+  }
+  std::uint64_t string_address = 0;
+  std::uint64_t string_size = 0;
+  std::vector<std::uint64_t> needed;
+  for (const auto &entry : *dynamic) {
+    if (entry.d_tag == llvm::ELF::DT_NULL) {
+      break;
+    }
+    if (entry.d_tag == llvm::ELF::DT_NEEDED) {
+      needed.push_back(entry.d_un.d_val);
+    } else if (entry.d_tag == llvm::ELF::DT_STRTAB) {
+      string_address = entry.d_un.d_ptr;
+    } else if (entry.d_tag == llvm::ELF::DT_STRSZ) {
+      string_size = entry.d_un.d_val;
+    }
+  }
+  if (needed.empty()) {
+    return result;
+  }
+  auto strings = elf.toMappedAddr(string_address);
+  if (!strings) {
+    throw AgentRuntimeIncompatible("cannot read agent dependency names: " +
+                                   llvm::toString(strings.takeError()));
+  }
+  if (string_size > static_cast<std::uint64_t>(elf.end() - *strings)) {
+    throw AgentRuntimeIncompatible("agent dependency names exceed its ELF image");
+  }
+  const std::string_view table(reinterpret_cast<const char *>(*strings), string_size);
+  for (auto offset : needed) {
+    const auto end = table.find('\0', offset);
+    if (offset >= table.size() || end == std::string_view::npos || end == offset) {
+      throw AgentRuntimeIncompatible("agent has an invalid dependency name");
+    }
+    result.dependencies.emplace_back(table.substr(offset, end - offset));
+  }
+  return result;
 }
 
 template <std::size_t N> std::string profile_text(const char (&value)[N]) {
@@ -150,6 +197,7 @@ clangtracer::v1::JitRuntimeProfile read_agent_profile(
   result.set_target_abi("linux-x86-64-sysv");
   result.set_clang_version(profile_text(profile.clang_version));
   result.set_llvm_version(profile_text(profile.llvm_version));
+  result.set_scalar_overrides_supported(true);
   result.set_glibc_version(profile_text(profile.glibc_version));
   result.set_cxx_runtime_path(profile_text(profile.cxx_runtime_path));
   result.set_libstdcxx_header_release(profile.libstdcxx_header_release);
@@ -176,7 +224,8 @@ Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
 
 Session::~Session() = default;
 
-void Session::require_probe_control_locked(std::uint64_t removing) const {
+void Session::require_probe_control_locked(std::uint64_t removing,
+                                           std::uint64_t registration) const {
   if (entry_trap_ && removing != trap_probe_id_)
     throw std::runtime_error("remove the entry trap before changing other native probes");
   if (object_watch_) {
@@ -184,11 +233,55 @@ void Session::require_probe_control_locked(std::uint64_t removing) const {
     if (status.active() || status.restoration_pending())
       throw std::runtime_error("stop the object watch before changing native probes");
   }
-  if (object_cache_) {
+  if (object_cache_ && !object_cache_->is_registration(registration)) {
     const auto status = object_cache_->status();
     if (status.active() || status.restoration_pending())
       throw std::runtime_error("stop the object watch before changing native probes");
   }
+}
+
+void Session::require_object_watch_sites_locked(std::uint64_t registration) const {
+  bool grouped_method = false;
+  for (const auto &[probe_id, probe] : probes_) {
+    (void)probe_id;
+    if (!probe.patch_committed && !probe.value.active() &&
+        !probe.value.draining() && !probe.remote_request)
+      continue;
+    if (!registration || probe.reload_spec.object_watch_id() != registration)
+      throw std::runtime_error("remove the session's native probes before starting an object watch");
+    grouped_method = true;
+  }
+  if (pthread_create_patch_committed_ && !grouped_method)
+    throw std::runtime_error("remove the session's native probes before starting an object watch");
+}
+
+void Session::preflight_object_probe() {
+  std::lock_guard lock(mutex_);
+  check_identity_locked();
+  if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
+    throw std::runtime_error("object probe requires a live attached session");
+  require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
+  require_object_watch_sites_locked(0);
+}
+
+bool Session::has_object_probe_registration(std::uint64_t registration) const {
+  std::lock_guard lock(mutex_);
+  return object_cache_ && object_cache_->is_registration(registration);
+}
+
+void Session::set_object_probe_active(std::uint64_t registration, bool active) {
+  std::lock_guard lock(mutex_);
+  if (!object_cache_ || !object_cache_->is_registration(registration))
+    throw std::invalid_argument("no matching object probe registration");
+  if (active) {
+    check_identity_locked();
+    const auto status = object_cache_->status();
+    if (!status.active() || status.restoration_pending())
+      throw std::runtime_error("cannot publish a stopped object probe");
+  }
+  object_cache_->set_registration_active(active);
 }
 
 clangtracer::v1::ObjectWatchStatus Session::prepare_object_watch(
@@ -201,7 +294,8 @@ clangtracer::v1::ObjectWatchStatus Session::prepare_object_watch(
 
 clangtracer::v1::ObjectWatchStatus Session::object_watch(
     const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
-    std::function<void(clangtracer::v1::TraceEvent)> publish) {
+    std::function<void(clangtracer::v1::TraceEvent)> publish,
+    bool verify_method_lifetimes) {
   using Request = clangtracer::v1::ObjectWatchRequest;
   std::lock_guard lock(mutex_);
   if (request.action() == Request::STATUS || request.action() == Request::STOP) {
@@ -218,6 +312,9 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
         if (state_ == clangtracer::v1::Session::ATTACHED)
           retire_changed_object_cache_locked(std::chrono::steady_clock::now() + operation_timeout_);
       }
+      if (request.action() == Request::STOP && !request.staged_registration() &&
+          object_cache_->is_registration(object_cache_->status().watch_id()))
+        throw std::invalid_argument("stop this registration with %object-probe stop");
       if (request.action() == Request::STOP || state_ == clangtracer::v1::Session::EXITED)
         stop_object_cache_locked();
       return object_cache_->status();
@@ -233,22 +330,19 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
     throw std::runtime_error("object watch requires a live attached session");
   if (request.action() == Request::PREVIEW)
-    return object_watch::preview(request, pid_, executable_);
+    return object_watch::preview(request, pid_, executable_, verify_method_lifetimes);
   std::string binding_status;
   if (request.has_prepared_bindings())
-    binding_status = object_watch::preview(request, pid_, executable_).binding_status();
+    binding_status = object_watch::preview(request, pid_, executable_, verify_method_lifetimes).binding_status();
   require_probe_control_locked();
-  if (pthread_create_patch_committed_ ||
-      std::any_of(probes_.begin(), probes_.end(), [](const auto &item) {
-        return item.second.patch_committed || item.second.value.active() ||
-               item.second.value.draining() || item.second.remote_request;
-      }))
-    throw std::runtime_error("remove the session's native probes before starting an object watch");
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
+  require_object_watch_sites_locked(request.staged_registration() ? id : 0);
   if (request.backend() == Request::CODE_CACHE) {
     if (!object_cache_address_)
       throw std::runtime_error("the loaded agent does not export the code-cache backend");
     auto prepared = std::make_unique<object_cache::Watch>(
-        request, id, pid_, executable_, event_path_, std::move(publish));
+        request, id, pid_, executable_, event_path_, std::move(publish), verify_method_lifetimes);
     injector::Process process;
     const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
     attach_process(process, deadline);
@@ -282,6 +376,7 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
 
 void Session::stop_object_watch_locked() {
   if (object_cache_) {
+    object_cache_->set_registration_active(false);
     stop_object_cache_locked(true);
     return;
   }
@@ -358,11 +453,12 @@ std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
 }
 
 void Session::attach_process(injector::Process &process,
-                             std::chrono::steady_clock::time_point deadline) {
+                             std::chrono::steady_clock::time_point deadline,
+                             pid_t excluded_tid, pid_t required_tid) {
   for (;;) {
     check_identity_locked();
     try {
-      process.attach(static_cast<pid_t>(pid_), application_modules_);
+      process.attach(static_cast<pid_t>(pid_), application_modules_, excluded_tid, required_tid);
       check_identity_locked();
       return;
     } catch (const injector::IdlePointUnavailable &) {
@@ -385,6 +481,8 @@ void Session::check_identity_locked() {
   try {
     if (ProcessStartTime(pid_) != process_start_) {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = "target process exited; PID was reused";
       throw std::runtime_error(error_);
@@ -392,6 +490,8 @@ void Session::check_identity_locked() {
   } catch (const std::runtime_error &error) {
     if (std::string(error.what()) == "target process is no longer available") {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = error.what();
     }
@@ -410,7 +510,7 @@ void Session::attach(const std::string &expected_executable) {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
-  const auto expected_agent_id = configured_agent_build_id(agent_path_);
+  const auto agent = configured_agent(agent_path_);
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   try {
@@ -436,20 +536,50 @@ void Session::attach(const std::string &expected_executable) {
   std::uintptr_t scratch = 0;
   // Each synchronous loader call has finished using its string before the
   // scratch buffer is reused for another symbol name or the profile.
-  const auto scratch_size = std::max(
-      {agent_path_.size() + 1, sizeof(AgentRuntimeProfile),
-       sizeof("tracer_agent_object_cache_v37")});
+  auto scratch_size =
+      std::max({agent_path_.size() + 1, sizeof(AgentRuntimeProfile),
+                sizeof("tracer_agent_object_cache_v41")});
+  std::vector<std::uintptr_t> companion_handles;
+  std::uintptr_t dlclose_address = 0;
+  const auto release_companions = [&] {
+    while (!companion_handles.empty()) {
+      const auto handle = companion_handles.back();
+      companion_handles.pop_back();
+      if (process.remote_call(dlclose_address, {handle}, 1) != 0) {
+        throw std::runtime_error("target dlclose failed to release a glibc companion");
+      }
+    }
+  };
   try {
+    const auto companions = injector::target_runtime_companions(
+        static_cast<pid_t>(pid_), agent.dependencies);
+    companion_handles.reserve(companions.size());
+    for (const auto &path : companions) {
+      scratch_size = std::max(scratch_size, path.size() + 1);
+    }
     scratch = process.remote_allocate(scratch_size);
-    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto dlopen_address = process.resolve_remote_symbol("dlopen");
     const auto dlsym_address = process.resolve_remote_symbol("dlsym");
+    if (!companions.empty()) {
+      dlclose_address = process.resolve_remote_symbol("dlclose");
+    }
+    for (const auto &path : companions) {
+      process.remote_write(scratch, path.c_str(), path.size() + 1);
+      const auto handle = process.remote_call(
+          dlopen_address, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
+      if (!handle) {
+        throw std::runtime_error("target dlopen failed to load glibc companion " + path);
+      }
+      companion_handles.push_back(handle);
+    }
+    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto handle = process.remote_call(
         dlopen_address, {scratch, RTLD_NOW | RTLD_GLOBAL}, 2);
     if (!handle) {
       throw std::runtime_error(
           "target dlopen failed to load the agent and its dependencies");
     }
+    release_companions();
     const auto agent_symbol = [&](const char *name) {
       process.remote_write(scratch, name, std::strlen(name) + 1);
       return process.remote_call(dlsym_address, {handle, scratch}, 2);
@@ -457,7 +587,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto profile_entry = agent_symbol("tracer_agent_runtime_profile_v1");
     try {
       jit_runtime_ =
-          read_agent_profile(process, profile_entry, scratch, expected_agent_id);
+          read_agent_profile(process, profile_entry, scratch, agent.build_id);
     } catch (const AgentRuntimeIncompatible &) {
       // The handshake does not install hooks. Return a definitive failure
       // only after scratch memory and ptrace ownership have been released.
@@ -469,8 +599,14 @@ void Session::attach(const std::string &expected_executable) {
     const auto start = agent_symbol("tracer_agent_start");
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
+    const auto plugin = agent_symbol("tracer_agent_plugin_v1");
+    const auto plugin_v2 = agent_symbol("tracer_agent_plugin_v2");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
-    const auto object_cache = agent_symbol("tracer_agent_object_cache_v37");
+    const auto reclaim = agent_symbol("tracer_agent_reclaim_v1");
+    const auto page_start = agent_symbol("tracer_agent_page_monitor_start_v1");
+    const auto page_stop = agent_symbol("tracer_agent_page_monitor_stop_v1");
+    const auto object_cache = agent_symbol("tracer_agent_object_cache_v41");
+    const auto live = agent_symbol("tracer_agent_live_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -483,10 +619,22 @@ void Session::attach(const std::string &expected_executable) {
     start_address_ = start;
     stop_address_ = stop;
     validate_address_ = validate;
+    plugin_address_ = plugin;
+    plugin_v2_address_ = plugin_v2;
     capacity_address_ = capacity;
+    reclaim_address_ = reclaim;
+    start_page_monitor_address_ = page_start;
+    stop_page_monitor_address_ = page_stop;
     object_cache_address_ = object_cache;
+    live_address_ = live;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
+    if (!process.unsafe()) {
+      try {
+        release_companions();
+      } catch (...) {
+      }
+    }
     if (process.unsafe()) {
       unsafe_target_ = true;
       set_failed_locked("agent bootstrap recovery is uncertain; target "
@@ -508,6 +656,8 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
                         clangtracer::v1::ValidateProbeRequest::Level level) {
   std::lock_guard lock(mutex_);
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -571,6 +721,142 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
   }
 }
 
+bool Session::invoke_agent_plugin_locked(AgentPluginCall& request, const std::string& source,
+                                         std::chrono::steady_clock::time_point deadline,
+                                         const std::string& offer,
+                                         const std::string& expected_executable) {
+  if (!plugin_address_)
+    throw std::runtime_error("loaded native agent does not support plugins");
+  copy_field(request.session_id, id_, "plugin session");
+  request.source_size = source.size();
+  const bool send_offer = plugin_v2_address_ && !offer.empty();
+  const auto size = sizeof(request) + source.size() +
+                    (send_offer ? offer.size() : 0);
+  injector::Process process;
+  std::uintptr_t buffer = 0;
+  try {
+    attach_process(process, deadline);
+    if (!expected_executable.empty()) {
+      std::error_code error;
+      const auto live = std::filesystem::read_symlink(proc::directory(pid_) / "exe", error);
+      if (error || live.string() != expected_executable) {
+        throw std::runtime_error("agent plugin target executable changed");
+      }
+    }
+    buffer = process.remote_allocate(size);
+    process.remote_write(buffer, &request, sizeof(request));
+    const auto remote_source = source.empty() ? 0 : buffer + sizeof(request);
+    if (remote_source) {
+      process.remote_write(remote_source, source.data(), source.size());
+      plugins_may_be_active_ = true;
+    }
+    const auto remote_offer = remote_source + source.size();
+    if (send_offer)
+      process.remote_write(remote_offer, offer.data(), offer.size());
+    const auto status = send_offer
+        ? process.remote_call(plugin_v2_address_,
+                              {buffer, remote_source, remote_offer, offer.size()}, 4)
+        : process.remote_call(plugin_address_, {buffer, remote_source}, 2);
+    process.remote_read(buffer, &request, sizeof(request));
+    process.remote_free(buffer, size);
+    buffer = 0;
+    process.detach();
+    const bool reused = send_offer && status == kAgentPluginReusedReplObject;
+    if (status != 0 && !reused)
+      throw std::runtime_error(std::string("agent plugin failed: ") +
+                               request.error);
+    return reused;
+  } catch (...) {
+    if (buffer && !process.unsafe()) {
+      try {
+        process.remote_free(buffer, size);
+      } catch (...) {
+      }
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("plugin recovery is uncertain; target remains stopped");
+    }
+    throw;
+  }
+}
+
+clangtracer::v1::AgentPluginResponse
+Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
+  std::lock_guard lock(mutex_);
+  if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
+    throw std::runtime_error("session is not attached");
+  require_probe_control_locked();
+  AgentPluginCall request{};
+  using Rpc = clangtracer::v1::AgentPluginRequest;
+  const auto& expected = rpc.expected_executable();
+  if (!expected.empty() && expected != executable_) {
+    throw std::invalid_argument("agent plugin target executable does not match the attachment");
+  }
+  std::string payload;
+  switch (rpc.operation()) {
+  case Rpc::LOAD:
+  case Rpc::RELOAD:
+    if (rpc.source().empty() || rpc.source().size() > kMaxAgentPluginSource ||
+        !rpc.command().empty())
+      throw std::invalid_argument(
+          "load and reload require nonempty plugin source within the wire format range");
+    if (rpc.has_package()) {
+      throw std::invalid_argument("source load cannot include a plugin package");
+    }
+    request.operation = rpc.operation() == Rpc::LOAD ? AgentPluginOperation::Load
+                                                    : AgentPluginOperation::Reload;
+    payload = rpc.source();
+    break;
+  case Rpc::LOAD_PACKAGE:
+  case Rpc::RELOAD_PACKAGE:
+    if (expected.empty() || !rpc.has_package() || rpc.package().sources().empty() ||
+        rpc.package().ByteSizeLong() > kMaxAgentPluginSource || !rpc.source().empty() ||
+        !rpc.command().empty() || rpc.has_repl_object()) {
+      throw std::invalid_argument(
+          "package load or reload requires an executable and package within the wire format range");
+    }
+    request.operation = rpc.operation() == Rpc::RELOAD_PACKAGE ? AgentPluginOperation::ReloadPackage
+                                                               : AgentPluginOperation::LoadPackage;
+    payload = rpc.package().SerializeAsString();
+    break;
+  case Rpc::RUN:
+    if (rpc.command().empty() || !rpc.source().empty() || rpc.has_repl_object() ||
+        rpc.has_package()) {
+      throw std::invalid_argument("run requires a plugin command");
+    }
+    request.operation = AgentPluginOperation::Run;
+    break;
+  default:
+    throw std::invalid_argument("invalid agent plugin operation");
+  }
+  if (rpc.plugin_id().empty())
+    throw std::invalid_argument("plugin name is required");
+  copy_field(request.plugin_id, rpc.plugin_id(), "plugin name");
+  copy_field(request.command, rpc.command(), "plugin command");
+  const auto offer = plugin_v2_address_ && rpc.has_repl_object() &&
+                             rpc.repl_object().ByteSizeLong() <= kMaxAgentPluginOffer
+                         ? rpc.repl_object().SerializeAsString() : std::string{};
+  const auto reused = invoke_agent_plugin_locked(
+      request, payload, std::chrono::steady_clock::now() + operation_timeout_, offer, expected);
+  clangtracer::v1::AgentPluginResponse response;
+  response.set_generation(request.generation);
+  response.set_cache_hit(request.cache_hit);
+  response.set_value(request.value);
+  response.set_reused_repl_object(reused);
+  return response;
+}
+
+void Session::clear_agent_plugins_locked(
+    std::chrono::steady_clock::time_point deadline) {
+  if (!plugins_may_be_active_)
+    return;
+  AgentPluginCall request{};
+  request.operation = AgentPluginOperation::Clear;
+  invoke_agent_plugin_locked(request, {}, deadline);
+  plugins_may_be_active_ = false;
+}
+
 Session::ProbeRecord &Session::find_probe_locked(std::uint64_t probe_id) {
   const auto found = probes_.find(probe_id);
   if (found == probes_.end()) {
@@ -587,19 +873,38 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &bulk_batch_id, std::uint64_t reload_probe_id,
                    const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
-  require_probe_control_locked();
+  require_probe_control_locked(0, spec.object_watch_id());
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
   }
-  if (probes_.size() >= kMaxProbes) {
-    throw std::invalid_argument("session probe limit reached");
+  for (auto &[id, prior] : probes_) {
+    (void)id;
+    if (!prior.reload_spec.reclaimable() || prior.value.reclaimed() || prior.value.active())
+      continue;
+    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+    try {
+      if (prior.value.draining()) {
+        stop_probe_locked(prior, true, retry_deadline);
+      } else {
+        injector::Process process;
+        attach_process(process, retry_deadline);
+        reclaim_probe_locked(prior, process);
+        process.detach();
+      }
+    } catch (const std::exception &) {
+      if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+        throw;
+    }
   }
   if (probe_id == 0 || probes_.count(probe_id) != 0) {
     throw std::invalid_argument("probe id is invalid or already used");
   }
   if (cancelled && cancelled())
-    throw std::runtime_error("reload cancelled before preparing the replacement");
+    throw std::runtime_error(reload_probe_id ? "reload cancelled before preparing the replacement"
+                                            : "probe install cancelled before preparation");
   const auto batch_id = reload_probe_id ? find_probe_locked(reload_probe_id).value.bulk_batch_id()
                                         : bulk_batch_id;
   const auto source_file =
@@ -656,7 +961,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     remote_request = process.remote_allocate(sizeof(Request));
     Request request{};
     request.probe_id = probe_id;
-    request.reject_replacement = !reload_probe_id && !batch_id.empty();
+    request.object_watch_id = spec.object_watch_id();
+    request.reject_replacement = !reload_probe_id && (!batch_id.empty() || spec.object_watch_id());
     request.expected_replaced_probe_id = reload_probe_id;
     copy_field(request.session_id, id_, "session id");
     request.context_native_pid = pid_;
@@ -695,6 +1001,11 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_symbol(spec.symbol());
     record.value.set_bulk_batch_id(batch_id);
     record.value.mutable_signature()->CopyFrom(spec.signature());
+    record.value.set_allow_argument_overrides(spec.allow_argument_overrides());
+    record.value.set_allow_result_override(spec.allow_result_override());
+    record.value.set_allow_replacement(spec.allow_replacement());
+    record.value.set_allow_call_original(spec.allow_call_original());
+    record.value.set_trace_exceptions(spec.trace_exceptions());
     record.reload_spec.CopyFrom(spec);
     record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
@@ -874,8 +1185,23 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         throw std::runtime_error("agent returned inconsistent replacement patch metadata");
     }
 
+    for (const auto &patch : memory_patches_) {
+      const auto start = patch.value.address();
+      if (!patch.value.restored() && start < response.original_entry + response.patch_size &&
+          response.original_entry < start + patch.value.size())
+        throw std::runtime_error("native probe overlaps an active memory patch");
+    }
     const auto patch_started = std::chrono::steady_clock::now();
+    const auto check_commit_cancelled = [&] {
+      if (!cancelled || !cancelled())
+        return;
+      if (!reload_probe_id)
+        discard_prepared();
+      throw std::runtime_error(reload_probe_id ? "reload cancelled before switching the active observer"
+                                              : "probe install cancelled before patching");
+    };
     if (trap) {
+      check_commit_cancelled();
       if (scheduler_patch || pthread_create_patch_committed_ || previous ||
           std::any_of(probes_.begin(), probes_.end(), [&](const auto &other) {
             return other.first != probe_id &&
@@ -915,8 +1241,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     unsigned patch_attempts = 0;
     std::exception_ptr switch_error;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
-      if (cancelled && cancelled())
-        throw std::runtime_error("reload cancelled before switching the active observer");
+      check_commit_cancelled();
       if (std::chrono::steady_clock::now() >= deadline)
         break;
       ++patch_attempts;
@@ -1021,6 +1346,15 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           std::string("probe committed but target detach failed: ") +
           error.what());
       throw std::runtime_error(error_);
+    }
+    if (previous && previous->reload_spec.reclaimable()) {
+      try {
+        stop_probe_locked(*previous, true,
+                          std::chrono::steady_clock::now() + std::chrono::milliseconds(30));
+      } catch (const std::exception &) {
+        if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+          throw;
+      }
     }
     return it->second.value;
   } catch (...) {
@@ -1356,6 +1690,8 @@ bool Session::stop_probe_locked(
     probe.value.set_entry_address(response.original_entry);
     probe.value.set_agent_dropped_events(response.event_drops);
     probe.value.set_callback_errors(response.callback_errors);
+    if (probe.reload_spec.reclaimable())
+      reclaim_probe_locked(probe, process);
     try {
       process.remote_free(probe.remote_request, sizeof(Request));
       probe.remote_request = 0;
@@ -1423,6 +1759,32 @@ void Session::release_request_locked(
   }
 }
 
+void Session::reclaim_probe_locked(ProbeRecord &probe, injector::Process &process) {
+  if (!reclaim_address_ || probe.value.reclaimed())
+    return;
+  TracerRetiredCode code{};
+  std::uintptr_t scratch = 0;
+  try {
+    scratch = process.remote_allocate(sizeof(code));
+    if (process.remote_call(reclaim_address_, {probe.value.id(), scratch, 0}, 3) == 0) {
+      process.remote_read(scratch, &code, sizeof(code));
+      if (process.retired_code_quiescent(code) &&
+          process.remote_call(reclaim_address_, {probe.value.id(), scratch, 1}, 3) == 0)
+        probe.value.set_reclaimed(true);
+    }
+    process.remote_free(scratch, sizeof(code));
+  } catch (...) {
+    if (scratch && !process.unsafe()) {
+      try { process.remote_free(scratch, sizeof(code)); } catch (...) {}
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("JIT reclamation recovery is uncertain; target remains stopped");
+      throw;
+    }
+  }
+}
+
 std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
   std::lock_guard lock(mutex_);
   const auto found = probes_.find(probe_id);
@@ -1431,17 +1793,24 @@ std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
 
 clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   std::lock_guard lock(mutex_);
-  require_probe_control_locked(probe_id);
+  auto &probe = find_probe_locked(probe_id);
+  require_probe_control_locked(probe_id, probe.reload_spec.object_watch_id());
   if (unsafe_target_) {
     throw std::runtime_error(error_.empty() ? "session is in failed state"
                                             : error_);
   }
   check_identity_locked();
-  auto &probe = find_probe_locked(probe_id);
   if (probe.value.active() || probe.value.draining())
     stop_probe_locked(probe, false);
-  else
+  else {
     release_request_locked(probe, std::chrono::steady_clock::now() + operation_timeout_);
+    if (probe.reload_spec.reclaimable() && !probe.value.reclaimed()) {
+      injector::Process process;
+      attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+      reclaim_probe_locked(probe, process);
+      process.detach();
+    }
+  }
   return probe.value;
 }
 
@@ -1456,6 +1825,26 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
+  if (instructions_)
+    stop_instruction_trace_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  if (page_monitor_)
+    stop_page_monitor_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  last_instruction_trace_.reset();
+  for (auto &patch : memory_patches_)
+    if (!patch.value.restored())
+      write_memory_patch_locked(patch, true, std::chrono::steady_clock::now() + operation_timeout_);
+  if (live_.managed_transition)
+    throw std::runtime_error("managed publication requires %live recover");
+  if (live_.pending_extension) {
+    poll_pending_live_data_locked();
+    if (live_.pending_extension || unsafe_target_)
+      throw std::runtime_error("live operation outcome remains unresolved");
+  }
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED)
+      throw std::runtime_error("live restoration incomplete: " + result.diagnostic());
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1464,6 +1853,10 @@ void Session::detach() {
       release_request_locked(probe, std::chrono::steady_clock::now() +
                                         operation_timeout_);
   }
+  for (auto &allocation : allocations_)
+    free_memory_locked(allocation, std::chrono::steady_clock::now() + operation_timeout_);
+  clear_agent_plugins_locked(std::chrono::steady_clock::now() +
+                             operation_timeout_);
   state_ = clangtracer::v1::Session::DETACHED;
   application_modules_.clear();
   error_.clear();
@@ -1480,10 +1873,64 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
+  if (live_.managed_transition) {
+    set_failed_locked("managed publication still requires recovery during shutdown");
+    return;
+  }
+  if (live_.pending_extension) {
+    try {
+      poll_pending_live_data_locked();
+    } catch (const std::exception &error) {
+      set_failed_locked(error.what());
+      return;
+    }
+    if (live_.pending_extension || unsafe_target_) {
+      set_failed_locked("live operation outcome remains unresolved during shutdown");
+      return;
+    }
+  }
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED) {
+      set_failed_locked("live restoration incomplete: " + result.diagnostic());
+      return;
+    }
+  }
   std::string first_error =
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =
       std::chrono::steady_clock::now() + operation_timeout_;
+  if (instructions_) {
+    try {
+      stop_instruction_trace_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  if (page_monitor_) {
+    try {
+      stop_page_monitor_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  for (auto &patch : memory_patches_) {
+    if (patch.value.restored())
+      continue;
+    try {
+      write_memory_patch_locked(patch, true, shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (!probe.value.active() && !probe.value.draining() && !probe.remote_request)
@@ -1500,11 +1947,31 @@ void Session::shutdown() noexcept {
         break;
     }
   }
+  if (!unsafe_target_) {
+    for (auto &allocation : allocations_) {
+      try {
+        free_memory_locked(allocation, shutdown_deadline);
+      } catch (const std::exception &error) {
+        if (first_error.empty())
+          first_error = error.what();
+        if (unsafe_target_)
+          break;
+      }
+    }
+  }
   const bool any_active =
       std::any_of(probes_.begin(), probes_.end(),
                   [](const auto &item) {
                     return item.second.value.active() || item.second.value.draining();
                   });
+  if (state_ != clangtracer::v1::Session::EXITED && !unsafe_target_) {
+    try {
+      clear_agent_plugins_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+    }
+  }
   if (state_ == clangtracer::v1::Session::EXITED)
     return;
   if (!any_active && first_error.empty()) {
@@ -1542,8 +2009,7 @@ std::optional<unsigned> Session::agent_retained_count() const {
   iovec remote{reinterpret_cast<void *>(capacity_address_), sizeof(word)};
   if (linux_api::process_vm_readv(pid_, &local, 1, &remote, 1, 0) !=
           static_cast<ssize_t>(sizeof(word)) ||
-      (word & 0xffffffff00000000ULL) != kAgentCapacityTag ||
-      (word & 0xffffffffULL) > kMaxProbes)
+      (word & 0xffffffff00000000ULL) != kAgentCapacityTag)
     return std::nullopt;
   return static_cast<unsigned>(word & 0xffffffffULL);
 }

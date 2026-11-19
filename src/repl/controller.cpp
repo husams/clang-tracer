@@ -1,9 +1,16 @@
+#include "tracer/compat.hpp"
 #include "controller.hpp"
+#include "local_perf.hpp"
+#include "object_probe_package.hpp"
+#include "tracer/instruction_trace.h"
 #include "../prepared_contract.hpp"
+#include "../snapshot_limits.hpp"
+#include "../preparer_diagnostics.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
 #include "../bounded_proto.hpp"
+#include "../live_mock.hpp"
 #include "../value_snapshot_storage.hpp"
 
 #include <algorithm>
@@ -26,10 +33,12 @@
 #include <cctype>
 #include <cstdlib>
 #include <cerrno>
+#include <poll.h>
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
-#ifdef __linux__
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/sysmacros.h>
 #endif
 #include <system_error>
@@ -41,6 +50,7 @@
 #include <unistd.h>
 
 #include "background_events.hpp"
+#include "prepared_libraries.hpp"
 #include "tracer/compiler_options.hpp"
 
 extern char **environ;
@@ -133,8 +143,6 @@ std::pair<std::string, std::string> parse_memory_pattern(std::string_view text) 
     while (input >> token) {
       if (token.size() != 2)
         throw std::invalid_argument("memory pattern needs two hex digits or wildcards per byte");
-      if (bytes.size() == 256)
-        throw std::invalid_argument("memory pattern must be at most 256 bytes");
       unsigned value = 0, bits = 0;
       for (const unsigned char ch : token) {
         value <<= 4;
@@ -206,6 +214,8 @@ void print_bulk_report(std::ostream &out, const char *operation,
     out << api::BulkTraceEntry::Status_Name(row.status()) << ' '
         << std::quoted(printable_proc_text(function.selector().empty()
                            ? function.linkage_symbol() : function.selector()));
+    if (!function.linkage_symbol().empty())
+      out << " symbol=" << printable_proc_text(function.linkage_symbol());
     if (!function.module_path().empty())
       out << " module=" << std::quoted(printable_proc_text(function.module_path()));
     if (row.has_probe())
@@ -349,8 +359,6 @@ PreparedMode prepared_options(Request &request, const Command &options,
       throw std::invalid_argument(
           "No prepared package for this selector. Run %probe prepare or pass --prepared DIRECTORY.");
     const auto file = std::filesystem::path(directory) / "prepared.pb";
-    if (std::filesystem::file_size(file) > 65536)
-      throw std::runtime_error("prepared metadata exceeds 64 KiB");
     std::ifstream input(file, std::ios::binary);
     api::PreparedInjector prepared;
     if (!input || !prepared.ParseFromIstream(&input))
@@ -394,7 +402,7 @@ Controller::~Controller() {
 void Controller::connect(const std::string &endpoint) {
   grpc::ChannelArguments arguments;
   arguments.SetMaxReceiveMessageSize(-1);
-  arguments.SetMaxSendMessageSize(32 * 1024 * 1024);
+  arguments.SetMaxSendMessageSize(-1);
   auto next = api::Tracer::NewStub(grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments));
   api::ListSessionsRequest request;
@@ -406,6 +414,7 @@ void Controller::connect(const std::string &endpoint) {
   endpoint_ = endpoint;
   stop_background();
   stub_ = std::move(next);
+  agent_packages_.clear();
   selected_ = {};
   ++connection_;
 }
@@ -414,6 +423,7 @@ void Controller::start_server(const Command &command) {
   if (server_.running()) {
     throw std::runtime_error("this console already owns a running server");
   }
+  require_no_owned_targets();
   if (!owned_sessions_.empty() || !pending_attaches_.empty()) {
     throw std::runtime_error(
         "resolve console-created or uncertain sessions before changing server");
@@ -433,6 +443,8 @@ void Controller::start_server(const Command &command) {
 void Controller::disconnect() {
   stop_background();
   stub_.reset();
+  agent_packages_.clear();
+  object_probe_preview_.reset();
   selected_ = {};
   ++connection_;
   endpoint_.clear();
@@ -491,20 +503,63 @@ std::string Controller::prompt() const {
              : "tracer[" + std::to_string(selected_.pid) + "]> ";
 }
 
-void Controller::require_session(const SessionHandle &session) {
+std::uint64_t Controller::require_session(const SessionHandle &session, bool scalar_overrides) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error(
         "no valid selected session; use %attach PID or %use SESSION");
   }
+  if (scalar_overrides && endpoint_.rfind("unix:", 0) != 0)
+    throw std::runtime_error("scalar overrides require a local Unix control socket");
   api::ListSessionsRequest request;
   auto response = unary<api::ListSessionsResponse>(
       [&](auto &c, auto &r) { return stub_->ListSessions(&c, request, &r); });
   for (const auto &entry : response.sessions()) {
     if (entry.id() == session.id && entry.state() == api::Session::ATTACHED) {
-      return;
+      if (scalar_overrides && !entry.jit_runtime().scalar_overrides_supported())
+        throw std::runtime_error("the server and agent do not support scalar overrides");
+      return entry.process_start_time();
     }
   }
   throw std::runtime_error("session is no longer attached: " + session.id);
+}
+
+void Controller::require_idle_target(const SessionHandle &session) const {
+  const auto owned = owned_targets_.find(session.pid);
+  if (owned != owned_targets_.end() && owned->second.session.id == session.id &&
+      owned->second.process->call_pending())
+    throw std::runtime_error("target call pending; use %call-result or %terminate");
+}
+
+void Controller::on_attach(std::function<void(const api::Session&)> hook) {
+  attachment_hook_ = std::move(hook);
+}
+
+std::filesystem::path Controller::agent_plugin_manifest(const api::AgentPluginRequest& request) const {
+  if (const auto session = agent_packages_.find(request.session_id()); session != agent_packages_.end()) {
+    if (const auto package = session->second.find(request.plugin_id()); package != session->second.end())
+      return package->second;
+  }
+  return {};
+}
+
+void Controller::agent_plugin(const api::AgentPluginRequest& request,
+                              const std::filesystem::path& manifest) {
+  const auto response = unary<api::AgentPluginResponse>(
+      [&](auto& context, auto& reply) { return stub_->AgentPlugin(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (!manifest.empty())
+    agent_packages_[request.session_id()].insert_or_assign(request.plugin_id(), manifest);
+  if (request.operation() == api::AgentPluginRequest::RUN) {
+    out_ << "agent " << request.plugin_id() << '.' << request.command() << " = " << response.value()
+         << '\n';
+  } else {
+    out_ << "agent " << request.plugin_id() << " generation " << response.generation()
+         << " active ("
+         << (response.reused_repl_object() ? "REPL object"
+             : response.cache_hit()        ? "cache hit"
+                                           : "compiled")
+         << ")\n";
+  }
 }
 
 SessionHandle Controller::attach(std::uint32_t pid,
@@ -584,7 +639,141 @@ SessionHandle Controller::attach(std::uint32_t pid,
     out_ << "target JIT runtime " << response.jit_runtime().ShortDebugString()
          << '\n';
   }
+  if (attachment_hook_) {
+    attachment_hook_(response);
+  }
   return selected_;
+}
+
+void Controller::prune_owned_targets() {
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    if (it->second.process->running())
+      ++it;
+    else
+      it = owned_targets_.erase(it);
+  }
+}
+
+void Controller::require_no_owned_targets() {
+  prune_owned_targets();
+  if (!owned_targets_.empty())
+    throw std::runtime_error("terminate owned targets before changing server");
+}
+
+void Controller::launch(const Command &command) {
+  prune_owned_targets();
+  if (owned_targets_.size() >= 16)
+    throw std::runtime_error("owned target limit reached");
+  ensure_connected();
+  // An owned server is authorized by PID. Any other endpoint is assumed to be
+  // a server on this host, so the child accepts any permitted tracer.
+  const bool owned_server = server_.running() && endpoint_ == server_.endpoint();
+  const int tracer_pid = owned_server ? server_.pid() : OwnedTarget::any_tracer;
+
+  LaunchOptions options;
+  options.executable = command.arguments.at(0);
+  options.cwd = command.option("--cwd");
+  options.input = command.option("--stdin");
+  options.output = command.option("--stdout");
+  options.error = command.option("--stderr");
+  options.preload = command.option("--preload");
+  options.supervise = command.has("--supervise");
+  options.gate_children = command.has("--gate-children");
+  if (command.has("--arg"))
+    options.arguments = command.options.at("--arg");
+  if (command.has("--env"))
+    options.environment = command.options.at("--env");
+
+  auto target = OwnedTarget::start(options, tracer_pid);
+  const auto pid = target->pid();
+  auto &owned = owned_targets_.emplace(pid, OwnedLaunch{std::move(target), {}}).first->second;
+  auto &process = *owned.process;
+  try {
+    out_ << "launching pid=" << pid
+         << " stdout=" << std::quoted(printable_proc_text(process.output_path()))
+         << " stderr=" << std::quoted(printable_proc_text(process.error_path()))
+         << '\n' << std::flush;
+    process.wait_ready(command.number("--timeout", settings_.timeout_seconds), interrupted);
+    const auto start = tracer::proc::start_time(tracer::proc::directory(pid) / "stat");
+    if (!start)
+      throw std::runtime_error("cannot verify owned target identity");
+    owned.session = attach(pid, start, process.executable());
+    if (interrupted.load())
+      throw std::runtime_error("target launch cancelled");
+  } catch (const std::exception &error) {
+    try {
+      process.terminate();
+    } catch (const std::exception &cleanup) {
+      throw std::runtime_error(std::string(error.what()) + "; " + cleanup.what() +
+                               "; retry with %terminate " + std::to_string(pid));
+    }
+    const auto session = std::move(owned.session);
+    owned_targets_.erase(pid);
+    pending_attaches_.erase(pid);
+    if (!session.id.empty()) {
+      try {
+        detach(session);
+      } catch (const std::exception &cleanup) {
+        throw std::runtime_error(std::string(error.what()) +
+                                 "; target reaped, session cleanup failed: " + cleanup.what());
+      }
+    }
+    throw;
+  }
+  out_ << "launched pid=" << pid << " session=" << owned.session.id
+       << " paused=true\n";
+}
+
+void Controller::control_target(const Command &command) {
+  const auto pid = command.arguments.empty()
+                       ? selected_.pid
+                       : static_cast<std::uint32_t>(unsigned_number(command.arguments[0], "PID", INT32_MAX));
+  const auto found = owned_targets_.find(pid);
+  if (found == owned_targets_.end()) {
+    if (command.kind == CommandKind::resume) {
+      for (const auto &entry : owned_targets_) {
+        if (entry.second.process->resume_child(pid)) {
+          out_ << "resumed child pid=" << pid << '\n';
+          return;
+        }
+      }
+    }
+    throw std::runtime_error("specify a PID launched by this REPL or select its session");
+  }
+  auto &owned = found->second;
+  if (command.kind == CommandKind::resume) {
+    require_idle_target(owned.session);
+    require_session(owned.session);
+    owned.process->resume();
+    out_ << "resumed pid=" << pid << '\n';
+    return;
+  }
+  owned.process->terminate();
+  const auto session = std::move(owned.session);
+  owned_targets_.erase(found);
+  pending_attaches_.erase(pid);
+  out_ << "terminated pid=" << pid << '\n';
+  if (owned_sessions_.count(session.id))
+    detach(session);
+}
+
+void Controller::call_target(const Command &command) {
+  const auto found = owned_targets_.find(selected_.pid);
+  if (found == owned_targets_.end() || found->second.session.id != selected_.id ||
+      found->second.session.connection != connection_)
+    throw std::runtime_error("select a target launched by this REPL");
+  auto &target = *found->second.process;
+  if (command.kind == CommandKind::target_call) {
+    require_idle_target(selected_);
+    require_session(selected_);
+    const auto args = command.options.find("--arg");
+    const std::vector<std::string> no_args;
+    if (interrupted.load())
+      throw std::runtime_error("target call cancelled before submission");
+    target.start_call(command.arguments.at(0), args == command.options.end() ? no_args : args->second);
+  }
+  const auto result = target.call_result(command.number("--timeout", settings_.timeout_seconds), interrupted);
+  out_ << "call result pid=" << found->first << ' ' << result << '\n';
 }
 
 namespace {
@@ -620,6 +809,12 @@ void Controller::detach(const SessionHandle &session) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error("invalid session handle");
   }
+  for (const auto &entry : owned_targets_) {
+    auto &target = entry.second;
+    if (target.session.id == session.id && target.process->paused() &&
+        target.process->running())
+      throw std::runtime_error("resume or terminate the paused target before detaching");
+  }
   stop_background(session.id);
   api::DetachRequest request;
   request.set_session_id(session.id);
@@ -632,6 +827,7 @@ void Controller::detach(const SessionHandle &session) {
                              " " + response.error());
   }
   owned_sessions_.erase(session.id);
+  agent_packages_.erase(session.id);
   for (auto it = pending_attaches_.begin(); it != pending_attaches_.end();) {
     const bool identified = it->second.candidate_ids.erase(session.id) != 0 ||
                             (response.pid() == it->first &&
@@ -647,6 +843,13 @@ void Controller::detach(const SessionHandle &session) {
     selected_ = {};
   }
   out_ << "detached session=" << request.session_id() << '\n';
+  if (response.has_object_probe()) {
+    const auto &group = response.object_probe();
+    out_ << "object-probe registration=" << group.registration_id()
+         << " active=" << (group.active() ? "yes" : "no")
+         << " restoration_pending=" << (group.restoration_pending() ? "yes" : "no")
+         << " | " << group.diagnostic() << '\n';
+  }
 }
 
 api::ProbeSpec Controller::resolve(const std::string &selector,
@@ -707,6 +910,61 @@ std::filesystem::path Controller::module_index_path(const Command &command) cons
   throw std::invalid_argument("no default module index; run %module index or %module use INDEX");
 }
 
+ModuleList::~ModuleList() = default;
+ModuleInfo::~ModuleInfo() = default;
+
+api::ListModulesResponse Controller::module_snapshot(bool include_mappings) {
+  return module_snapshot(selected_, include_mappings);
+}
+
+api::ListModulesResponse Controller::module_snapshot(const SessionHandle &session,
+                                                     bool include_mappings) {
+  require_session(session);
+  api::ListModulesRequest request;
+  request.set_session_id(session.id);
+  request.set_include_mappings(include_mappings);
+  auto response = unary<api::ListModulesResponse>(
+      [&](auto &context, auto &result) { return stub_->ListModules(&context, request, &result); },
+      settings_.timeout_seconds);
+  if (include_mappings && response.mapping_token().empty())
+    throw std::runtime_error("server does not support mapped module details");
+  return response;
+}
+
+ModuleList Controller::modules(const std::string &filter) {
+  const auto response = module_snapshot(false);
+  ModuleList modules;
+  for (const auto &path : response.modules()) {
+    if (path.find(filter) != std::string::npos)
+      modules.paths.push_back(path);
+  }
+  return modules;
+}
+
+ModuleInfo Controller::module_info(const std::string &name) {
+  const auto response = module_snapshot(true);
+  const bool use_basename = name.find('/') == std::string::npos;
+  ModuleInfo info;
+  for (const auto &path : response.modules()) {
+    if (path != name && !(use_basename && std::filesystem::path(path).filename() == name))
+      continue;
+    if (!info.path.empty())
+      throw std::invalid_argument("ambiguous module name: " + name + " (use its full path)");
+    info.path = path;
+  }
+  if (info.path.empty())
+    throw std::invalid_argument("module not found: " + name);
+  info.mapping_token = response.mapping_token();
+  for (const auto &entry : response.mappings()) {
+    if (entry.path() == info.path) {
+      info.mappings.push_back({entry.begin_address(), entry.end_address(),
+                               entry.file_offset(), entry.device(), entry.inode(),
+                               entry.build_id()});
+    }
+  }
+  return info;
+}
+
 ::tracer_module::ModuleIndex Controller::open_module_index(const std::filesystem::path &path) {
   auto index = ::tracer_module::ModuleIndex::open(path.empty() ? module_index_path(Command{}) : path);
   default_module_index_ = index.path();
@@ -760,12 +1018,7 @@ void Controller::module_command(const Command &command) {
       if (::stat(mapped.c_str(), &file) != 0)
         throw std::invalid_argument("mapped ELF is unavailable locally");
       for (const auto &entry : reply.mappings()) {
-        if (entry.path() != mapped || entry.inode() != file.st_ino) continue;
-        const auto colon = entry.device().find(':');
-        if (colon == std::string::npos ||
-            std::stoul(entry.device().substr(0, colon), nullptr, 16) != major(file.st_dev) ||
-            std::stoul(entry.device().substr(colon + 1), nullptr, 16) != minor(file.st_dev))
-          continue;
+        if (entry.path() != mapped || entry.build_id().empty()) continue;
         build_id = entry.build_id();
         break;
       }
@@ -860,15 +1113,151 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
   std::vector<char *> argv;
   for (auto &argument : arguments) argv.push_back(argument.data());
   argv.push_back(nullptr);
+  int diagnostic_pipe[2]{};
+  if (::pipe(diagnostic_pipe) != 0)
+    throw std::system_error(errno, std::generic_category(), "cannot capture native preparation diagnostics");
+  for (const auto fd : diagnostic_pipe) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+      const int error = errno;
+      ::close(diagnostic_pipe[0]);
+      ::close(diagnostic_pipe[1]);
+      throw std::system_error(error, std::generic_category(), "cannot secure native preparation diagnostics");
+    }
+  }
+  if (::fcntl(diagnostic_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
+    const int error = errno;
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(error, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
+  posix_spawn_file_actions_t actions;
+  int configured = ::posix_spawn_file_actions_init(&actions);
+  const bool actions_initialized = configured == 0;
+  if (!configured)
+    configured = ::posix_spawn_file_actions_adddup2(&actions, diagnostic_pipe[1], STDERR_FILENO);
+  if (!configured && diagnostic_pipe[0] != STDERR_FILENO)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[0]);
+  if (!configured && diagnostic_pipe[1] != STDERR_FILENO)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[1]);
+  if (configured) {
+    if (actions_initialized)
+      ::posix_spawn_file_actions_destroy(&actions);
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(configured, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
   pid_t pid = 0;
-  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
-  if (started)
+  const int started = ::posix_spawnp(&pid, argv.front(), &actions, nullptr, argv.data(), environ);
+  ::posix_spawn_file_actions_destroy(&actions);
+  ::close(diagnostic_pipe[1]);
+  if (started) {
+    ::close(diagnostic_pipe[0]);
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
+  }
+  std::array<char, 4096> buffer{};
+  // The preparer's terminal reason belongs in the REPL error. Its other
+  // output continues to stream while the child is running.
+  const auto failure_prefix = tracer::prepared::preparer_failure_prefix;
+  std::string line_prefix, failure_reason;
+  bool at_line_start = true, saw_failure = false, capturing_reason = false;
+  const auto relay_stderr = [&](std::string_view bytes) {
+    while (!bytes.empty()) {
+      const auto newline = bytes.find('\n');
+      const bool complete_line = newline != bytes.npos;
+      const auto length = complete_line ? newline + 1 : bytes.size();
+      const auto part = bytes.substr(0, length);
+      bytes.remove_prefix(length);
+      if (capturing_reason) {
+        failure_reason.append(part);
+        capturing_reason = !complete_line;
+      } else if (at_line_start && !saw_failure) {
+        line_prefix.append(part);
+        if (::tracer::compat::starts_with(failure_prefix, line_prefix) && line_prefix.size() < failure_prefix.size())
+          continue;
+        if (::tracer::compat::starts_with(line_prefix, failure_prefix)) {
+          saw_failure = true;
+          capturing_reason = !complete_line;
+          failure_reason.assign(line_prefix, failure_prefix.size());
+        } else {
+          std::cerr << line_prefix;
+        }
+        line_prefix.clear();
+      } else {
+        std::cerr << part;
+      }
+      at_line_start = complete_line;
+    }
+  };
+  int read_error = 0;
+  const auto drain = [&](std::size_t size) {
+    ssize_t count;
+    do {
+      count = ::read(diagnostic_pipe[0], buffer.data(), std::min(size, buffer.size()));
+    } while (count < 0 && errno == EINTR);
+    if (count > 0) {
+      relay_stderr({buffer.data(), static_cast<std::size_t>(count)});
+    } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      read_error = errno;
+    }
+    return count;
+  };
+
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0)
-    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error(failure);
+  pid_t waited;
+  bool pipe_open = true;
+  do {
+    do {
+      waited = ::waitpid(pid, &status, pipe_open ? WNOHANG : 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != 0)
+      break;
+    const auto count = drain(buffer.size());
+    if (!count || read_error) {
+      ::close(diagnostic_pipe[0]);
+      pipe_open = false;
+    } else if (count < 0) {
+      pollfd ready{diagnostic_pipe[0], POLLIN, 0};
+      // A descendant may keep the pipe open after the preparer exits.
+      // Check the leader's status even when stderr has no new bytes.
+      (void)::poll(&ready, 1, 20);
+    }
+  } while (true);
+  if (pipe_open) {
+    if (waited == pid) {
+      int pending = 0;
+      if (::ioctl(diagnostic_pipe[0], FIONREAD, &pending) == 0) {
+        while (pending > 0) {
+          const auto count = drain(static_cast<std::size_t>(pending));
+          if (count <= 0)
+            break;
+          pending -= static_cast<int>(count);
+        }
+      } else {
+        (void)drain(buffer.size());
+      }
+    }
+    ::close(diagnostic_pipe[0]);
+  }
+  if (!line_prefix.empty())
+    std::cerr << line_prefix;
+  if (waited < 0)
+    throw std::runtime_error("cannot wait for native preparation");
+  if (read_error)
+    throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    if (saw_failure)
+      std::cerr << failure_prefix << failure_reason;
+    return;
+  }
+  while (!failure_reason.empty() && (failure_reason.back() == '\n' || failure_reason.back() == '\r'))
+    failure_reason.pop_back();
+  const auto status_message = WIFSIGNALED(status)
+      ? "preparer terminated by signal " + std::to_string(WTERMSIG(status))
+      : WIFEXITED(status) ? "preparer exited with status " + std::to_string(WEXITSTATUS(status))
+                         : std::string("unexpected preparer status");
+  throw std::runtime_error(std::string(failure) + ": " + status_message +
+                           (failure_reason.empty() ? "" : ": " + failure_reason));
 }
 
 class PreparationDirectory {
@@ -937,6 +1326,12 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
     arguments.insert(arguments.end(), {"--compdb", database});
   }
   if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
+  if (options.has("--no-automatic-members")) arguments.push_back("--no-automatic-members");
+  // Limits are validated by the prepare tool, which also reads the environment.
+  for (const auto &limit : tracer::kLimitSpecs) {
+    const auto key = std::string("--") + limit.name;
+    if (options.has(key)) arguments.insert(arguments.end(), {key, options.option(key)});
+  }
   if (options.has("--receiver-storage")) arguments.push_back("--receiver-storage");
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
@@ -970,11 +1365,187 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
   PreparedPackage package{directory.string(), {}};
   const auto file = directory / "prepared.pb";
   std::ifstream input(file, std::ios::binary);
-  if (!input || std::filesystem::file_size(file) > 65536 ||
-      !package.artifact.ParseFromIstream(&input))
+  if (!input || !package.artifact.ParseFromIstream(&input)) {
     throw std::runtime_error("cannot read newly generated prepared package");
+  }
   out_ << "prepared directory=" << directory << '\n';
   return package;
+}
+
+void Controller::object_probe_command(const Command &command) {
+  using K = CommandKind;
+  using Request = api::ObjectProbeRequest;
+  const auto values = [&](const char *name) {
+    const auto found = command.options.find(name);
+    return found == command.options.end() ? std::vector<std::string>{} : found->second;
+  };
+  if (command.kind == K::object_probe_prepare) {
+    if (!command.has("--output"))
+      throw std::invalid_argument("object probe preparation requires --output FILE");
+    const auto output = command.option("--output");
+    if (std::filesystem::exists(std::filesystem::symlink_status(output)))
+      throw std::invalid_argument("object-probe package already exists; select a new --output file");
+    ObjectProbePackageInput input;
+    input.qualified_type = command.arguments.at(0);
+    input.methods = values("--method");
+    input.fields = values("--field");
+    input.writer_selectors = values("--code");
+    input.allow_dwarf_writer_fallback = command.has("--dwarf-writers");
+    input.compile.includes = values("--include");
+    input.compile.compilation_database = command.option("--compdb");
+    input.compile.translation_unit = command.option("--translation-unit");
+    input.compile.extra_arguments = probe_extra_arguments(command, settings_);
+    if (command.has("--callbacks"))
+      input.callback_source = read_source(command.option("--callbacks"));
+    if (input.fields.size() > 1)
+      throw std::invalid_argument("select one field per object probe");
+    if (!input.fields.empty() && input.writer_selectors.empty()) {
+      api::ObjectWatchRequest discovery;
+      discovery.set_concrete_type(input.qualified_type);
+      discovery.set_field(input.fields.front());
+      discover_writers(command, discovery);
+      input.writer_selectors.push_back(discovery.code_symbol());
+      for (const auto &additional : discovery.additional_code_symbols())
+        input.writer_selectors.push_back(additional);
+    }
+    if (!input.fields.empty() && input.methods.empty() && !input.allow_dwarf_writer_fallback &&
+        (!command.has("--compdb") || !command.has("--translation-unit")))
+      throw std::invalid_argument("supply original compilation context or select --dwarf-writers");
+    PreparationDirectory staging;
+    std::size_t method_index = 0;
+    const auto package = ObjectProbePackage::prepare(input,
+        [&](const std::string &selector, const ObjectProbeCompileInputs &compile) {
+      Command options;
+      options.options["--receiver-storage"] = {"true"};
+      options.options["--include"] = compile.includes;
+      options.options["--compdb"] = {compile.compilation_database};
+      options.options["--translation-unit"] = {compile.translation_unit};
+      options.options["--output"] = {staging.file(std::to_string(method_index++)).string()};
+      options.extra_compile_argument_inputs = command.extra_compile_argument_inputs;
+      options.extra_compile_arguments = command.extra_compile_arguments;
+      try {
+        return prepare_package(selector, options).artifact;
+      } catch (const std::exception &error) {
+        throw std::runtime_error("cannot prepare object probe method " + selector + " | " + error.what());
+      }
+    });
+    package.save(output);
+    out_ << "object-probe package=" << command.option("--output")
+         << " type=" << input.qualified_type << " methods=" << input.methods.size()
+         << " writers=" << input.writer_selectors.size() << '\n';
+    return;
+  }
+
+  const bool inspecting = command.kind == K::object_probe_status || command.kind == K::object_probe_stop;
+  if (!inspecting)
+    require_session(selected_);
+  else if (!stub_ || selected_.id.empty() || selected_.connection != connection_)
+    throw std::runtime_error("no valid selected session; use %attach PID or %use SESSION");
+  Request request;
+  request.set_session_id(selected_.id);
+  std::string definition;
+  if (inspecting) {
+    request.set_action(command.kind == K::object_probe_status ? Request::STATUS : Request::STOP);
+    if (!command.arguments.empty())
+      request.set_registration_id(unsigned_number(command.arguments.front(), "registration id"));
+  } else {
+    if (!command.has("--package"))
+      throw std::invalid_argument("object probe requires --package FILE");
+    const auto package = ObjectProbePackage::load(command.option("--package"));
+    const auto &input = package.input();
+    const auto starting = command.kind == K::object_probe_start;
+    request.set_action(Request::START);
+    for (const auto &artifact : package.prepared_methods())
+      *request.add_methods() = artifact;
+    request.set_callback_source(input.callback_source);
+    const auto module_path = [](const std::string &selector) {
+      const std::filesystem::path path(selector);
+      return path.has_parent_path() ? std::filesystem::absolute(path).lexically_normal().string() : selector;
+    };
+    request.set_method_module(module_path(command.option("--method-module", command.option("--module"))));
+    auto &watch = *request.mutable_watch();
+    watch.set_concrete_type(input.qualified_type);
+    watch.set_code_module(module_path(command.option("--module")));
+    if (!input.fields.empty()) {
+      watch.set_field(input.fields.front());
+      watch.set_code_symbol(input.writer_selectors.front());
+      for (std::size_t i = 1; i < input.writer_selectors.size(); ++i)
+        watch.add_additional_code_symbols(input.writer_selectors[i]);
+    }
+    watch.set_follow_calls(command.has("--follow-calls"));
+    watch.set_no_values(command.has("--no-values"));
+    watch.set_first_seen(command.has("--first-seen"));
+    watch.set_union_tag(command.option("--union-tag"));
+    if (command.has("--synchronization")) {
+      const auto policy = command.option("--synchronization");
+      if (policy == "thread-confined")
+        watch.set_synchronization(api::ObjectWatchRequest::THREAD_CONFINED);
+      else if (policy == "caller-lock")
+        watch.set_synchronization(api::ObjectWatchRequest::CALLER_LOCK);
+      else
+        throw std::invalid_argument("synchronization must be thread-confined or caller-lock");
+    }
+    for (const auto &mapping : values("--union-case")) {
+      const auto split = mapping.find('=');
+      if (split == std::string::npos || !split || split + 1 == mapping.size())
+        throw std::invalid_argument("--union-case requires TAG=MEMBER");
+      const auto literal = mapping.substr(0, split);
+      auto *item = watch.add_union_cases();
+      if (literal.front() == '-') {
+        std::size_t consumed = 0;
+        const auto tag = std::stoll(literal, &consumed);
+        if (consumed != literal.size())
+          throw std::invalid_argument("invalid signed union discriminator");
+        item->set_tag_bits(static_cast<std::uint64_t>(tag));
+      } else {
+        item->set_tag_bits(unsigned_number(literal, "union discriminator"));
+      }
+      item->set_member(mapping.substr(split + 1));
+    }
+    definition = request.SerializeAsString();
+    if (starting && object_probe_preview_ && object_probe_preview_->definition == definition)
+      *request.mutable_preview() = object_probe_preview_->binding;
+    if (!starting)
+      request.set_action(Request::PREVIEW);
+  }
+  const auto result = unary<api::ObjectProbeStatus>(
+      [&](auto &context, auto &reply) { return stub_->ObjectProbe(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (request.action() == Request::PREVIEW) {
+    object_probe_preview_ = ObjectProbePreview{std::move(definition), result.binding()};
+    const auto &watch = result.watch();
+    out_ << "object-probe preview build_id=" << watch.plan().executable_build_id()
+         << " writer_build_id=" << watch.plan().writer_build_id()
+         << " sites=" << watch.store_sites() << " unsupported=" << watch.unsupported_sites()
+         << " redirects=" << watch.redirects_size() << '\n';
+    for (const auto &binding : watch.plan().bindings())
+      out_ << "  " << binding.role() << " " << binding.function()
+           << " module=" << binding.module() << " pc=0x" << std::hex << binding.runtime_pc()
+           << std::dec << '\n';
+    for (const auto &patch : result.binding().method_patches())
+      out_ << "  method " << patch.function() << " module=" << patch.module()
+           << " pc=0x" << std::hex << patch.runtime_pc() << std::dec
+           << " verified_bytes=" << patch.patch_size() << '\n';
+    out_ << result.diagnostic() << '\n';
+    if (!watch.diagnostic().empty())
+      out_ << watch.diagnostic() << '\n';
+    return;
+  }
+  const auto &watch = result.watch();
+  out_ << "object-probe registration=" << result.registration_id()
+       << " active=" << (result.active() ? "yes" : "no")
+       << " methods=" << result.methods_size()
+       << " observations=" << watch.observations() << " dropped=" << watch.dropped()
+       << " coverage_gaps=" << watch.coverage_gaps()
+       << " runtime_gap_hits=" << watch.runtime_gap_hits()
+       << " restoration_pending=" << (result.restoration_pending() ? "yes" : "no")
+       << " | " << result.diagnostic() << '\n';
+  for (const auto &method : result.methods())
+    out_ << "  method_probe=" << method.id()
+         << " active=" << (method.active() ? "yes" : "no")
+         << " restored=" << (method.original_bytes_restored() ? "yes" : "no") << '\n';
+  if (result.restoration_pending())
+    throw std::runtime_error("retry %object-probe stop with the registration id");
 }
 
 void Controller::prepare(const std::string &selector, const Command &options) {
@@ -1009,8 +1580,50 @@ void Controller::prepare_object_methods(const Command &command, api::ObjectWatch
   }
 }
 
-std::vector<std::string> Controller::take_pending_imports() {
+std::vector<PendingPreparedImport> Controller::take_pending_imports() {
   return std::exchange(pending_imports_, {});
+}
+
+std::function<api::ListModulesResponse()>
+Controller::prepared_import_modules(const SessionHandle &session) {
+#if defined(__linux__) && defined(__x86_64__)
+  if (!server_.endpoint().empty() && endpoint_ == server_.endpoint())
+    return [this, session] { return module_snapshot(session, true); };
+  // Another server's mappings count only when this host's kernel confirms them
+  // for a process owned by the REPL's user.
+  return [this, session] {
+    auto modules = module_snapshot(session, true);
+    std::string text;
+    bool readable = false;
+    if (session.pid) {
+      const auto path = "/proc/" + std::to_string(session.pid) + "/maps";
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        struct stat status{};
+        readable = ::fstat(fd, &status) == 0 && status.st_uid == ::geteuid();
+        // The kernel bounds the file by the process's mapping count (vm.max_map_count).
+        char buffer[65536];
+        while (readable) {
+          const auto count = ::read(fd, buffer, sizeof(buffer));
+          if (count < 0 && errno == EINTR) continue;
+          if (count < 0) readable = false;
+          if (count <= 0) break;
+          text.append(buffer, static_cast<std::size_t>(count));
+        }
+        ::close(fd);
+      }
+    }
+    if (!readable) {
+      modules.clear_mappings();
+      return modules;
+    }
+    std::istringstream maps(text);
+    return tracer_repl::confirmed_local_mappings(std::move(modules), maps);
+  };
+#else
+  (void)session;
+#endif
+  return {};
 }
 
 std::vector<api::PreparedInjector> Controller::take_pending_replay_types() {
@@ -1021,7 +1634,12 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &selector,
                                  const std::string &source,
                                  const Command &options) {
-  require_session(session);
+  require_idle_target(session);
+  const bool override_arguments = options.has("--allow-arg-overrides");
+  const bool override_result = options.has("--allow-result-override");
+  const bool replacement = options.has("--allow-replacement");
+  const bool call_original = options.has("--allow-call-original");
+  require_session(session, override_arguments || override_result || replacement || call_original);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1033,7 +1651,17 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       options.option("--stack-application-only", "true") == "false");
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
+  spec.set_allow_argument_overrides(override_arguments);
+  spec.set_allow_result_override(override_result);
+  spec.set_allow_replacement(replacement);
+  spec.set_allow_call_original(call_original);
+  spec.set_trace_exceptions(options.has("--trace-exceptions"));
+  spec.set_reclaimable(options.has("--reclaimable"));
   spec.set_snapshot_return_pointee(options.has("--snapshot-return-pointee"));
+  for (const auto &limit : tracer::kLimitSpecs) {
+    const auto key = std::string("--") + limit.name;
+    if (options.has(key)) tracer::set_limit(*spec.mutable_snapshot_limits(), limit.name, options.option(key));
+  }
   spec.set_snapshot_receiver_at_return(options.has("--snapshot-receiver-at-return"));
   spec.set_native_backend(options.option("--backend", "auto"));
   spec.set_direct_caller(options.option("--caller"));
@@ -1053,7 +1681,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   if (tracer::prepared::is_typed_version(artifact.format_version()) &&
       package != prepared_packages_.end() &&
       artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
-    pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));
+    pending_imports_.push_back(
+        {tracer::prepared::adapter_source(package->second.artifact), session});
   out_ << "installed probe=" << result.id()
        << " session=" << result.session_id();
   if (result.jit_compile_ns() && result.patch_install_ns())
@@ -1073,8 +1702,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
 }
 
 void Controller::draft(const std::string &name, std::string source) {
-  if (source.empty() || source.size() > 4 * 1024 * 1024) {
-    throw std::invalid_argument("draft must contain between 1 byte and 4 MiB");
+  if (source.empty()) {
+    throw std::invalid_argument("draft must contain nonempty source");
   }
   drafts_[name] = std::move(source);
 }
@@ -1110,6 +1739,17 @@ void Controller::print(const Collection &collection) const {
 RecordResult Controller::watch(const Command &command, bool display,
                                const std::string &record_path) {
   ensure_connected();
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
+  if (command.has("--callback-errors")) {
+    const auto value = command.option("--callback-errors");
+    if (value == "exclude")
+      callback_errors = CallbackErrorFilter::exclude;
+    else if (value == "only")
+      callback_errors = CallbackErrorFilter::only;
+    else if (value != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+  }
   api::WatchEventsRequest request;
   if (command.has("--session")) {
     request.add_session_ids(command.option("--session"));
@@ -1188,6 +1828,12 @@ RecordResult Controller::watch(const Command &command, bool display,
         api::TracePhase_Name(event.phase()) != command.option("--phase")) {
       // The server can send the adapter once for a batch. Keep it if the
       // event carrying it is filtered out before the next stored event.
+      if (sqlite && event.has_replay_types())
+        pending_types.insert_or_assign(event.probe_id(),
+                                       std::move(*event.mutable_replay_types()));
+      continue;
+    }
+    if (!callback_error_matches(event, callback_errors)) {
       if (sqlite && event.has_replay_types())
         pending_types.insert_or_assign(event.probe_id(),
                                        std::move(*event.mutable_replay_types()));
@@ -1272,8 +1918,13 @@ RecordResult Controller::record(const std::string &path,
     throw std::invalid_argument("SQLite recording requires a persistent file path");
   if (options.session && options.all_sessions)
     throw std::invalid_argument("recording session conflicts with all_sessions");
-  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
-    throw std::invalid_argument("recording phase must be PRE or POST");
+  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST" &&
+      options.phase != "EXCEPTION")
+    throw std::invalid_argument("recording phase must be PRE, POST or EXCEPTION");
+  if (options.callback_errors != CallbackErrorFilter::include &&
+      options.callback_errors != CallbackErrorFilter::exclude &&
+      options.callback_errors != CallbackErrorFilter::only)
+    throw std::invalid_argument("invalid callback error filter");
   if (options.timeout_seconds > 86400)
     throw std::invalid_argument("recording timeout must be at most 86400 seconds");
 
@@ -1289,6 +1940,10 @@ RecordResult Controller::record(const std::string &path,
     command.options["--name"] = options.names;
   if (!options.phase.empty())
     command.options["--phase"] = {options.phase};
+  if (options.callback_errors == CallbackErrorFilter::exclude)
+    command.options["--callback-errors"] = {"exclude"};
+  else if (options.callback_errors == CallbackErrorFilter::only)
+    command.options["--callback-errors"] = {"only"};
   if (options.probe_id)
     command.options["--probe"] = {std::to_string(options.probe_id)};
   if (options.after_sequence)
@@ -1503,6 +2158,7 @@ void Controller::preview_bulk_trace(const Command &command) {
     else
       out_ << "address=unavailable";
     out_ << " " << std::quoted(printable_proc_text(function.selector()))
+         << " symbol=" << printable_proc_text(function.linkage_symbol())
          << " module=" << std::quoted(printable_proc_text(function.module_path()));
     if (!candidate.diagnostic().empty())
       out_ << " reason=" << std::quoted(printable_proc_text(candidate.diagnostic()));
@@ -1515,11 +2171,16 @@ void Controller::preview_bulk_trace(const Command &command) {
          << " reason=\"no matching concrete entry after module and exclusion rules\"\n";
   out_ << "dry-run matched=" << response.candidates_size()
        << " dwarf_supported=" << supported
-       << " limit=" << response.retained_limit()
+       << " limit=" << (response.retained_limit()
+                            ? std::to_string(response.retained_limit())
+                            : "unlimited")
        << " session_retained=" << response.session_retained();
-  if (response.has_available_slots())
-    out_ << " agent_retained=" << response.agent_retained()
-         << " available=" << response.available_slots()
+  if (response.has_agent_retained())
+    out_ << " agent_retained=" << response.agent_retained();
+  if (!response.retained_limit())
+    out_ << " available=unlimited fits=yes";
+  else if (response.has_available_slots())
+    out_ << " available=" << response.available_slots()
          << " fits=" << (supported <= response.available_slots() ? "yes" : "no");
   else
     out_ << " available=unknown fits=unknown";
@@ -1532,6 +2193,7 @@ void Controller::preview_bulk_trace(const Command &command) {
 }
 
 void Controller::apply_bulk_trace(const Command &command) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::ApplyBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1543,18 +2205,43 @@ void Controller::apply_bulk_trace(const Command &command) {
 
   grpc::ClientContext context;
   context.set_deadline(std::chrono::system_clock::now() +
-                       std::chrono::seconds(settings_.timeout_seconds));
-  Cancellation cancellation(context);
+                       std::chrono::seconds(settings_.bulk_apply_timeout_seconds));
   api::BulkTraceReport report;
-  const auto status = stub_->ApplyBulkTrace(&context, request, &report);
+  grpc::Status status;
+  {
+    Cancellation cancellation(context);
+    status = stub_->ApplyBulkTrace(&context, request, &report);
+  }
   if (!status.ok()) {
     auto message = "bulk trace apply: " + status.error_message();
     if (status.error_code() == grpc::StatusCode::CANCELLED ||
         status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
         status.error_code() == grpc::StatusCode::UNAVAILABLE ||
         status.error_code() == grpc::StatusCode::UNKNOWN ||
-        status.error_code() == grpc::StatusCode::INTERNAL)
-      message += " | check or restore with %trace remove " + request.batch_id();
+        status.error_code() == grpc::StatusCode::INTERNAL) {
+      // Removal takes the session operation lock after apply's own rollback.
+      // Use a fresh deadline so cancellation cannot also cancel restoration.
+      api::RemoveBulkTraceRequest remove;
+      remove.set_session_id(request.session_id());
+      remove.set_batch_id(request.batch_id());
+      grpc::ClientContext cleanup_context;
+      cleanup_context.set_deadline(std::chrono::system_clock::now() +
+          std::chrono::seconds(std::max(default_bulk_apply_timeout_seconds,
+                                       settings_.bulk_apply_timeout_seconds)));
+      api::BulkTraceReport cleanup;
+      const auto restored = stub_->RemoveBulkTrace(&cleanup_context, remove, &cleanup);
+      if (restored.ok())
+        print_bulk_report(out_, "restore", cleanup);
+      if (restored.ok() && cleanup.complete()) {
+        message += " | batch restored";
+      } else if (restored.error_code() == grpc::StatusCode::NOT_FOUND) {
+        message += " | cleanup: " + restored.error_message();
+      } else {
+        message += restored.ok() ? " | batch restoration incomplete" :
+                                   " | cleanup: " + restored.error_message();
+        message += " | retry with %trace remove " + request.batch_id();
+      }
+    }
     throw std::runtime_error(message);
   }
   print_bulk_report(out_, "apply", report);
@@ -1569,6 +2256,7 @@ void Controller::apply_bulk_trace(const Command &command) {
 }
 
 void Controller::remove_bulk_trace(const std::string &batch_id) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::RemoveBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1581,7 +2269,7 @@ void Controller::remove_bulk_trace(const std::string &batch_id) {
     throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
-bool Controller::execute(const Command &command) {
+bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepare_agent) {
   const auto &args = command.arguments;
   using K = CommandKind;
   switch (command.kind) {
@@ -1591,6 +2279,7 @@ bool Controller::execute(const Command &command) {
     start_server(command);
     return true;
   case K::server_connect:
+    require_no_owned_targets();
     if (server_.running() || !owned_sessions_.empty() ||
         !pending_attaches_.empty()) {
       throw std::runtime_error(
@@ -1601,6 +2290,7 @@ bool Controller::execute(const Command &command) {
     out_ << "connected endpoint=" << endpoint_ << " ownership=external\n";
     return true;
   case K::server_stop:
+    require_no_owned_targets();
     if (server_.pid() < 0) {
       throw std::runtime_error("this console does not own a server");
     }
@@ -1612,6 +2302,7 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::server_status:
   case K::status: {
+    prune_owned_targets();
     const bool owned = server_.running();
     out_ << "endpoint=" << (endpoint_.empty() ? settings_.endpoint : endpoint_)
          << " ownership="
@@ -1631,6 +2322,11 @@ bool Controller::execute(const Command &command) {
     }
     if (!pending_attaches_.empty())
       out_ << reconcile_attaches() << '\n';
+    for (const auto &target : owned_targets_)
+      out_ << "owned_target pid=" << target.first
+           << " paused=" << (target.second.process->paused() ? "true" : "false")
+           << " calls=" << (target.second.process->calls_enabled() ? "enabled" : "unavailable")
+           << " call_pending=" << (target.second.process->call_pending() ? "true" : "false") << '\n';
     for (const auto &b : batches_) {
       out_ << "collection=" << b.first << " events=" << b.second.events().size()
            << " bytes=" << b.second.bytes() << '\n';
@@ -1641,6 +2337,58 @@ bool Controller::execute(const Command &command) {
     attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
            command.number("--start-time", 0));
     return true;
+  case K::launch:
+    launch(command);
+    return true;
+  case K::children:
+    for (const auto &entry : owned_targets_)
+      for (const auto pid : entry.second.process->children())
+        out_ << "gated child pid=" << pid << " owner=" << entry.first << '\n';
+    return true;
+  case K::resume:
+  case K::terminate:
+    control_target(command);
+    return true;
+  case K::target_call:
+  case K::target_call_result:
+    call_target(command);
+    return true;
+  case K::syscalls:
+  case K::watchpoint:
+  case K::faults:
+  case K::sample_allocations:
+  case K::sample_cpu: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("local perf capture requires the REPL's owned local server");
+    const auto start = require_session(selected_);
+    auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    if (command.kind == K::faults)
+      mode = LocalPerfMode::faults;
+    if (command.kind == K::sample_allocations)
+      mode = LocalPerfMode::allocations;
+    Watchpoint watch{};
+    if (command.kind == K::watchpoint) {
+      mode = LocalPerfMode::watchpoint;
+      watch = {static_cast<std::uint32_t>(command.number("--tid", 0)),
+               address_number(command.option("--address")),
+               static_cast<unsigned>(command.number("--size", 0)),
+               command.option("--access") == "read-write"};
+      api::ReadMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_address(watch.address);
+      request.set_size(watch.size);
+      const auto result = unary<api::ReadMemoryResponse>(
+          [&](auto &c, auto &r) { return stub_->ReadMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+      if (result.address() != watch.address || result.data().size() != watch.size)
+        throw std::runtime_error("watchpoint range could not be verified");
+    }
+    capture_local_perf(mode, selected_.pid, start, command.number("--timeout", 2),
+                       command.number("--count", 256), interrupted, out_,
+                       mode == LocalPerfMode::watchpoint ? &watch : nullptr);
+    return true;
+  }
   case K::bulk_preview:
     preview_bulk_trace(command);
     return true;
@@ -1718,6 +2466,185 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::object_probe_prepare:
+  case K::object_probe_preview:
+  case K::object_probe_start:
+  case K::object_probe_status:
+  case K::object_probe_stop:
+    object_probe_command(command);
+    return true;
+  case K::live_update:
+  case K::live_preview:
+  case K::live_watch:
+  case K::live_status:
+  case K::live_revert:
+  case K::live_recover:
+  case K::live_mock:
+  case K::live_update_data:
+  case K::live_scan_heap: {
+    require_session(selected_);
+    api::LiveUpdateRequest request;
+    request.set_session_id(selected_.id);
+    switch (command.kind) {
+    case K::live_update: request.set_action(api::LiveUpdateRequest::UPDATE); break;
+    case K::live_preview:
+    case K::live_watch: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
+    case K::live_status: request.set_action(api::LiveUpdateRequest::STATUS); break;
+    case K::live_revert: request.set_action(api::LiveUpdateRequest::REVERT); break;
+    case K::live_recover: request.set_action(api::LiveUpdateRequest::RECOVER); break;
+    case K::live_mock: request.set_action(api::LiveUpdateRequest::MOCK); break;
+    case K::live_update_data: request.set_action(api::LiveUpdateRequest::UPDATE_DATA); break;
+    case K::live_scan_heap: request.set_action(api::LiveUpdateRequest::SCAN_HEAP); break;
+    default: throw std::logic_error("invalid live command");
+    }
+    if (command.kind == K::live_revert && !args.empty()) {
+      request.set_revision(unsigned_number(args.front(), "revision"));
+      request.set_has_exact_revision(true);
+    }
+    if (command.has("--retention-limit")) {
+      const auto limit = command.number("--retention-limit", 0);
+      if (!limit)
+        throw std::invalid_argument("retention limit must be positive");
+      request.set_retention_limit(limit);
+    }
+    if (command.has("--payload-limit"))
+      request.set_payload_limit(command.number("--payload-limit", 0));
+    const auto snapshot = [](const std::filesystem::path &path) {
+      std::ifstream input(path, std::ios::binary);
+      if (!input)
+        throw std::runtime_error("cannot read saved source " + path.string());
+      return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    std::map<std::string, std::string> watched;
+    if (command.kind == K::live_update || command.kind == K::live_preview ||
+        command.kind == K::live_watch) {
+      if (args.empty())
+        throw std::invalid_argument("provide at least one source or header");
+      for (const auto &arg : args) {
+        const auto path = std::filesystem::canonical(arg).string();
+        auto contents = snapshot(path);
+        if (command.kind == K::live_watch) {
+          if (!watched.emplace(path, std::move(contents)).second)
+            throw std::invalid_argument("duplicate live watch file: " + path);
+        } else {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(std::move(contents));
+        }
+      }
+    } else if (command.kind != K::live_status && command.kind != K::live_revert &&
+               command.kind != K::live_recover) {
+      for (const auto &arg : args)
+        request.add_arguments(arg);
+    }
+    if (command.kind != K::live_status && command.kind != K::live_revert &&
+        command.kind != K::live_recover) {
+      request.set_build_manifest(std::filesystem::absolute(
+          command.option("--build", "clang-tracer-live.textproto")).string());
+      request.set_compilation_database(std::filesystem::absolute(
+          command.option("--compdb", "compile_commands.json")).string());
+    }
+    for (const auto &[name, options] : command.options) {
+      if (name == "--compdb" || name == "--build" || name == "--retention-limit" ||
+          name == "--payload-limit")
+        continue;
+      for (const auto &value : options) {
+        auto *option = request.add_options();
+        option->set_name(name);
+        option->set_value(value);
+      }
+    }
+    if (command.kind == K::live_mock)
+      tracer::live::snapshot_live_mock(request);
+    const auto print = [&](const api::LiveUpdateStatus &response) {
+      out_ << "live " << api::LiveUpdateStatus::State_Name(response.state())
+           << " revision=" << response.active_revision()
+           << " retained=" << response.retained_generations() << '/' << response.retention_limit();
+      if (!response.diagnostic().empty())
+        out_ << " " << response.diagnostic();
+      out_ << '\n';
+      for (const auto &note : response.notes())
+        out_ << "  " << note << '\n';
+      for (const auto &entry : response.candidates()) {
+        out_ << "  " << api::LiveUpdateStatus::State_Name(entry.state())
+             << ' ' << entry.signature() << " [" << entry.symbol() << "] "
+             << entry.module() << " " << entry.source();
+        if (entry.address())
+          out_ << " address=0x" << std::hex << entry.address() << std::dec;
+        if (!entry.diagnostic().empty())
+          out_ << " " << entry.diagnostic();
+        out_ << '\n';
+      }
+      out_.flush();
+    };
+    const auto perform = [&] {
+      return unary<api::LiveUpdateStatus>(
+          [&](auto &context, auto &response) {
+            Cancellation cancel(context);
+            return stub_->LiveUpdate(&context, request, &response);
+          },
+          settings_.timeout_seconds);
+    };
+    const auto preview_and_apply = [&] {
+      request.clear_preview_revision();
+      request.set_action(api::LiveUpdateRequest::PREVIEW);
+      const auto preview = perform();
+      print(preview);
+      if (preview.state() != api::LiveUpdateStatus::PLANNED || interrupted)
+        return preview.state() == api::LiveUpdateStatus::UNCHANGED;
+      request.set_preview_revision(preview.active_revision());
+      request.set_action(api::LiveUpdateRequest::UPDATE);
+      const auto applied = perform();
+      print(applied);
+      return applied.state() == api::LiveUpdateStatus::APPLIED ||
+             applied.state() == api::LiveUpdateStatus::UNCHANGED;
+    };
+    if (command.kind == K::live_watch) {
+      out_ << "Watching " << watched.size() << " live source files. Press Ctrl-C to stop.\n";
+      out_.flush();
+      std::map<std::string, std::string> pending;
+      while (!interrupted) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        request.clear_sources();
+        std::map<std::string, std::string> saved;
+        try {
+          for (const auto &[path, before] : watched) {
+            auto contents = snapshot(path);
+            if (contents != before)
+              saved.emplace(path, std::move(contents));
+          }
+        } catch (const std::exception &) {
+          // Editors may temporarily remove a path while replacing its contents.
+          continue;
+        }
+        if (saved.empty() || interrupted)
+          continue;
+        for (auto &[path, contents] : saved) {
+          watched.at(path) = contents;
+          pending.insert_or_assign(path, std::move(contents));
+        }
+        for (const auto &[path, contents] : pending) {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(contents);
+        }
+        try {
+          if (preview_and_apply())
+            pending.clear();
+        } catch (const std::exception &) {
+          if (!interrupted)
+            throw;
+        }
+      }
+      out_ << "Live watch stopped.\n";
+      out_.flush();
+    } else if (command.kind == K::live_update) {
+      preview_and_apply();
+    } else {
+      print(perform());
+    }
+    return true;
+  }
   case K::object_start:
   case K::object_prepare:
   case K::object_preview:
@@ -1751,10 +2678,10 @@ bool Controller::execute(const Command &command) {
         api::ObjectWatchPackage package;
         const auto file = std::filesystem::path(command.option("--plan")) / "object-plan.pb";
         std::ifstream input(file, std::ios::binary);
-        if (!input || std::filesystem::file_size(file) > 4 * 1024 * 1024 ||
-            !package.ParseFromIstream(&input) ||
-            package.version() != 1 || !package.has_definition() || !package.has_plan())
+        if (!input || !package.ParseFromIstream(&input) || package.version() != 1 ||
+            !package.has_definition() || !package.has_plan()) {
           throw std::runtime_error("cannot read object watch package: " + file.string());
+        }
         request = package.definition();
         *request.mutable_prepared_bindings() = package.plan();
         if (command.has("--module")) {
@@ -1763,7 +2690,8 @@ bool Controller::execute(const Command &command) {
           else if (!request.code_module().empty())
             request.set_code_module(command.option("--module"));
           else
-            throw std::invalid_argument("--module requires a saved method or shared writer plan");
+            throw std::invalid_argument("--module requires a saved method or shared writer plan; "
+                "prepare a shared writer with %object prepare TYPE --executable APP --module LIB");
         }
         if (command.has("--no-values"))
           request.set_no_values(true);
@@ -1834,9 +2762,22 @@ bool Controller::execute(const Command &command) {
           for (const auto &mapping : command.options.at("--union-case")) {
             const auto split = mapping.find('=');
             if (split == std::string::npos || split == 0 || split + 1 == mapping.size())
-              throw std::invalid_argument("--union-case requires UINT32=MEMBER");
+              throw std::invalid_argument("--union-case requires TAG=MEMBER");
             auto &item = *request.add_union_cases();
-            item.set_tag(unsigned_number(mapping.substr(0, split), "union discriminator", UINT32_MAX));
+            const auto literal = mapping.substr(0, split);
+            if (literal.front() == '-') {
+              std::size_t consumed = 0;
+              const auto negative = std::stoll(literal, &consumed, 10);
+              if (consumed != literal.size())
+                throw std::invalid_argument("invalid signed union discriminator");
+              item.set_tag_bits(static_cast<std::uint64_t>(negative));
+            } else {
+              const auto tag = unsigned_number(literal, "union discriminator");
+              if (tag <= UINT32_MAX)
+                item.set_tag(tag);
+              else
+                item.set_tag_bits(tag);
+            }
             item.set_member(mapping.substr(split + 1));
           }
         }
@@ -2053,7 +2994,11 @@ bool Controller::execute(const Command &command) {
       out_ << " receivers=" << result.admitted_receivers();
     if (result.mode() == api::ObjectWatchRequest::SNAPSHOTS || result.coverage_gaps())
       out_ << " coverage_gaps=" << result.coverage_gaps();
-    if (result.coverage_gaps() || result.unsupported_sites() || result.dropped() ||
+    if (result.runtime_gap_hits())
+      out_ << " runtime_gap_hits=" << result.runtime_gap_hits();
+    if (result.helper_reentries())
+      out_ << " helper_reentries=" << result.helper_reentries();
+    if (result.coverage_gaps() || result.runtime_gap_hits() || result.unsupported_sites() || result.dropped() ||
         result.external_write_order_unknown())
       out_ << " coverage=partial";
     if (!result.capture_limit().empty())
@@ -2093,7 +3038,7 @@ bool Controller::execute(const Command &command) {
         out_ << std::dec << " bytes=" << binding.original().size()
              << " module=" << std::quoted(binding.module())
              << " function=" << std::quoted(binding.function());
-        if (binding.role() == "store" || binding.role().starts_with("inline mutation "))
+        if (binding.role() == "store" || ::tracer::compat::starts_with(binding.role(), "inline mutation "))
           out_ << " original=" << hex(binding.original());
         if (binding.role() == "method")
           out_ << " patch_bytes=" << binding.patch_size() << " original=" << hex(binding.original());
@@ -2126,27 +3071,80 @@ bool Controller::execute(const Command &command) {
     module_command(command);
     return true;
   case K::modules: {
+    if (!command.has("--watch") && !command.has("--elf")) {
+      const auto filter = command.option("--filter");
+      if (!command.has("--details")) {
+        for (const auto &module : modules(filter))
+          out_ << module << '\n';
+      } else {
+        const auto response = module_snapshot(true);
+        out_ << "mapping=" << response.mapping_token() << '\n';
+        for (const auto &entry : response.mappings()) {
+          if (entry.path().find(filter) == std::string::npos)
+            continue;
+          out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+               << entry.end_address() << " offset=0x" << entry.file_offset()
+               << std::dec << " device=" << entry.device() << " inode="
+               << entry.inode() << " build_id="
+               << (entry.build_id().empty() ? "unavailable" : entry.build_id())
+               << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
+        }
+      }
+      return true;
+    }
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
-    request.set_include_mappings(command.has("--details"));
-    const auto response = unary<api::ListModulesResponse>(
-        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); });
-    if (!command.has("--details")) {
-      for (const auto &module : response.modules())
-        out_ << module << '\n';
-    } else {
+    request.set_include_mappings(command.has("--watch"));
+    request.set_elf_path(command.option("--elf"));
+    const auto modules = [&] { return unary<api::ListModulesResponse>(
+        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); }); };
+    const auto response = modules();
+    if (command.has("--watch")) {
+      const auto indexed = [](const api::ListModulesResponse &snapshot) {
+        std::map<std::string, api::ModuleMapping> entries;
+        for (const auto &mapping : snapshot.mappings())
+          entries.emplace(mapping.SerializeAsString(), mapping);
+        return entries;
+      };
       if (response.mapping_token().empty())
-        throw std::runtime_error("server does not support mapped module details");
-      out_ << "mapping=" << response.mapping_token() << '\n';
-      for (const auto &entry : response.mappings()) {
-        out_ << "0x" << std::hex << entry.begin_address() << "-0x"
-             << entry.end_address() << " offset=0x" << entry.file_offset()
-             << std::dec << " device=" << entry.device() << " inode="
-             << entry.inode() << " build_id="
-             << (entry.build_id().empty() ? "unavailable" : entry.build_id())
-             << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
+        throw std::runtime_error("server does not support mapped module snapshots");
+      auto before = indexed(response);
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(command.number("--timeout", 5));
+      const auto limit = command.number("--count", 16);
+      std::uint64_t count = 0;
+      out_ << "module watch ready\n" << std::flush;
+      const auto report = [&](const auto &from, const auto &to, const char *kind) {
+        for (const auto &[key, mapping] : from) {
+          if (count == limit)
+            break;
+          if (to.count(key))
+            continue;
+          out_ << "module " << kind << " address=0x" << std::hex << mapping.begin_address()
+               << std::dec << " " << std::quoted(printable_proc_text(mapping.path())) << '\n'
+               << std::flush;
+          ++count;
+        }
+      };
+      while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+          break;
+        auto after = indexed(modules());
+        report(before, after, "unloaded");
+        report(after, before, "loaded");
+        before = std::move(after);
       }
+      out_ << "module watch complete changes=" << count << '\n';
+    } else {
+      if (response.elf_entries().empty())
+        throw std::runtime_error("server did not return an ELF view");
+      for (const auto &entry : response.elf_entries())
+        out_ << "elf " << api::ModuleElfEntry::Kind_Name(entry.kind())
+             << " address=0x" << std::hex << entry.elf_address() << std::dec
+             << " size=" << entry.size() << ' '
+             << std::quoted(printable_proc_text(entry.name())) << '\n';
     }
     return true;
   }
@@ -2166,6 +3164,169 @@ bool Controller::execute(const Command &command) {
            << ' ' << std::quoted(printable_proc_text(entry.path())) << '\n';
     }
     out_ << "memory mappings=" << response.mappings_size() << '\n';
+    return true;
+  }
+  case K::instructions_start: {
+    require_session(selected_);
+    if (!server_.running())
+      throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+    api::StartInstructionTraceRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_tid(command.number("--tid", 0));
+    request.set_address(address_number(command.option("--address")));
+    request.set_size(command.number("--size", 0));
+    request.set_max_records(command.number("--count", 256));
+    request.set_timeout_seconds(command.number("--timeout", 5));
+    request.set_registers(command.has("--registers"));
+    request.set_discover_calls(command.has("--discover"));
+    request.set_callback_library(command.option("--callback-library"));
+    if (command.has("--memory-address")) {
+      request.set_memory_address(address_number(command.option("--memory-address")));
+      request.set_memory_size(command.number("--memory-size", 0));
+    }
+    const auto result = unary<api::InstructionTrace>(
+        [&](auto &c, auto &r) { return stub_->StartInstructionTrace(&c, request, &r); },
+        settings_.timeout_seconds);
+    out_ << "instructions started tid=" << result.tid() << " address=0x"
+         << std::hex << result.address() << std::dec << " size=" << result.size()
+         << " count-limit=" << request.max_records()
+         << " timeout=" << request.timeout_seconds() << '\n';
+    return true;
+  }
+  case K::page_monitor_start:
+  case K::page_monitor_stop: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("page monitoring requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::page_monitor_start) {
+      api::StartPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_tid(unsigned_number(command.option("--tid"), "monitor TID", INT32_MAX));
+      request.set_address(address_number(command.option("--address")));
+      request.set_size(unsigned_number(command.option("--size"), "monitor size", UINT32_MAX));
+      request.set_timeout_seconds(command.number("--timeout", 5));
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StartPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "page monitor started tid=" << result.tid() << '\n' << std::flush;
+    } else {
+      api::StopPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StopPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      for (const auto &access : result.accesses())
+        out_ << "page " << (access.write() ? "write" : "read") << " address=0x"
+             << std::hex << access.address() << " pc=0x" << access.pc() << std::dec << '\n';
+      out_ << "page monitor stopped count=" << result.accesses_size()
+           << " expired=" << (result.expired() ? "true" : "false") << '\n';
+    }
+    return true;
+  }
+  case K::instructions_replay:
+  case K::instructions_stop: {
+    constexpr std::uint64_t magic = 0x3145434152545443ULL; // CTTRACE1
+    constexpr int max_bytes = INT32_MAX; // Protobuf CodedInputStream uses signed int sizes.
+    api::InstructionRecording recording;
+    if (command.kind == K::instructions_replay) {
+      const int fd = ::open(args.at(0).c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open instruction recording");
+      google::protobuf::io::FileInputStream input(fd);
+      input.SetCloseOnDelete(true);
+      struct stat status {};
+      if (::fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+          static_cast<std::uint64_t>(status.st_size) > max_bytes)
+        throw std::invalid_argument("instruction recording must be a regular file within the Protobuf size range");
+      google::protobuf::io::CodedInputStream bytes(&input);
+      bytes.SetTotalBytesLimit(max_bytes);
+      const auto end = bytes.PushLimit(static_cast<int>(status.st_size));
+      if (!recording.ParseFromCodedStream(&bytes) || !bytes.ConsumedEntireMessage() ||
+          bytes.BytesUntilLimit() != 0)
+        throw std::invalid_argument("invalid instruction recording");
+      bytes.PopLimit(end);
+      if (recording.magic() != magic || recording.version() != 1 || !recording.has_trace())
+        throw std::invalid_argument("unsupported instruction recording format");
+    } else {
+      require_session(selected_);
+      if (!server_.running())
+        throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+      api::StopInstructionTraceRequest request;
+      request.set_session_id(selected_.id);
+      *recording.mutable_trace() = unary<api::InstructionTrace>(
+          [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    const auto &result = recording.trace();
+    if (!result.tid() || !result.address() || !result.size() ||
+        result.size() > TRACER_INSTRUCTION_MAX_BYTES ||
+        result.reason() < api::InstructionTrace::STOPPED || result.reason() > api::InstructionTrace::TIMEOUT ||
+        result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS ||
+        (result.discover_calls() ? result.call_targets_size() != result.pcs_size() || result.details_size()
+                                 : result.call_targets_size() != 0) ||
+        (result.details_size() && result.details_size() != result.pcs_size()))
+      throw std::runtime_error("invalid instruction capture response");
+    for (const auto pc : result.pcs())
+      if (pc < result.address() || pc - result.address() >= result.size())
+        throw std::runtime_error("instruction capture PC outside its range");
+    for (const auto &detail : result.details())
+      if ((detail.registers_size() && detail.registers_size() != TRACER_INSTRUCTION_REGISTER_COUNT) ||
+          (detail.memory_size() && (detail.memory_size() > 8 || detail.memory_access() < 1 ||
+                                    detail.memory_access() > 3)))
+        throw std::runtime_error("invalid instruction capture detail");
+    if (command.has("--save")) {
+      recording.set_magic(magic);
+      recording.set_version(1);
+      const auto path = command.option("--save");
+      if (recording.ByteSizeLong() > max_bytes)
+        throw std::runtime_error("instruction recording exceeds the Protobuf size range");
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "create instruction recording");
+      const bool written = recording.SerializeToFileDescriptor(fd);
+      const bool closed = ::close(fd) == 0;
+      if (!written || !closed) {
+        ::unlink(path.c_str());
+        throw std::runtime_error("could not write instruction recording");
+      }
+    }
+    constexpr const char *registers[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    static_assert(std::size(registers) == TRACER_INSTRUCTION_REGISTER_COUNT);
+    std::map<std::uint64_t, unsigned> targets;
+    for (int i = 0; i < result.pcs_size(); ++i) {
+      if (result.discover_calls()) {
+        const auto target = result.call_targets(i);
+        ++targets[target];
+        out_ << "call pc=0x" << std::hex << result.pcs(i) << " target=0x" << target << std::dec << '\n';
+        continue;
+      }
+      out_ << "instruction pc=0x" << std::hex << result.pcs(i);
+      if (result.details_size()) {
+        const auto &detail = result.details(i);
+        for (int j = 0; j < detail.registers_size(); ++j)
+          out_ << ' ' << registers[j] << "=0x" << detail.registers(j);
+        if (detail.has_callback_value())
+          out_ << " callback=0x" << detail.callback_value();
+        if (detail.memory_size()) {
+          out_ << " memory=0x" << detail.memory_address() << std::dec
+               << " size=" << detail.memory_size() << " access="
+               << (detail.memory_access() == TRACER_INSTRUCTION_MEMORY_READ ? "read" :
+                   detail.memory_access() == TRACER_INSTRUCTION_MEMORY_WRITE ? "write" : "read-write");
+        }
+      }
+      out_ << std::dec << '\n';
+    }
+    for (const auto &[target, count] : targets)
+      out_ << "discovered target=0x" << std::hex << target << std::dec << " calls=" << count << '\n';
+    out_ << "instructions stopped tid=" << result.tid() << " count=" << result.pcs_size()
+         << " reason=" << api::InstructionTrace::Reason_Name(result.reason())
+         << " truncated=" << (result.reason() == api::InstructionTrace::LIMIT ? "true" : "false")
+         << '\n';
     return true;
   }
   case K::memory_read: {
@@ -2188,6 +3349,99 @@ bool Controller::execute(const Command &command) {
       print_memory_scalar(out_, request.address(), response.data(), type);
     else
       print_memory_dump(out_, request.address(), response.data());
+    return true;
+  }
+  case K::library_load:
+  case K::memory_allocate:
+  case K::memory_free: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("target mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::library_load) {
+      api::LoadTargetLibraryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_path(std::filesystem::absolute(args.at(0)).string());
+      const auto result = unary<api::TargetLibrary>(
+          [&](auto &c, auto &r) { return stub_->LoadTargetLibrary(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "library loaded path=" << result.path() << " lifetime=target-process\n";
+      return true;
+    }
+    api::MemoryAllocation result;
+    if (command.kind == K::memory_allocate) {
+      api::AllocateMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_size(unsigned_number(args.at(0), "allocation size", 1048576));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->AllocateMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::FreeMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_allocation_id(unsigned_number(args.at(0), "allocation ID"));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->FreeMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory allocation=" << result.id() << " address=0x" << std::hex
+         << result.address() << std::dec << " size=" << result.size()
+         << " freed=" << (result.freed() ? "true" : "false") << '\n';
+    return true;
+  }
+  case K::memory_write:
+  case K::memory_patch:
+  case K::memory_import_hook:
+  case K::memory_restore: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("memory mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    api::MemoryPatch response;
+    if (command.kind == K::memory_restore) {
+      api::RestoreMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_patch_id(unsigned_number(args.at(0), "patch ID"));
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->RestoreMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::ApplyMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_module(command.option("--module"));
+      if (command.kind == K::memory_import_hook) {
+        auto *hook = request.mutable_import_slot();
+        hook->set_symbol(command.option("--symbol"));
+        hook->set_abi(command.option("--abi"));
+        hook->set_expected_target(address_number(command.option("--original")));
+        hook->set_replacement_target(address_number(command.option("--address")));
+      } else {
+        const auto bytes = [&](const char *option) {
+          auto [value, mask] = parse_memory_pattern(command.option(option));
+          if (mask.find_first_not_of(static_cast<char>(0xff)) != std::string::npos)
+            throw std::invalid_argument("memory patch bytes cannot use wildcards or masks");
+          return value;
+        };
+        if (command.kind == K::memory_write) {
+          auto *patch = request.mutable_writable();
+          patch->set_address(address_number(args.at(0)));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        } else {
+          auto *patch = request.mutable_executable();
+          patch->set_elf_address(address_number(command.option("--elf-address")));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        }
+      }
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->ApplyMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory patch=" << response.id() << " address=0x" << std::hex << response.address()
+         << std::dec << " size=" << response.size()
+         << " restored=" << (response.restored() ? "true" : "false") << '\n';
     return true;
   }
   case K::memory_scan: {
@@ -2340,7 +3594,12 @@ public:
   }
   case K::validate:
   case K::draft_validate: {
-    require_session(selected_);
+    require_idle_target(selected_);
+    const bool override_arguments = command.has("--allow-arg-overrides");
+    const bool override_result = command.has("--allow-result-override");
+    const bool replacement = command.has("--allow-replacement");
+    const bool call_original = command.has("--allow-call-original");
+    require_session(selected_, override_arguments || override_result || replacement || call_original);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
@@ -2348,6 +3607,12 @@ public:
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_selector(selector);
+    request.set_allow_argument_overrides(override_arguments);
+    request.set_allow_result_override(override_result);
+    request.set_allow_replacement(replacement);
+    request.set_allow_call_original(call_original);
+    request.set_trace_exceptions(command.has("--trace-exceptions"));
+    request.set_reclaimable(command.has("--reclaimable"));
     const auto callback = probe_path(command, command.option("--callback"));
     request.set_callback_source(named ? drafts_.at(args.at(0)) : read_source(callback));
     *request.mutable_include_headers() = resolution.include_headers();
@@ -2383,29 +3648,103 @@ public:
       throw std::runtime_error("server and agent do not support extra compiler arguments");
     return true;
   }
+  case K::agent_plugin_load:
+  case K::agent_plugin_reload:
+  case K::agent_plugin_run: {
+    require_session(selected_);
+    using Request = api::AgentPluginRequest;
+    const bool run = command.kind == K::agent_plugin_run;
+    const bool load = command.kind == K::agent_plugin_load;
+    const auto id = load ? command.option("--as") : args.at(0);
+    Request request;
+    request.set_session_id(selected_.id);
+    request.set_plugin_id(id);
+    request.set_operation(run ? Request::RUN : load ? Request::LOAD : Request::RELOAD);
+    if (run)
+      request.set_command(args.at(1));
+    else {
+      const auto path_index = load ? 0u : 1u;
+      const bool has_path = path_index < args.size();
+      const auto path = has_path ? args[path_index] : std::string{};
+      if (has_path && path.empty())
+        throw std::invalid_argument("agent plugin source path is empty");
+      if (prepare_agent)
+        prepare_agent(request, path);
+      else if (has_path)
+        request.set_source(read_source(path));
+      else
+        throw std::invalid_argument("agent plugin reload requires FILE or an installed package");
+    }
+    agent_plugin(request);
+    return true;
+  }
   case K::probe_reload: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::ReloadProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
-    request.set_callback_source(read_source(probe_path(command, command.option("--callback"))));
-    const auto response = unary<api::ReloadProbeResponse>(
+    const auto reload = [&](const std::string &source) {
+      request.set_callback_source(source);
+      const auto response = unary<api::ReloadProbeResponse>(
         [&](auto &c, auto &r) {
           Cancellation cancellation(c);
           return stub_->ReloadProbe(&c, request, &r);
         },
         settings_.timeout_seconds);
-    out_ << "reloaded probe=" << response.probe().id()
-         << " replaces=" << response.probe().replaces_probe_id()
-         << " retained_limit=" << response.retained_limit();
-    if (response.has_agent_retained())
-      out_ << " agent_retained=" << response.agent_retained();
-    else
-      out_ << " agent_retained=unknown";
-    out_ << '\n';
+      out_ << "reloaded probe=" << response.probe().id()
+           << " replaces=" << response.probe().replaces_probe_id()
+           << " retained_limit=" << (response.retained_limit()
+                                        ? std::to_string(response.retained_limit())
+                                        : "unlimited");
+      if (response.has_agent_retained())
+        out_ << " agent_retained=" << response.agent_retained();
+      else
+        out_ << " agent_retained=unknown";
+      out_ << '\n' << std::flush;
+      request.set_probe_id(response.probe().id());
+    };
+    const auto path = probe_path(command, command.option("--callback"));
+    if (!command.has("--watch")) {
+      reload(read_source(path));
+      return true;
+    }
+    auto previous = read_source(path);
+    auto candidate = previous;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(command.number("--timeout", 15));
+    const auto limit = command.number("--count", 16);
+    std::uint64_t count = 0;
+    out_ << "probe watch ready probe=" << request.probe_id() << '\n' << std::flush;
+    while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+        break;
+      try {
+        auto source = read_source(path);
+        if (source != candidate) {
+          candidate = std::move(source);
+          continue;
+        }
+      } catch (const std::exception &) {
+        candidate = previous;
+        continue; // An editor may briefly remove the file during a save.
+      }
+      if (candidate == previous)
+        continue;
+      previous = candidate;
+      try {
+        reload(candidate);
+      } catch (const std::exception &error) {
+        out_ << "probe watch rejected: " << error.what() << '\n' << std::flush;
+      }
+      ++count;
+    }
+    out_ << "probe watch complete changes=" << count << " probe=" << request.probe_id() << '\n';
     return true;
   }
   case K::remove: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::RemoveProbeRequest request;
     request.set_session_id(selected_.id);
@@ -2414,7 +3753,8 @@ public:
         [&](auto &c, auto &r) { return stub_->RemoveProbe(&c, request, &r); },
         settings_.timeout_seconds);
     out_ << "removed probe=" << response.id() << " restored="
-         << (response.original_bytes_restored() ? "true" : "false") << '\n';
+         << (response.original_bytes_restored() ? "true" : "false")
+         << (response.reclaimed() ? " reclaimed=true" : "") << '\n';
     if (!response.original_bytes_restored() && !response.superseded_by_probe_id()) {
       throw std::runtime_error("probe restoration incomplete");
     }
@@ -2492,7 +3832,16 @@ public:
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    auto loaded = read_recording(args.at(0), {});
+    EventQuery query;
+    const auto callback_errors = command.option("--callback-errors", "include");
+    if (callback_errors == "exclude")
+      query.callback_errors = CallbackErrorFilter::exclude;
+    else if (callback_errors == "only")
+      query.callback_errors = CallbackErrorFilter::only;
+    else if (callback_errors != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+    auto loaded = read_recording(args.at(0), query);
     out_ << "opened events=" << loaded.received
          << " retained=" << loaded.events().size()
          << " evicted=" << loaded.evicted << '\n';
@@ -2516,6 +3865,13 @@ public:
   case K::cpp_import:
   case K::cpp_options:
   case K::cpp_generate:
+  case K::plugin_load:
+  case K::plugin_enable:
+  case K::plugin_disable:
+  case K::plugin_reload:
+  case K::plugin_list:
+  case K::plugin_run:
+  case K::plugin_commands:
   case K::shell:
   case K::complete:
   case K::type:
@@ -2528,6 +3884,16 @@ public:
 void Controller::shutdown() {
   stop_background();
   std::string failures;
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    try {
+      it->second.process->terminate();
+      pending_attaches_.erase(it->first);
+      it = owned_targets_.erase(it);
+    } catch (const std::exception &e) {
+      failures += "pid=" + std::to_string(it->first) + ": " + e.what() + "\n";
+      ++it;
+    }
+  }
   for (const auto &id : std::vector<std::string>(owned_sessions_.begin(),
                                                  owned_sessions_.end())) {
     try {
@@ -2562,6 +3928,14 @@ const SessionHandle &Facade::selected_session() const {
 
 SessionHandle Facade::attach(std::uint32_t pid) {
   return controller_->attach(pid);
+}
+
+ModuleList Facade::modules(const std::string &filter) {
+  return controller_->modules(filter);
+}
+
+ModuleInfo Facade::module_info(const std::string &name) {
+  return controller_->module_info(name);
 }
 
 ::tracer_module::ModuleIndex Facade::module_index(const ::tracer_module::ModuleSource &source,

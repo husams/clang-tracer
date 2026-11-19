@@ -32,7 +32,7 @@ namespace tracer_repl {
 namespace api = clangtracer::v1;
 
 namespace {
-constexpr std::uint32_t max_frame = 32 * 1024 * 1024;
+constexpr std::uint32_t max_frame = INT32_MAX; // Protobuf ParseFromArray takes int.
 
 void write_all(int fd, const void *data, std::size_t size) {
   auto *next = static_cast<const char *>(data);
@@ -224,6 +224,27 @@ std::string Event::function_name() const {
   return data_->message.function_name();
 }
 
+std::vector<StackFrame> Event::stack() const {
+  const auto &captured = data_->message.stack().frames();
+  std::vector<StackFrame> frames;
+  frames.reserve(captured.size());
+  for (const auto &frame : captured) {
+    frames.push_back({frame.pc(), frame.stack_pointer(),
+                      api::StackFrame::Kind_Name(frame.kind()), frame.module(),
+                      frame.module_offset(), frame.function(), frame.file(),
+                      frame.line(), frame.application_frame()});
+  }
+  return frames;
+}
+
+bool Event::callback_error() const {
+  return data_->message.callback_error();
+}
+
+std::string Event::callback_error_message() const {
+  return data_->message.callback_error_message();
+}
+
 bool Event::has_result() const {
   const auto &event = data_->message;
   return (event.has_context() && event.context().event().has_result()) ||
@@ -393,6 +414,19 @@ std::string value_text(const api::Value &value) {
   return scalar_text(value, value.type());
 }
 
+bool callback_error_matches(const api::TraceEvent &event,
+                            CallbackErrorFilter filter) {
+  switch (filter) {
+  case CallbackErrorFilter::include:
+    return true;
+  case CallbackErrorFilter::exclude:
+    return !event.callback_error();
+  case CallbackErrorFilter::only:
+    return event.callback_error();
+  }
+  return false;
+}
+
 std::string event_summary(const api::TraceEvent &event) {
   std::ostringstream out;
   if (event.has_object_observation()) {
@@ -449,7 +483,7 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " \"" << google::protobuf::CEscape(object.old_string()) << "\" ->";
     if (object.has_new_string())
       out << " \"" << google::protobuf::CEscape(object.new_string()) << '"';
-    const auto union_sample = [&](std::uint32_t tag, const std::string &member,
+    const auto union_sample = [&](std::uint64_t tag, const std::string &member,
                                   const api::ObjectObservation::SnapshotValue &value) {
       out << " tag=" << tag;
       if (member.empty())
@@ -462,11 +496,16 @@ std::string event_summary(const api::TraceEvent &event) {
       else if (value.has_real_value())
         out << value.real_value();
     };
-    if (object.has_old_union_tag()) {
+    if (object.has_storage_write() && object.storage_write().has_before_discriminator()) {
+      union_sample(object.storage_write().before_discriminator(), object.old_union_member(), object.snapshot_before());
+      out << " ->";
+    } else if (object.has_old_union_tag()) {
       union_sample(object.old_union_tag(), object.old_union_member(), object.snapshot_before());
       out << " ->";
     }
-    if (object.has_new_union_tag())
+    if (object.has_storage_write() && object.storage_write().has_after_discriminator())
+      union_sample(object.storage_write().after_discriminator(), object.new_union_member(), object.snapshot_after());
+    else if (object.has_new_union_tag())
       union_sample(object.new_union_tag(), object.new_union_member(), object.snapshot_after());
     const auto raw_bytes = [&](const std::string &bytes) {
       std::ostringstream encoded;
@@ -490,6 +529,14 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " " << object.file() << ":" << object.line();
     if (!object.diagnostic().empty())
       out << " | " << object.diagnostic();
+    return out.str();
+  }
+  if (event.has_agent_latency()) {
+    out << "cursor=" << event.sequence() << " probe=" << event.probe_id()
+        << " phase=AGENT_OBSERVER call=" << event.call_id()
+        << " plugin=" << event.agent_latency().plugin_id()
+        << " elapsed_ns=" << event.agent_latency().elapsed_ns()
+        << " function=" << event.function_name();
     return out.str();
   }
   out << "cursor=" << event.sequence() << " session=" << event.session_id()
@@ -531,6 +578,12 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " result=" << value_text(event.result());
     }
   }
+  if (event.callback_error()) {
+    out << " callback_error=true";
+    if (!event.callback_error_message().empty())
+      out << " callback_error_message="
+          << std::quoted(event.callback_error_message());
+  }
   out << " lost(agent=" << event.agent_dropped_events()
       << ",server=" << event.server_dropped_events() << ')';
   return out.str();
@@ -564,6 +617,7 @@ void EventBuffer::push(const api::TraceEvent &event) {
   }
   bytes_ += size;
   events_.push_back(std::move(item));
+  ++appended;
 }
 
 Collection EventBuffer::snapshot() const {
@@ -607,11 +661,12 @@ struct CallPair {
 };
 
 struct CallCounts {
-  std::size_t paired = 0, missing_pre = 0, missing_post = 0, timed = 0;
+  std::size_t paired = 0, missing_pre = 0, missing_post = 0, timed = 0, exceptional = 0;
   std::size_t ambiguous = 0;
 
   void add(const CallPair &pair, bool has_duration) {
     paired += pair.pre && pair.post;
+    exceptional += pair.post && pair.post->phase() == api::EXCEPTION;
     missing_pre += !pair.pre;
     missing_post += !pair.post;
     timed += has_duration;
@@ -776,7 +831,7 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
   std::map<CallKey, CallPair> pairs;
   std::map<ProbeKey, std::uint64_t> agent_losses;
   std::map<std::string_view, std::uint64_t> server_losses;
-  std::uint64_t pre = 0, post = 0, other = 0, unidentified = 0;
+  std::uint64_t pre = 0, post = 0, exceptions = 0, other = 0, unidentified = 0;
   for (const auto &item : buffer.events()) {
     const auto &e = item->message;
     const ProbeKey probe{e.server_instance_id(), e.session_id(), e.probe_id()};
@@ -786,8 +841,10 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
     server_loss = std::max(server_loss, e.server_dropped_events());
     pre += e.phase() == api::PRE;
     post += e.phase() == api::POST;
-    other += e.phase() != api::PRE && e.phase() != api::POST;
-    if (e.has_context() || (e.phase() != api::PRE && e.phase() != api::POST))
+    exceptions += e.phase() == api::EXCEPTION;
+    const bool paired_phase = e.phase() == api::PRE || e.phase() == api::POST || e.phase() == api::EXCEPTION;
+    other += !paired_phase;
+    if (e.has_context() || !paired_phase)
       continue;
     if (e.session_id().empty() || !e.probe_id() || !e.tid() || !e.call_id()) {
       ++unidentified;
@@ -815,7 +872,8 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
           << " probe=" << e->probe_id()
           << " tid=" << e->tid() << " call=" << e->call_id()
           << " PRE=" << (pair.pre ? "present" : "missing")
-          << " POST=" << (pair.post ? "present" : "missing");
+          << (pair.post && pair.post->phase() == api::EXCEPTION
+                  ? " EXCEPTION=present" : pair.post ? " POST=present" : " POST=missing");
       if (duration)
         out << " duration_ns=" << *duration;
       if (pair.ambiguous)
@@ -847,12 +905,13 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
   out << "received=" << buffer.received
       << " retained=" << buffer.events().size() << " bytes=" << buffer.bytes()
       << " evicted=" << buffer.evicted << " PRE=" << pre << " POST=" << post
-      << " other_phases=" << other << " paired=" << counts.paired
+      << " EXCEPTION=" << exceptions << " other_phases=" << other << " paired=" << counts.paired
       << " incomplete=" << counts.incomplete()
       << " lost(agent=" << sum_losses(agent_losses)
       << ",server=" << sum_losses(server_losses) << ')'
       << " calls=" << counts.paired + counts.incomplete()
-      << " timed=" << counts.timed << " missing_pre=" << counts.missing_pre
+      << " timed=" << counts.timed << " exceptional=" << counts.exceptional
+      << " missing_pre=" << counts.missing_pre
       << " missing_post=" << counts.missing_post
       << " untimed_pairs=" << counts.paired - counts.timed
       << " ambiguous=" << counts.ambiguous
@@ -1016,6 +1075,8 @@ void read_sqlite_recording(const std::string &path, const EventQuery &query,
     if (size <= 0 || size > static_cast<int>(max_frame) ||
         !event.ParseFromArray(sqlite3_column_blob(rows.get(), 0), size))
       throw std::runtime_error("invalid event payload in SQLite recording: " + path);
+    if (!callback_error_matches(event, query.callback_errors))
+      continue;
     buffer.push(event);
   }
   read_recorded_types(db.get(), buffer);
@@ -1024,6 +1085,10 @@ void read_sqlite_recording(const std::string &path, const EventQuery &query,
 
 EventBuffer open_recording(const std::string &path, std::size_t max_events,
                            std::size_t max_bytes, const EventQuery &query) {
+  if (query.callback_errors != CallbackErrorFilter::include &&
+      query.callback_errors != CallbackErrorFilter::exclude &&
+      query.callback_errors != CallbackErrorFilter::only)
+    throw std::invalid_argument("invalid callback error filter");
   api::TracePhase phase = api::TRACE_PHASE_UNSPECIFIED;
   if (!query.phase.empty() && !api::TracePhase_Parse(query.phase, &phase))
     throw std::invalid_argument("unknown event phase: " + query.phase);
@@ -1081,7 +1146,7 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
         (!query.names.empty() &&
          std::none_of(query.names.begin(), query.names.end(), [&](const auto &name) {
            return name == event.function_name() || name == event.context().event().name();
-         })))
+         })) || !callback_error_matches(event, query.callback_errors))
       continue;
     buffer.push(event);
   }
@@ -1093,14 +1158,41 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
 }
 
 void export_json(const EventBuffer &buffer, const std::string &path) {
+  // Lifecycle samples and method events arrive on different transports. Both
+  // use the target's monotonic clock. Keep the original sequence as a cursor,
+  // and order each registration's exported subsequence by observation time.
+  using Registration = std::pair<std::string, std::uint64_t>;
+  const auto registration_of = [](const api::TraceEvent &event) -> Registration {
+    return {event.session_id(), event.object_probe_registration_id()};
+  };
+  const auto orderable = [](const api::TraceEvent &event) {
+    return event.object_probe_registration_id() && event.monotonic_time_ns();
+  };
+  std::map<Registration, std::vector<const api::TraceEvent *>> registrations;
+  for (const auto &event : buffer.events())
+    if (orderable(event->message))
+      registrations[registration_of(event->message)].push_back(&event->message);
+  for (auto &registration : registrations) {
+    auto &events = registration.second;
+    std::stable_sort(events.begin(), events.end(), [](const auto *a, const auto *b) {
+      return a->monotonic_time_ns() < b->monotonic_time_ns();
+    });
+    std::reverse(events.begin(), events.end());
+  }
+
   const int fd = create_recording(path);
   try {
     write_all(fd, "[\n", 2);
     bool first = true;
     for (const auto &event : buffer.events()) {
+      const auto *message = &event->message;
+      if (orderable(*message)) {
+        auto &events = registrations.at(registration_of(*message));
+        message = events.back();
+        events.pop_back();
+      }
       std::string json;
-      const auto status =
-          google::protobuf::util::MessageToJsonString(event->message, &json);
+      const auto status = google::protobuf::util::MessageToJsonString(*message, &json);
       if (!status.ok()) {
         throw std::runtime_error("cannot encode event as JSON");
       }

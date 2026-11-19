@@ -1,4 +1,7 @@
+#include "tracer/compat.hpp"
 #include "object_code_cache_protocol.hpp"
+#include "object_code_cache_identity.hpp"
+#include "mapped_elf.hpp"
 
 #include "object_code_cache_decode.hpp"
 #if defined(__aarch64__)
@@ -12,7 +15,6 @@
 #include <llvm/Support/SHA256.h>
 
 #include <algorithm>
-#include <bit>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -24,8 +26,10 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <span>
+#include <set>
+#include <shared_mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -39,6 +43,7 @@
 #endif
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <link.h>
 #include <linux/futex.h>
 #include <signal.h>
@@ -160,7 +165,7 @@ struct Site {
   Address gate = 0;
   Address after_label = 0;
   std::uint32_t runtime_module = 0;
-  std::span<const Site> runtime_sites{};
+  ::tracer::compat::span<const Site> runtime_sites{};
   bool runtime_prefix = false, native_scope = false;
   bool before_hook = false;
   bool reclaimable = false;
@@ -172,12 +177,14 @@ struct Site {
 #endif
   GateWindow entry_gate{};
   std::vector<ExitWindow> exit_gates{};
+  mutable std::uint32_t dispatch_gap_mask = 0;
 };
 
 struct Lifetime {
   std::uint64_t id = 0, generation = 0;
   Address owner = 0;
   std::optional<std::int32_t> last_ordered_value = std::nullopt;
+  object_watch::UnionActivation union_activation;
 };
 
 struct Mapping {
@@ -208,22 +215,34 @@ struct RuntimeBlock {
 
 struct RuntimeLocation {
   Address bias = 0, end = 0, offset = 0;
-  dev_t device = 0;
-  ino_t inode = 0;
   std::uint64_t unload_generation = 0;
   bool main_image = false;
   Lmid_t name_space = LM_ID_BASE;
   std::string path;
 };
 
-using RuntimeImageKey = std::tuple<dev_t, ino_t, Address, std::uint64_t>;
+using RuntimeImageKey = std::tuple<std::string, Address, std::uint64_t>;
 
 struct RuntimeImage {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
   std::uint32_t module_index = 0;
 
+  struct FunctionImage {
+    std::string bytes;
+    Address file_offset = 0;
+    bool weak = false;
+  };
+
+  struct PltStub {
+    Address got_address = 0;
+    Address lazy_target = 0;
+    Address file_offset = 0;
+    std::string bytes;
+  };
+
   explicit RuntimeImage(const RuntimeLocation &location);
-  std::pair<std::string, Address> function(Address elf_address) const;
+  FunctionImage function(Address elf_address) const;
+  std::optional<PltStub> plt_stub(Address elf_address) const;
 };
 
 struct State {
@@ -269,14 +288,28 @@ struct State {
   bool recycler_started = false;
   std::atomic<std::uint64_t> runtime_inflight{0};
   std::map<RuntimeImageKey, RuntimeImage> runtime_images;
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
-  std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
+  std::map<std::tuple<std::string, Address, Address>, RuntimeBlock *> runtime_scopes;
+  struct RuntimeRejection {
+    DispatchGap reason = DispatchGap::translation_failed;
+    bool plt_only = false;
+  };
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeRejection> runtime_rejections;
+  // Bound per-slot lazy-binding rows by runtime_limit; occurrence totals live in Channel.
+  std::set<std::tuple<RuntimeImageKey, Address, Address>> runtime_lazy_slots;
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
   State *previous = nullptr;
   std::mutex mutex;
+  // Keep typed identity reads independent from collection and event work.
+  std::shared_mutex identity_mutex;
   std::map<Address, Lifetime> lifetimes;
   struct AddressHistory {
     std::uint64_t generation = 0;
+    bool observed = false;
+    bool uncertain_live = false;
+    bool provisional_live = false;
+    ProvisionalReason provisional_reason = ProvisionalReason::none;
     std::atomic<std::uint64_t> write_window{0};
   };
   // Retain address generations and stable write-window storage for in-flight stores.
@@ -284,12 +317,19 @@ struct State {
   std::map<Address, pid_t> active_collections;
   std::uint64_t next_id = 0;
   std::uint64_t next_borrow = 0;
+  std::uint64_t identity_watch_id = 0;
+  bool provisional_method_watch = false;
+  bool identity_lifecycle_covered = false;
 
-  // Call with mutex held and no current lifetime at this address.
+  // Call with mutex and identity_mutex held and no current lifetime here.
   Lifetime *admit_lifetime(Address object) {
     if (max_instances && lifetimes.size() >= max_instances)
       return nullptr;
     auto &history = generations[object];
+    history.observed = true;
+    history.uncertain_live = false;
+    history.provisional_live = false;
+    history.provisional_reason = ProvisionalReason::none;
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
       entry->second = {++next_id, ++history.generation};
@@ -311,7 +351,38 @@ Address tail_body(const State &watch, Address entry) noexcept {
 
 std::atomic<State *> retained{nullptr};
 std::mutex install_mutex;
+std::atomic<pid_t *> identity_pid_cache{nullptr};
+void prepare_identity_pid_cache() noexcept {
+#if defined(MADV_WIPEONFORK)
+  if (identity_pid_cache.load(std::memory_order_relaxed))
+    return;
+  const auto page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  auto *page = static_cast<pid_t *>(::mmap(nullptr, static_cast<std::size_t>(page_size),
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (page == MAP_FAILED)
+    return;
+  if (::madvise(page, static_cast<std::size_t>(page_size), MADV_WIPEONFORK)) {
+    ::munmap(page, static_cast<std::size_t>(page_size));
+    return;
+  }
+  identity_pid_cache.store(page, std::memory_order_release);
+#endif
+}
+pid_t identity_lookup_pid() noexcept {
+  auto *cache = identity_pid_cache.load(std::memory_order_acquire);
+  if (!cache)
+    return ::getpid();
+  auto pid = __atomic_load_n(cache, __ATOMIC_RELAXED);
+  if (!pid) {
+    pid = ::getpid();
+    __atomic_store_n(cache, pid, __ATOMIC_RELAXED);
+  }
+  return pid;
+}
 struct sigaction previous_actions[NSIG]{};
+std::array<std::atomic_flag, NSIG> previous_delivered{};
 std::array<bool, NSIG> bridge_installed{};
 
 void finish_runtime_prefix(State &watch) noexcept {
@@ -375,6 +446,9 @@ void reclaim_code(State *watch) noexcept {
         watch->runtime_targets.clear();
         watch->runtime_scopes.clear();
         watch->runtime_images.clear();
+        watch->runtime_plt_stubs.clear();
+        watch->runtime_rejections.clear();
+        watch->runtime_lazy_slots.clear();
         channel.runtime_reclaimed.store(reclaimed, std::memory_order_release);
         runtime_done = true;
       }
@@ -392,6 +466,27 @@ void reclaim_code(State *watch) noexcept {
   }
 }
 
+void start_recycler(State &watch) {
+  // Legacy glibc may load libpthread after libstdc++'s weak reference to
+  // pthread_create was bound. A direct dependency resolves the active entry.
+  pthread_attr_t attributes;
+  int error = ::pthread_attr_init(&attributes);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "initialize recycler attributes");
+  error = ::pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+  if (!error) {
+    pthread_t thread;
+    error = ::pthread_create(&thread, &attributes, +[](void *state) -> void * {
+      reclaim_code(static_cast<State *>(state));
+      return nullptr;
+    }, &watch);
+  }
+  ::pthread_attr_destroy(&attributes);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "start code-cache recycler");
+  watch.recycler_started = true;
+}
+
 bool enter_static_code(State &watch) noexcept {
   auto value = watch.static_gate.load(std::memory_order_acquire);
   while (value & enabled)
@@ -404,11 +499,14 @@ struct Sample {
   const Site *site = nullptr;
   Address stack = 0, destination = 0;
   Lifetime life{};
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   std::uint32_t input = 0, expected = 0;
   std::uint64_t old = 0;
   bool has_old = false;
   object_watch::ValueWrite storage_write;
   object_watch::ValueStoreBytes storage_before{};
+  Address storage_field = 0, storage_receiver = 0;
+  object_watch::UnionWriteState union_before;
   Address collection_owner = 0;
   std::uint64_t storage_generation = 0;
   std::optional<std::uint32_t> old_tag = std::nullopt;
@@ -449,6 +547,7 @@ struct CollectionScope {
   std::optional<object_watch::LogicalRangeSample> prior_logical;
   bool destroyed = false;
   bool value_partial = false;
+  object_watch::UnionActivation union_activation;
   Address writer_return = 0;
 };
 thread_local CollectionScope collection_scope;
@@ -579,8 +678,13 @@ bool supported_store(const State &watch, const native_entry::ScalarStore &store)
 
 std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFileIdentity &file,
                                                         Address destination) noexcept {
-  // All numeric fields and permissions fit in this prefix. Paths can span reads.
-  std::array<char, 160> prefix;
+  std::array<char, 4096> pinned_path;
+  const auto path_size = ::readlink(file.reference.data(), pinned_path.data(), pinned_path.size());
+  if (path_size <= 0 || static_cast<std::size_t>(path_size) == pinned_path.size())
+    return std::nullopt;
+  const std::string_view selected(pinned_path.data(), path_size);
+  // Keep the pathname as well as the numeric fields, including across reads.
+  std::array<char, 4096 + 160> prefix;
   std::size_t used = 0;
   std::array<char, 4096> buffer;
   for (;;) {
@@ -624,8 +728,11 @@ std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFi
       unsigned major_id = 0, minor_id = 0;
       if (!number(offset, 16, ' ') || !number(major_id, 16, ':') ||
           !number(minor_id, 16, ' ') || !number(inode, 10, ' ') ||
-          inode != file.inode || makedev(major_id, minor_id) != file.device ||
           destination - begin > UINT64_MAX - offset)
+        return std::nullopt;
+      while (cursor != limit && *cursor == ' ')
+        ++cursor;
+      if (std::string_view(cursor, limit - cursor) != selected)
         return std::nullopt;
       return offset + (destination - begin);
     }
@@ -652,15 +759,23 @@ std::optional<std::uint64_t> shared_file_offset(const State &watch, Address dest
   } close_maps{fd};
   static thread_local bool query_unavailable = false;
   if (!query_unavailable) {
+    std::array<char, 4096> name{}, pinned_path{};
+    const auto path_size = ::readlink(watch.shared_file.reference.data(), pinned_path.data(), pinned_path.size());
+    if (path_size <= 0 || static_cast<std::size_t>(path_size) == pinned_path.size())
+      return std::nullopt;
     MappingQuery query{};
+    query.name_size = name.size();
+    query.name_address = reinterpret_cast<std::uintptr_t>(name.data());
     query.size = sizeof(query);
     query.flags = required | 0x20; // file-backed VMA
     query.address = destination;
     if (::ioctl(fd, query_mapping, &query) == 0) {
       if (query.begin <= destination && destination < query.end &&
           query.end - destination >= sizeof(std::int32_t) &&
-          query.inode == watch.shared_file.inode &&
-          makedev(query.device_major, query.device_minor) == watch.shared_file.device &&
+          query.name_size > 0 && query.name_size <= name.size() &&
+          name[query.name_size - 1] == '\0' &&
+          std::string_view(name.data(), query.name_size - 1) ==
+              std::string_view(pinned_path.data(), path_size) &&
           destination - query.begin <= UINT64_MAX - query.offset)
         return query.offset + (destination - query.begin);
       return std::nullopt;
@@ -730,8 +845,8 @@ void stack(State &watch, Observation &event, const Registers &regs,
   if (watch.cfi_stack) {
     const auto original = before_store ? *before_store : application_registers(regs, event.pc, stack_adjust);
     const auto depth = std::min<std::size_t>(watch.stack_depth, stack_limit);
-    const auto capture = capture_native_code_stack(original, std::span(event.frames).first(depth),
-                                                    std::span(event.stack_pointers).first(depth));
+    const auto capture = capture_native_code_stack(original, ::tracer::compat::span(event.frames).first(depth),
+                                                    ::tracer::compat::span(event.stack_pointers).first(depth));
     event.depth = capture.count;
     event.stack_status = static_cast<std::uint8_t>(capture.status);
     return;
@@ -760,6 +875,15 @@ void stack(State &watch, Observation &event, const Registers &regs,
 
 void emit(State &watch, Observation &event) noexcept {
   auto &channel = *watch.channel;
+  // A type-wide registration stages its lifecycle redirects before method
+  // probes are ready. Keep target-side identity accounting active, but never
+  // reserve an event slot that could be published after group activation.
+  // Ordinary ObjectWatch instances have no identity_watch_id and keep their
+  // existing event behavior.
+  if (watch.identity_watch_id &&
+      (!channel.registration_active.load(std::memory_order_acquire) ||
+       !(watch.static_gate.load(std::memory_order_acquire) & enabled)))
+    return;
   if (capture_exhausted(channel))
     return;
   auto position = channel.tail.load(std::memory_order_relaxed);
@@ -825,7 +949,7 @@ bool collection_header(State &watch, const CollectionScope &scope,
   const auto &plan = watch.collection;
   if (plan.pointer_hops)
     return object_watch::read_pointee_chain(scope.owner,
-        std::span(plan.pointer_offsets).first(plan.pointer_hops), header, read_self<Address>);
+        ::tracer::compat::span(plan.pointer_offsets).first(plan.pointer_hops), header, read_self<Address>);
   if (plan.is_map) {
     header[2] = scope.owner + plan.map.header;
     return read_self(scope.owner + plan.map.root, header[0]) &&
@@ -943,6 +1067,7 @@ void bind_collection(State &watch, const Site &site, const Registers &regs,
   scope.header = header;
   scope.destination = destination;
   scope.valid = true;
+  scope.union_activation = {};
   std::uint64_t next = 0;
   const bool capture = !watch.no_values && !watch.value_write.active();
   const bool sampled = capture && read_field(watch, destination, next);
@@ -1023,7 +1148,7 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       scope.mutation_stack = regs.value(rsp);
     } else {
       Address return_pc;
-      if (!application_return(regs, return_pc) || !std::ranges::any_of(watch.sites, [&](const auto &successor) {
+      if (!application_return(regs, return_pc) || !std::any_of(std::begin(watch.sites), std::end(watch.sites), [&](const auto &successor) {
             return successor.instruction.collection_resume &&
                    successor.instruction.boundary_pc == instruction.boundary_pc &&
                    successor.instruction.continuation_pc() == return_pc;
@@ -1131,7 +1256,8 @@ std::optional<bool> contains(const State &watch, Address owner, Address object) 
 
 void emit_boundary(State &watch, const Site &site, Address object, const Lifetime &life,
                    Hook hook, std::uint64_t borrow_id = 0, std::uint32_t owner_index_plus_one = 0,
-                   bool transfer = false) noexcept {
+                   bool transfer = false,
+                   ProvisionalReason provisional_reason = ProvisionalReason::none) noexcept {
   Observation event{};
   event.owner = life.owner;
   event.object = object;
@@ -1141,15 +1267,16 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
   event.borrow_id = borrow_id;
   event.owner_index_plus_one = owner_index_plus_one;
   event.hook = hook;
+  event.provisional_reason = provisional_reason;
   event.gap = transfer;
-  if (watch.shared_file.inode && object <= UINT64_MAX - watch.offset) {
+  if (watch.shared_file.active() && object <= UINT64_MAX - watch.offset) {
     if (const auto offset = shared_file_offset(watch, object + watch.offset)) {
       event.has_shared_file_offset = true;
       event.shared_file_offset = *offset;
     }
   }
-  if (hook == Hook::create && !watch.no_values && !watch.shared_file.inode &&
-      read_field(watch, object + watch.offset, event.new_value)) {
+  if (hook == Hook::create && !watch.no_values && !watch.value_write.active() &&
+      !watch.shared_file.active() && read_field(watch, object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, object)) {
       event.new_tag = *tag;
@@ -1176,6 +1303,7 @@ void observe_owner(State &watch, const Site &site, const Registers &regs) {
 
 void retire_owned(State &watch, const Site &site, Address object) {
   const std::lock_guard lock(watch.mutex);
+  const std::unique_lock identity_lock(watch.identity_mutex);
   const auto found = watch.lifetimes.find(object);
   if (found == watch.lifetimes.end() || !found->second.id)
     return; // A deleting destructor may enter the complete destructor next.
@@ -1368,8 +1496,19 @@ void ownership_boundary(State &watch, const Site &site, const Registers &regs) {
 }
 
 void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) {
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
   const auto object = regs.value(rdi);
-  if (kind == Hook::create && watch.shared_file.inode &&
+  const bool identity_type_matches = !watch.identity_watch_id ||
+      !watch.receiver_typeinfo ||
+      ((kind == Hook::create || kind == Hook::destroy_begin) &&
+       matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset));
+  if (watch.identity_watch_id &&
+      (kind == Hook::create || kind == Hook::destroy_begin) &&
+      !identity_type_matches)
+    return;
+  if (kind == Hook::create && watch.shared_file.active() &&
       (object > UINT64_MAX - watch.offset || !shared_file_offset(watch, object + watch.offset)))
     return;
   if (watch.borrow.dispatch_return) {
@@ -1381,26 +1520,39 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       if (!matches_type(object, watch.borrow.typeinfo, watch.borrow.base_offset))
         return;
       const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
       if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
         watch.lifetimes.erase(prior);
       }
       if (const auto *life = watch.admit_lifetime(object))
         emit_boundary(watch, site, object, *life, kind);
-      else
+      else {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
+      }
       return;
     }
   }
   Lifetime life;
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   if (kind == Hook::destroy_end) {
     const auto sample = destroying;
     destroying = {};
     if (!sample.site || sample.site->watch != &watch || sample.stack != regs.value(rsp))
       return;
     life = sample.life;
+    provisional_reason = sample.provisional_reason;
   } else {
     const std::lock_guard lock(watch.mutex);
+    const std::unique_lock identity_lock(watch.identity_mutex);
     if (kind == Hook::create) {
       if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1408,21 +1560,45 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       const auto *item = watch.admit_lifetime(object);
       if (!item) {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
         return;
       }
       life = *item;
     } else {
       destroying = {};
+      auto &history = watch.generations[object];
+      // A verified address/type observation can support destructor boundaries
+      // without claiming a complete-object lifetime identity.
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
+          (history.uncertain_live || history.provisional_live) && identity_type_matches;
+      provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto found = watch.lifetimes.find(object);
-      if (found == watch.lifetimes.end() || !found->second.id)
-        return;
-      life = found->second;
-      watch.lifetimes.erase(found);
+      if (found == watch.lifetimes.end() || !found->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        life = found->second;
+        watch.lifetimes.erase(found);
+      }
       destroying = {&site, regs.value(rsp), object, life};
+      destroying.provisional_reason = provisional_reason;
     }
   }
-  emit_boundary(watch, site, object, life, kind);
+  emit_boundary(watch, site, object, life, kind, 0, 0, false, provisional_reason);
 }
 
 void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
@@ -1446,6 +1622,14 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
 
   if (entering) {
+    // A staged type-wide watch exists only to be ready for publication; do
+    // not create target-side lifetimes for constructors that began before
+    // the associated method probes became visible. Such receivers may be
+    // admitted provisionally after publication when their exact type is
+    // independently verified.
+    if (watch.identity_watch_id &&
+        !watch.channel->registration_active.load(std::memory_order_acquire))
+      return;
     const auto object = regs.value(rdi);
     if (!object || object > UINT64_MAX - watch.offset)
       return;
@@ -1453,7 +1637,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     Observation event{};
     event.object = object;
     event.pc = inst.boundary_pc;
-    if (constructor && watch.shared_file.inode) {
+    if (constructor && watch.shared_file.active()) {
       const auto offset = shared_file_offset(watch, object + watch.offset);
       if (!offset)
         return;
@@ -1462,14 +1646,33 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     }
     stack(watch, event, regs);
     if (!constructor) {
-      const std::lock_guard lock(watch.mutex);
-      const auto item = watch.lifetimes.find(object);
-      if (item == watch.lifetimes.end() || !item->second.id)
+      const bool exact_type = !watch.receiver_typeinfo ||
+          matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset);
+      if (watch.identity_watch_id && !exact_type)
         return;
-      event.id = item->second.id;
-      event.generation = item->second.generation;
-      event.owner = item->second.owner;
-      watch.lifetimes.erase(item);
+      const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[object];
+      // Keep provisional observations visible, but never attach a fabricated ID.
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
+          (history.uncertain_live || history.provisional_live) && exact_type;
+      event.provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
+      const auto item = watch.lifetimes.find(object);
+      if (item == watch.lifetimes.end() || !item->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        event.id = item->second.id;
+        event.generation = item->second.generation;
+        event.owner = item->second.owner;
+        watch.lifetimes.erase(item);
+      }
       event.hook = Hook::destroy_begin;
       emit(watch, event);
     }
@@ -1479,10 +1682,18 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
         });
     const auto call = std::pair{inst.boundary_pc, return_pc};
     const bool uncertain = inst.uncertain_construct &&
-        !std::ranges::binary_search(watch.complete_constructor_returns, call, {},
-            [](const auto &site) { return std::pair{site.entry, site.return_pc}; });
+        !std::binary_search(watch.complete_constructor_returns.begin(), watch.complete_constructor_returns.end(),
+                            ConstructorReturn{call.first, call.second}, [](const auto &a, const auto &b) {
+                              return std::tie(a.entry, a.return_pc) < std::tie(b.entry, b.return_pc);
+                            });
     if (constructor && outer && !uncertain) {
       const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[object];
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1517,21 +1728,43 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     emit(watch, event);
     return;
   }
-  if (frame.uncertain || (watch.receiver_typeinfo &&
-      !matches_type(event.object, watch.receiver_typeinfo, watch.borrow.base_offset))) {
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
+  const bool exact_type = !watch.receiver_typeinfo ||
+      matches_type(event.object, watch.receiver_typeinfo, watch.borrow.base_offset);
+  if (frame.uncertain || !exact_type) {
     event.hook = Hook::construction_uncertain;
     event.gap = frame.uncertain;
+    if (watch.identity_watch_id && watch.provisional_method_watch &&
+        frame.uncertain && exact_type) {
+      const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[event.object];
+      history.observed = true;
+      history.uncertain_live = true;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::uncertain_construction;
+    }
     emit(watch, event);
     return;
   }
   const std::lock_guard lock(watch.mutex);
-  if (watch.lifetimes.contains(event.object)) {
+  const std::unique_lock identity_lock(watch.identity_mutex);
+  if (watch.lifetimes.count(event.object)) {
     event.hook = Hook::construction_uncertain;
     emit(watch, event);
     return;
   }
   const auto *life = watch.admit_lifetime(event.object);
   if (!life) {
+    if (watch.identity_watch_id && watch.provisional_method_watch) {
+      auto &history = watch.generations[event.object];
+      history.observed = true;
+      history.provisional_live = true;
+      history.uncertain_live = false;
+      history.provisional_reason = ProvisionalReason::instance_limit;
+    }
     event.hook = Hook::admission_gap;
     emit(watch, event);
     return;
@@ -1539,7 +1772,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   event.id = life->id;
   event.generation = life->generation;
   event.hook = Hook::create;
-  if (!watch.no_values && !watch.shared_file.inode &&
+  if (!watch.no_values && !watch.value_write.active() && !watch.shared_file.active() &&
       read_field(watch, event.object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, event.object)) {
@@ -1565,10 +1798,10 @@ void snapshot_boundary(const Site &site, const Registers &regs) {
   const bool entry = site.instruction.hook == Hook::snapshot_entry;
   Address receiver = regs.value(rdi);
   if (entry) {
-    std::erase_if(snapshot_calls, [&](const auto &call) {
+    snapshot_calls.erase(std::remove_if(snapshot_calls.begin(), snapshot_calls.end(), [&](const auto &call) {
       return call.watch == &watch ? call.stack >= sp :
           call.watch->channel->reclaim_request.load(std::memory_order_acquire) != 0;
-    });
+    }), snapshot_calls.end());
     if (snapshot_calls.size() >= 64) {
       queue.drops.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -1635,14 +1868,9 @@ void before(const Site *site, const Registers *regs) noexcept {
     return;
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-#if defined(__aarch64__)
-    if (watch.snapshot_mapping) {
-      auto &queue = *static_cast<arm_snapshot::Queue *>(watch.snapshot_mapping->address);
-      queue.drops.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-#endif
-    watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    // Helper reentry is accounted separately and is not an application event
+    // or a capture loss, including for the snapshot backend.
     return;
   }
   const HelperGuard guard(site);
@@ -1746,9 +1974,13 @@ void before(const Site *site, const Registers *regs) noexcept {
       sample.storage_generation = scope.generation;
       sample.expected = regs->value(inst.result ? inst.result : rax);
       sample.storage_write = match.write;
+      sample.storage_field = scope.destination;
       if (!watch.no_values && sample.storage_write.size) {
         sample.has_old = read_self_memory(sample.storage_write.address, sample.storage_before.data(),
                                           sample.storage_write.size);
+        sample.union_before = object_watch::sample_union_write(watch.value_write,
+            watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+            sample.storage_write, read_self_memory);
       } else if (!watch.no_values) {
         sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
         sample.has_old = !watch.atomic && read_field(watch, destination, sample.old);
@@ -1761,8 +1993,11 @@ void before(const Site *site, const Registers *regs) noexcept {
       pending = sample;
       return;
     }
-    if (destination < watch.offset)
+    const bool union_storage = watch.value_write.kind == object_watch::ValueWriteKind::union_storage;
+    if (destination < watch.offset && !union_storage)
       return;
+    auto receiver = destination - watch.offset;
+    object_watch::ValueWrite write;
     Lifetime life;
     std::atomic<std::uint64_t> *window = nullptr;
     if (watch.borrow.dispatch_return)
@@ -1770,7 +2005,24 @@ void before(const Site *site, const Registers *regs) noexcept {
         return;
     {
       const std::lock_guard lock(watch.mutex);
-      const auto found = watch.lifetimes.find(destination - watch.offset);
+      auto found = std::as_const(watch.lifetimes).find(receiver);
+      if (union_storage) {
+        const auto match = object_watch::match_live_union(watch.value_write, watch.lifetimes,
+            watch.offset, destination, inst.store_width, [&] {
+              Observation event{};
+              event.pc = inst.pc;
+              event.destination = destination;
+              event.hook = Hook::collection_gap;
+              event.gap = 10;
+              stack(watch, event, *regs);
+              emit(watch, event);
+            });
+        found = match.first;
+        write = match.second;
+        if (!write.size)
+          return;
+        receiver = found->first;
+      }
       if (found == watch.lifetimes.end() || !found->second.id)
         return;
       life = found->second;
@@ -1778,10 +2030,15 @@ void before(const Site *site, const Registers *regs) noexcept {
                                            life.owner != active_borrow.owner))
         return;
       if (watch.serialize_wait_us || (!watch.no_values && !watch.atomic))
-        window = &watch.generations.at(destination - watch.offset).write_window;
+        window = &watch.generations.at(receiver).write_window;
     }
     Sample sample{site, regs->value(rsp), destination, life};
-    if (watch.shared_file.inode) {
+    sample.storage_write = write;
+    if (write.size) {
+      sample.storage_receiver = receiver;
+      sample.storage_field = receiver + watch.offset;
+    }
+    if (watch.shared_file.active()) {
       sample.shared_file_offset = shared_file_offset(watch, destination);
       if (!sample.shared_file_offset)
         return;
@@ -1795,10 +2052,17 @@ void before(const Site *site, const Registers *regs) noexcept {
       reserve_write(sample, *window, watch.serialize_wait_us);
     }
     if (!watch.no_values) {
-      sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
-      if (window)
-        sample.has_old = read_field(watch, destination, sample.old);
-      sample.old_tag = union_tag(watch, destination - watch.offset);
+      if (write.size) {
+        sample.has_old = read_self_memory(write.address, sample.storage_before.data(), write.size);
+        sample.union_before = object_watch::sample_union_write(watch.value_write,
+            watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+            write, read_self_memory);
+      } else {
+        sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
+        if (window)
+          sample.has_old = read_field(watch, destination, sample.old);
+        sample.old_tag = union_tag(watch, receiver);
+      }
     }
     pending = sample;
   } catch (...) {
@@ -1829,6 +2093,18 @@ void complete(const Site *site, const Registers *regs) {
   const bool readable = watch.no_values || !needs_read || (!watch.atomic &&
       (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
        read_field(watch, sample.destination, observed)));
+  object_watch::ValueStoreBytes storage_after{};
+  auto union_before = sample.union_before;
+  object_watch::UnionWriteState union_after;
+  bool storage_read = false;
+  if (sample.storage_write.size && !watch.no_values &&
+      sample.site == site && sample.stack == regs->value(rsp)) {
+    storage_read = read_self_memory(sample.storage_write.address, storage_after.data(),
+                                    sample.storage_write.size);
+    union_after = object_watch::sample_union_write(watch.value_write,
+        watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+        sample.storage_write, read_self_memory);
+  }
   const bool overlapping = ordered ?
       sample.overlapping || sample.write_window->load(std::memory_order_acquire) /
           write_epoch_increment != sample.write_epoch ||
@@ -1842,16 +2118,19 @@ void complete(const Site *site, const Registers *regs) {
     if (!succeeded)
       return;
   }
-  const auto object = sample.collection_owner ? sample.collection_owner : sample.destination - watch.offset;
+  const auto object = sample.collection_owner ? sample.collection_owner :
+                      sample.storage_receiver ? sample.storage_receiver : sample.destination - watch.offset;
   const bool new_value_available = readable && (!needs_read || watch.no_values || !overlapping);
   std::unique_lock lock(watch.mutex);
   bool drift = false;
+  object_watch::UnionActivation *activation = nullptr;
   if (sample.collection_owner) {
     const auto active = watch.active_collections.find(object);
     if (active == watch.active_collections.end() || !active->second ||
         collection_scope.watch != &watch || !collection_scope.valid ||
         collection_scope.id != sample.life.id || collection_scope.generation != sample.storage_generation)
       return;
+    activation = &collection_scope.union_activation;
   } else {
     const auto found = watch.lifetimes.find(object);
     if (found == watch.lifetimes.end() || found->second.id != sample.life.id ||
@@ -1859,16 +2138,22 @@ void complete(const Site *site, const Registers *regs) {
        (active_borrow.watch != &watch || active_borrow.life.id != sample.life.id ||
         found->second.owner != active_borrow.owner)))
       return;
+    activation = &found->second.union_activation;
     if (ordered && !watch.no_values) {
       auto &last = found->second.last_ordered_value;
       if (overlapping || !sample.has_old || !new_value_available) {
         last.reset();
       } else {
         drift = last && static_cast<std::uint32_t>(*last) != sample.old;
-        last = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(observed));
+        last = ::tracer::compat::bit_cast<std::int32_t>(static_cast<std::uint32_t>(observed));
       }
     }
   }
+  if (sample.storage_write.size && !watch.no_values &&
+      watch.value_write.kind == object_watch::ValueWriteKind::union_storage && watch.value_write.selector_width)
+    object_watch::confirm_union_payload(*activation, watch.value_alternatives.data(),
+        watch.value_alternatives.size(), sample.storage_field, sample.storage_write,
+        sample.has_old && storage_read && !overlapping, union_before, union_after);
   if (!watch.borrow.dispatch_return)
     lock.unlock();
   Observation event{};
@@ -1895,15 +2180,20 @@ void complete(const Site *site, const Registers *regs) {
   }
   if (sample.storage_write.size) {
     event.storage_write = sample.storage_write;
-    if (!watch.no_values) {
+    if (!watch.no_values && !overlapping) {
       event.storage_before = sample.storage_before;
-      const bool after_read = read_self_memory(sample.storage_write.address, event.storage_after.data(),
-                                               sample.storage_write.size);
-      event.values = (sample.has_old ? 1 : 0) | (after_read ? 2 : 0);
-      if (event.values == 3 && event.storage_before == event.storage_after)
+      event.storage_after = storage_after;
+      event.values = (sample.has_old ? 1 : 0) | (storage_read ? 2 : 0);
+      event.union_before = union_before;
+      event.union_after = union_after;
+      if (event.values == 3 && event.storage_before == event.storage_after &&
+          event.union_before.tag == event.union_after.tag &&
+          event.union_before.scalar == event.union_after.scalar)
         return;
       if (event.values != 3)
         event.gap = 3;
+    } else if (overlapping) {
+      event.gap = 1;
     }
   } else if (!watch.no_values && new_value_available) {
     auto old = sample.old;
@@ -1953,12 +2243,12 @@ void after(const Site *site, const Registers *regs) noexcept {
       cancel_pending();
     return;
   }
-  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-    channel.dropped.fetch_add(1, std::memory_order_relaxed);
+    channel.helper_reentries.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   const HelperGuard guard(site);
   try {
     complete(site, regs);
@@ -2378,7 +2668,7 @@ void fault(int sig, siginfo_t *info, void *context) {
     if (!selected(*watch))
       continue;
     const bool static_retired = watch->static_retired.load(std::memory_order_acquire);
-    const auto scan_sites = [&](std::span<const Site> sites) {
+    const auto scan_sites = [&](::tracer::compat::span<const Site> sites) {
       for (const auto &site : sites) {
         if (async && restore_dispatch(site, interrupted, signal_registers, destination)) {
           dispatching = &site;
@@ -2429,7 +2719,7 @@ void fault(int sig, siginfo_t *info, void *context) {
         return;
       }
     };
-    const auto find_helper = [&](const Mapping &mapping, std::span<const Site> sites) {
+    const auto find_helper = [&](const Mapping &mapping, ::tracer::compat::span<const Site> sites) {
       if (async && !faulting && !synthetic) {
         const auto base = reinterpret_cast<Address>(mapping.address);
         if (interrupted < base || interrupted - base >= mapping.size)
@@ -2528,8 +2818,14 @@ void fault(int sig, siginfo_t *info, void *context) {
     }
   }
   const auto &previous = previous_actions[sig];
-  if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
-    if (previous.sa_handler == SIG_IGN && info->si_code <= 0)
+  // SA_RESETHAND is emulated in the bridge because the process-wide handler
+  // remains installed for translated code. Claim the application handler
+  // atomically before chaining so a nested or concurrent delivery observes
+  // the default disposition instead of invoking the one-shot handler twice.
+  const bool one_shot_consumed = (previous.sa_flags & SA_RESETHAND) &&
+      previous_delivered[sig].test_and_set(std::memory_order_relaxed);
+  if (one_shot_consumed || previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
+    if (!one_shot_consumed && previous.sa_handler == SIG_IGN && async)
       return;
 
     if (faulting && !async && part == Part::instruction) {
@@ -2545,13 +2841,43 @@ void fault(int sig, siginfo_t *info, void *context) {
         sp = interrupted_sp;
       }
     }
-    // Linux takes the default action on a hardware fault even when the
-    // application ignored the signal. Raised signals must be sent again.
+    // A hardware fault reoccurs when its instruction resumes. Signals already
+    // delivered asynchronously (including kernel-generated timer/child signals)
+    // must be sent again after installing the default disposition.
     struct sigaction action{};
     action.sa_handler = SIG_DFL;
     ::sigaction(sig, &action, nullptr);
-    if (info->si_code <= 0)
-      ::raise(sig);
+    if (info->si_code <= 0 || async) {
+      bool default_action_delivered = false;
+      // The bridge blocks its current signal by default. Unblock it while
+      // SIG_DFL is installed so raise() cannot remain pending when the bridge
+      // disposition is restored, including for non-one-shot default handlers.
+      sigset_t one_signal{}, previous_mask{};
+      ::sigemptyset(&one_signal);
+      ::sigaddset(&one_signal, sig);
+      if (!::sigprocmask(SIG_UNBLOCK, &one_signal, &previous_mask)) {
+        default_action_delivered = ::raise(sig) == 0;
+        (void)::sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+      } else {
+        // Keep SIG_DFL installed. If raise queues, the action occurs after
+        // this bridge frame returns; do not rearm a handler over that signal.
+        (void)::raise(sig);
+      }
+      if (default_action_delivered) {
+        // Default-ignore and stop/continue actions can return here. Keep the
+        // bridge for translated code, but do not overwrite a handler that the
+        // application installed while the default action was running.
+        struct sigaction current{};
+        if (!::sigaction(sig, nullptr, &current) && current.sa_handler == SIG_DFL) {
+          struct sigaction bridge{};
+          bridge.sa_mask = previous.sa_mask;
+          bridge.sa_flags = SA_SIGINFO |
+              (previous.sa_flags & (SA_ONSTACK | SA_NODEFER | SA_RESTART));
+          bridge.sa_sigaction = fault;
+          (void)::sigaction(sig, &bridge, nullptr);
+        }
+      }
+    }
     return;
   }
   auto application_info = *info;
@@ -2593,7 +2919,7 @@ void fault(int sig, siginfo_t *info, void *context) {
     // A handler can retry, skip, or branch to another original instruction.
     // Start at the corresponding hook boundary, discarding any failed sample.
     const auto resume_sites = faulting->runtime_sites.empty() ?
-        std::span<const Site>(faulting->watch->sites) : faulting->runtime_sites;
+        ::tracer::compat::span<const Site>(faulting->watch->sites) : faulting->runtime_sites;
     const bool holds_static = faulting->reclaimable &&
         ((part != Part::entry_gate && part != Part::exit_gate) || gate_reference);
     for (const auto &site : resume_sites)
@@ -2618,6 +2944,16 @@ void fault(int sig, siginfo_t *info, void *context) {
 }
 
 void install_bridge(std::uint64_t async_signals) {
+  // Reacquire a disposition only when no retained translation or in-flight
+  // execution can still use the previous signal chain. This applies to both
+  // grouped JIT preparation and ordinary object-watch initialization.
+  bool allow_rebind = true;
+  for (auto *watch = retained.load(std::memory_order_acquire); allow_rebind && watch;
+       watch = watch->previous) {
+    if (watch->static_gate.load(std::memory_order_acquire) ||
+        watch->runtime_inflight.load(std::memory_order_acquire))
+      allow_rebind = false;
+  }
   std::vector<int> signals{SIGSEGV, SIGBUS, SIGFPE, SIGILL};
   for (int sig = 1; sig < NSIG && sig <= 64; ++sig)
     if (!synchronous_fault_signal(sig) && (async_signals & (1ULL << (sig - 1))))
@@ -2627,18 +2963,16 @@ void install_bridge(std::uint64_t async_signals) {
     struct sigaction current{};
     if (::sigaction(sig, nullptr, &current))
       throw std::runtime_error("cannot read application signal disposition");
-    if (bridge_installed[sig]) {
-      if (!(current.sa_flags & SA_SIGINFO) || current.sa_sigaction != fault)
-        throw std::runtime_error("application replaced the code-cache signal handler");
-    } else {
-      if (current.sa_flags & SA_RESETHAND)
-        throw std::runtime_error("code cache cannot chain one-shot signal handlers");
-      if ((async_signals & (1ULL << (sig - 1))) &&
-          (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
-        throw std::runtime_error("asynchronous signal needs an existing application handler");
-      previous_actions[sig] = current;
-      missing.push_back(sig);
-    }
+    if (bridge_installed[sig] && (current.sa_flags & SA_SIGINFO) && current.sa_sigaction == fault)
+      continue;
+    if (bridge_installed[sig] && !allow_rebind)
+      throw std::runtime_error("application replaced the code-cache signal handler");
+    if ((async_signals & (1ULL << (sig - 1))) &&
+        (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
+      throw std::runtime_error("asynchronous signal needs an existing application handler");
+    previous_actions[sig] = current;
+    previous_delivered[sig].clear(std::memory_order_relaxed);
+    missing.push_back(sig);
   }
   for (const auto sig : missing) {
     struct sigaction action{};
@@ -3168,7 +3502,7 @@ std::unique_ptr<Mapping> make_tail_gate(Site &site, const XState &xstate) {
   return gate;
 }
 
-std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, const XState &xstate,
+std::unique_ptr<Mapping> translate(::tracer::compat::span<Site> sites, Function &function, const XState &xstate,
                                    const StaticLink *links = nullptr, Address *tail_entry = nullptr) {
   Emitter out;
   std::map<Address, std::size_t> labels;
@@ -3287,7 +3621,7 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, co
   return map;
 }
 
-void install_static_fragment(State &watch, std::span<Site> sites, Function &function,
+void install_static_fragment(State &watch, ::tracer::compat::span<Site> sites, Function &function,
                              const XState &xstate, RuntimeBlock *scope = nullptr) {
   auto &gates = scope ? scope->tail_gates : watch.mappings;
   auto &bodies = scope ? scope->scope_bodies : watch.static_bodies;
@@ -3649,7 +3983,7 @@ std::unique_ptr<Mapping> make_tail_gate(Site &site, const XState &xstate) {
   return mapping;
 }
 
-std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
+std::unique_ptr<Mapping> translate(::tracer::compat::span<Site> sites, Function &function,
                                    const XState &xstate, const StaticLink *links = nullptr,
                                    Address *tail_entry = nullptr) {
   Emitter out;
@@ -3836,11 +4170,11 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
   return map;
 }
 
-void install_static_fragment(State &watch, std::span<Site> sites, Function &function,
+void install_static_fragment(State &watch, ::tracer::compat::span<Site> sites, Function &function,
                              const XState &xstate, RuntimeBlock *scope = nullptr) {
   auto &gates = scope ? scope->tail_gates : watch.mappings;
   auto &bodies = scope ? scope->scope_bodies : watch.static_bodies;
-  if (std::ranges::any_of(sites, [](const auto &site) {
+  if (std::any_of(std::begin(sites), std::end(sites), [](const auto &site) {
         return site.instruction.flow == Flow::runtime_call || site.instruction.flow == Flow::runtime_tail;
       })) {
     auto mapping = translate(sites, function, xstate);
@@ -3866,7 +4200,7 @@ void install_static_fragment(State &watch, std::span<Site> sites, Function &func
     if (inst.size == 1 && inst.bytes[0] == 0xc3)
       add_exit(inst.pc, true);
     if (inst.flow != Flow::copy &&
-        std::ranges::none_of(sites, [&](const auto &other) { return other.instruction.pc == inst.target; }))
+        std::none_of(std::begin(sites), std::end(sites), [&](const auto &other) { return other.instruction.pc == inst.target; }))
       add_exit(inst.target);
   }
   std::string error;
@@ -3908,13 +4242,11 @@ RuntimeLocation locate_runtime_target(Address target) {
         target < begin || target >= end)
       continue;
     if (permissions[0] != 'r' || permissions[2] != 'x' || permissions[1] == 'w' ||
-        !inode || line.size() <= static_cast<std::size_t>(path_offset) || line[path_offset] != '/' ||
-        line.ends_with(" (deleted)") || target - begin > UINT64_MAX - offset)
+        line.size() <= static_cast<std::size_t>(path_offset) || line[path_offset] != '/' ||
+        ::tracer::compat::ends_with(line, " (deleted)") || target - begin > UINT64_MAX - offset)
       break;
     location.end = end;
     location.offset = offset + target - begin;
-    location.device = makedev(dev_major, dev_minor);
-    location.inode = inode;
     location.path = line.substr(path_offset);
     break;
   }
@@ -3934,7 +4266,7 @@ RuntimeLocation locate_runtime_target(Address target) {
     if (query.target < info->dlpi_addr)
       return 0;
     const auto address = query.target - info->dlpi_addr;
-    for (const auto &segment : std::span(info->dlpi_phdr, info->dlpi_phnum)) {
+    for (const auto &segment : ::tracer::compat::span(info->dlpi_phdr, info->dlpi_phnum)) {
       if (segment.p_type != PT_LOAD || !(segment.p_flags & PF_X) || address < segment.p_vaddr)
         continue;
       const auto delta = address - segment.p_vaddr;
@@ -3985,7 +4317,6 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
   } file{::open(location.path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)};
   struct stat before{}, after{};
   if (file.fd < 0 || ::fstat(file.fd, &before) || !S_ISREG(before.st_mode) ||
-      before.st_dev != location.device || before.st_ino != location.inode ||
       before.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)))
     throw std::runtime_error("cannot identify the mapped runtime ELF file");
   auto buffer = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(before.st_size, location.path);
@@ -4016,13 +4347,29 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
 #endif
   if (!object || object->getArch() != native_arch)
     throw std::runtime_error("runtime callee is outside a native ELF image");
+  if (!tracer::detail::matches_mapped_elf(*object, location.bias, [](auto address, auto bytes) {
+        std::array<char, 4096> copy;
+        if (bytes.size() > UINT64_MAX - address)
+          return false;
+        while (!bytes.empty()) {
+          const auto size = std::min(bytes.size(), copy.size());
+          if (!read_self_memory(address, copy.data(), size) ||
+              std::string_view(copy.data(), size) != bytes.substr(0, size))
+            return false;
+          address += size;
+          bytes.remove_prefix(size);
+        }
+        return true;
+      }))
+    throw std::runtime_error("mapped runtime ELF content differs from the file");
   binary = {std::move(*elf), std::move(buffer)};
 }
 
-std::pair<std::string, Address> RuntimeImage::function(Address address) const {
+RuntimeImage::FunctionImage RuntimeImage::function(Address address) const {
   const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
   Address size = 0;
-  const auto find_entry = [&](const llvm::object::SymbolRef &symbol) {
+  bool weak = false;
+  const auto find_entry = [&](const llvm::object::SymbolRef &symbol, bool dynamic) {
     const llvm::object::ELFSymbolRef elf(symbol);
     if (elf.getELFType() != STT_FUNC || !elf.getSize())
       return;
@@ -4035,12 +4382,13 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
       if (size && size != elf.getSize())
         throw std::runtime_error("runtime callee has ambiguous ELF symbol extents");
       size = elf.getSize();
+      weak |= dynamic && elf.getBinding() == STB_WEAK;
     }
   };
   for (const auto &symbol : object.symbols())
-    find_entry(symbol);
+    find_entry(symbol, false);
   for (const auto &symbol : object.getDynamicSymbolIterators())
-    find_entry(symbol);
+    find_entry(symbol, true);
   if (!size)
     throw std::runtime_error("runtime callee has no concrete ELF symbol extent");
   auto headers = object.getELFFile().program_headers();
@@ -4057,10 +4405,108 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
     const Address delta = address - segment.p_vaddr;
     if (delta <= segment.p_filesz && size <= segment.p_filesz - delta) {
       const Address offset = segment.p_offset + delta;
-      return {file.substr(offset, size).str(), offset};
+      return {file.substr(offset, size).str(), offset, weak};
     }
   }
   throw std::runtime_error("runtime callee exceeds executable ELF segment");
+}
+
+std::optional<RuntimeImage::PltStub> RuntimeImage::plt_stub(Address address) const {
+#if !defined(__x86_64__)
+  (void)address;
+  return std::nullopt;
+#else
+  const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
+  std::optional<llvm::object::ELFSectionRef> entry_section;
+  std::optional<llvm::object::ELFSectionRef> lazy_section;
+  for (const auto &section : object.sections()) {
+    auto name = section.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      continue;
+    }
+    if ((*name != ".plt" && *name != ".plt.sec" && *name != ".plt.got") || !section.isText())
+      continue;
+    if (*name == ".plt")
+      lazy_section = llvm::object::ELFSectionRef(section);
+    if (address >= section.getAddress() && address - section.getAddress() < section.getSize())
+      entry_section = llvm::object::ELFSectionRef(section);
+  }
+  if (!entry_section)
+    return std::nullopt;
+  auto contents = entry_section->getContents();
+  if (!contents) {
+    llvm::consumeError(contents.takeError());
+    return std::nullopt;
+  }
+  const auto offset = address - entry_section->getAddress();
+  const auto entry = contents->substr(offset);
+  auto jump = entry;
+  if (::tracer::compat::starts_with(jump, "\xf3\x0f\x1e\xfa")) // ENDBR64
+    jump = jump.drop_front(4);
+  if (::tracer::compat::starts_with(jump, "\xf2\xff\x25")) // BND-prefixed indirect jump
+    jump = jump.drop_front(1);
+  if (jump.size() < 6 || !::tracer::compat::starts_with(jump, "\xff\x25"))
+    return std::nullopt;
+  std::int32_t displacement = 0;
+  std::memcpy(&displacement, jump.data() + 2, sizeof(displacement));
+  const auto size = entry.size() - jump.size() + 6;
+  const Address got = address + size + displacement;
+  if (got % alignof(Address))
+    return std::nullopt;
+
+  // The RIP-relative slot must be backed by a dynamic GOT relocation.
+  bool got_slot = false;
+  bool jump_slot = false;
+  for (const auto &section : object.sections()) {
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & SHF_ALLOC))
+      continue;
+    for (const auto &relocation : section.relocations()) {
+      if (relocation.getOffset() != got)
+        continue;
+      jump_slot |= relocation.getType() == R_X86_64_JUMP_SLOT;
+      got_slot |= relocation.getType() == R_X86_64_GLOB_DAT;
+    }
+  }
+  if (!jump_slot && !got_slot)
+    return std::nullopt;
+
+  auto headers = object.getELFFile().program_headers();
+  if (!headers) {
+    llvm::consumeError(headers.takeError());
+    return std::nullopt;
+  }
+  const auto file = object.getMemoryBufferRef().getBuffer();
+  const auto file_range = [&](Address start, std::size_t length, unsigned flags) -> std::optional<Address> {
+    for (const auto &segment : *headers) {
+      if (segment.p_type != PT_LOAD || (segment.p_flags & flags) != flags ||
+          start < segment.p_vaddr || segment.p_offset > file.size() ||
+          segment.p_filesz > file.size() - segment.p_offset)
+        continue;
+      const Address delta = start - segment.p_vaddr;
+      if (delta <= segment.p_filesz && length <= segment.p_filesz - delta)
+        return segment.p_offset + delta;
+    }
+    return std::nullopt;
+  };
+  const auto stub_offset = file_range(address, size, PF_X);
+  const auto got_offset = file_range(got, sizeof(Address), PF_R);
+  if (!stub_offset || *stub_offset != entry_section->getOffset() + offset || !got_offset)
+    return std::nullopt;
+
+  // For lazy JUMP_SLOT binding the file's initial GOT word points back into
+  // .plt, both for the classic continuation and a separate IBT resolver stub.
+  Address lazy_target = 0;
+  if (jump_slot && lazy_section) {
+    Address initial = 0;
+    std::memcpy(&initial, file.data() + *got_offset, sizeof(initial));
+    const auto begin = lazy_section->getAddress();
+    if (initial >= begin && initial - begin < lazy_section->getSize() &&
+        file_range(initial, 1, PF_X))
+      lazy_target = initial;
+  }
+  return PltStub{got, lazy_target, *stub_offset, entry.take_front(size).str()};
+#endif
 }
 
 bool matches_runtime_bytes(Address target, const RuntimeLocation &location, const RuntimeBlock &block) {
@@ -4146,7 +4592,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
           const auto interior = targets.upper_bound(start);
           if (end - start < 10 || end - start > RuntimePatch{}.original.size() ||
               (interior != targets.end() && *interior < end) ||
-              std::ranges::any_of(fragments, [&](const auto &prior) {
+              std::any_of(std::begin(fragments), std::end(fragments), [&](const auto &prior) {
                 return prior.code.front().pc < end &&
                     start < prior.code.back().pc + prior.code.back().size;
               }))
@@ -4164,7 +4610,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
     } else if (store(inst) && !covered_stores.count(inst.address)) {
       Fragment fragment;
       const auto overlaps = [&](Address begin, Address end) {
-        return std::ranges::any_of(fragments, [&](const auto &prior) {
+        return std::any_of(std::begin(fragments), std::end(fragments), [&](const auto &prior) {
           return prior.code.front().pc < end && begin < prior.code.back().pc + prior.code.back().size;
         });
       };
@@ -4201,8 +4647,8 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
         block.partial = true;
         continue;
       }
-      auto decoded = std::ranges::lower_bound(body.instructions, fragment.code.front().pc, {},
-                                              &native_entry::Instruction::address);
+      auto decoded = std::lower_bound(body.instructions.begin(), body.instructions.end(), fragment.code.front().pc,
+          [](const auto &inst, Address address) { return inst.address < address; });
       for (auto &out : fragment.code) {
         if (store(*decoded)) {
           instrument_store(out, *decoded->memory_store);
@@ -4212,7 +4658,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
       }
       fragments.push_back(std::move(fragment));
     } else if (inst.flow == NativeFlow::ordinary && inst.may_store && !store(inst) &&
-               !inst.changes_stack && !inst.text.starts_with("push")) {
+               !inst.changes_stack && !::tracer::compat::starts_with(inst.text, "push")) {
       block.partial = true;
     } else if (inst.flow == NativeFlow::branch && inst.target && !targets.count(*inst.target)) {
       block.partial = true;
@@ -4234,7 +4680,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
   for (const auto &fragment : fragments) {
     const auto pc = fragment.code.front().pc;
     const auto size = fragment.code.back().pc + fragment.code.back().size - pc;
-    auto sites = std::span(block.sites).subspan(offset, fragment.code.size());
+    auto sites = ::tracer::compat::span(block.sites).subspan(offset, fragment.code.size());
     for (auto &site : sites)
       site.runtime_sites = sites;
     Function function{nullptr, fragment.code.size(), pc, 0, fragment.resume};
@@ -4264,8 +4710,6 @@ bool request_runtime_scope(State &watch, RuntimeBlock &block, Address target,
   admission.scope = block.scope_index;
   admission.width = block.bytes.size();
   admission.module = block.sites.front().runtime_module;
-  admission.device = location.device;
-  admission.inode = location.inode;
   admission.file_offset = location.offset;
   unsigned idle = RuntimeAdmission::idle;
   if (!admission.phase.compare_exchange_strong(idle, RuntimeAdmission::ready, std::memory_order_release))
@@ -4325,21 +4769,25 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
   const Activity activity(*watch.channel);
   if (!activity.active)
     return fallback;
+  if (inside_helper) {
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    return fallback;
+  }
   if (watch.channel->reclaim_request.load(std::memory_order_acquire))
     return fallback;
-  if (std::ranges::binary_search(watch.static_scopes, target))
+  if (std::binary_search(watch.static_scopes.begin(), watch.static_scopes.end(), target))
     return fallback;
-  std::uint8_t gap = 1;
-  if (!inside_helper) {
+  std::uint8_t gap = static_cast<std::uint8_t>(DispatchGap::translation_failed);
+  bool from_plt = false;
+  RuntimeImageKey plt_owner_key{};
+  {
     const HelperGuard guard(site);
     try {
       // Query the loader before taking the watch lock. Loader callbacks can
       // enter application code on a different thread.
-      const auto location = locate_runtime_target(target);
-      const RuntimeImageKey image_key{location.device, location.inode, location.bias,
-                                      location.unload_generation};
-      const auto target_key = std::pair{image_key, target};
-      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
+      auto location = locate_runtime_target(target);
+      RuntimeImageKey image_key{location.path, location.bias,
+                                location.unload_generation};
       std::unique_lock lock(watch.runtime_mutex);
       const auto enter = [&](const RuntimeBlock &block) {
         if (watch.channel->reclaim_request.load(std::memory_order_acquire))
@@ -4351,6 +4799,100 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       };
       if (watch.channel->reclaim_request.load(std::memory_order_acquire))
         return fallback;
+      std::optional<RuntimeImage> fresh;
+      const auto image_for = [&]() -> const RuntimeImage & {
+        const auto known = watch.runtime_images.find(image_key);
+        if (known != watch.runtime_images.end()) {
+          fresh.reset();
+          return known->second;
+        }
+        if (!fresh) {
+          if (location.path.size() >= RuntimeModule{}.path.size())
+            throw std::runtime_error("runtime module path exceeds the event format");
+          fresh.emplace(location);
+        }
+        return *fresh;
+      };
+      const auto remember_rejection = [&](const RuntimeImageKey &key, Address destination,
+                                          DispatchGap reason, bool plt_only) noexcept {
+        try {
+          const auto rejection_key = std::pair{key, destination};
+          const auto found = watch.runtime_rejections.find(rejection_key);
+          if (found != watch.runtime_rejections.end()) {
+            if (found->second.plt_only && !plt_only)
+              found->second = {reason, plt_only};
+          } else if (watch.runtime_rejections.size() < watch.runtime_limit) {
+            watch.runtime_rejections.emplace(rejection_key,
+                State::RuntimeRejection{reason, plt_only});
+          }
+        } catch (...) {
+          // Rejection memoization is best-effort; always preserve the call path.
+        }
+      };
+#if defined(__x86_64__)
+      using PltStub = RuntimeImage::PltStub;
+      const auto stub_key = std::pair{image_key, target};
+      const PltStub *plt = nullptr;
+      std::optional<PltStub> stub;
+      if (const auto cached = watch.runtime_plt_stubs.find(stub_key); cached != watch.runtime_plt_stubs.end()) {
+        plt = &cached->second;
+      } else if (watch.runtime_targets.find(stub_key) == watch.runtime_targets.end()) {
+        stub = image_for().plt_stub(target - location.bias);
+        if (stub) {
+          plt = &*stub;
+          if (watch.runtime_plt_stubs.size() < watch.runtime_limit)
+            plt = &watch.runtime_plt_stubs.emplace(stub_key, std::move(*stub)).first->second;
+        }
+      }
+      if (plt) {
+        from_plt = true;
+        plt_owner_key = stub_key.first;
+        std::array<char, 11> live_stub{};
+        if (plt->file_offset != location.offset || plt->bytes.size() > location.end - target ||
+            !read_self_memory(target, live_stub.data(), plt->bytes.size()) ||
+            std::memcmp(live_stub.data(), plt->bytes.data(), plt->bytes.size()))
+          throw std::runtime_error("runtime PLT bytes disagree with the mapped ELF");
+        Address slot_value = 0;
+        if (!read_self(location.bias + plt->got_address, slot_value))
+          throw std::runtime_error("cannot read the verified runtime PLT GOT slot");
+        if (plt->lazy_target && slot_value == location.bias + plt->lazy_target) {
+          watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+          const auto slot_key = std::tuple{stub_key.first, plt->got_address, slot_value};
+          bool first = false;
+          try {
+            first = watch.runtime_lazy_slots.size() < watch.runtime_limit &&
+                watch.runtime_lazy_slots.insert(slot_key).second;
+          } catch (...) {
+            // Keep the linker path untouched if diagnostic accounting runs out of memory.
+          }
+          if (first) {
+            lock.unlock();
+            Observation event{};
+            event.pc = site->instruction.pc;
+            event.destination = target;
+            event.runtime_module = site->runtime_module;
+            event.hook = Hook::dispatch_gap;
+            event.gap = static_cast<std::uint8_t>(DispatchGap::lazy_plt);
+            emit(watch, event);
+          }
+          return fallback;
+        }
+        lock.unlock();
+        location = locate_runtime_target(slot_value);
+        lock.lock();
+        target = slot_value;
+        image_key = {location.path, location.bias, location.unload_generation};
+        if (image_key != stub_key.first)
+          fresh.reset();
+        if (watch.channel->reclaim_request.load(std::memory_order_acquire) ||
+            std::binary_search(watch.static_scopes.begin(), watch.static_scopes.end(), target))
+          return fallback;
+      }
+#endif
+      // The resolved target key uses the current GOT value for PLT calls.
+      const auto target_key = std::pair{image_key, target};
+      const bool outside_plt_scope = from_plt && !location.main_image && image_key != plt_owner_key;
+      const auto scope_key = std::tuple{location.path, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
         if (watch.channel->scope_status(watch.event_buffer, watch.runtime_limit, scope.scope_index)
@@ -4373,29 +4915,46 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
           return enter(*cached->second);
         watch.runtime_targets.erase(cached);
       }
+      if (const auto rejected = watch.runtime_rejections.find(target_key);
+          rejected != watch.runtime_rejections.end() &&
+          (!rejected->second.plt_only || outside_plt_scope)) {
+        gap = static_cast<std::uint8_t>(rejected->second.reason);
+        throw std::runtime_error("runtime callee has a memoized unsupported scope");
+      }
       if (watch.runtime_count == watch.runtime_limit) {
-        gap = 2;
+        gap = static_cast<std::uint8_t>(DispatchGap::runtime_limit);
         throw std::runtime_error("runtime translation limit reached");
       }
-      const auto known = watch.runtime_images.find(image_key);
-      std::optional<RuntimeImage> fresh;
-      if (known == watch.runtime_images.end()) {
-        if (location.path.size() >= RuntimeModule{}.path.size())
-          throw std::runtime_error("runtime module path exceeds the event format");
-        fresh.emplace(location);
-      }
-      const auto &image = fresh ? *fresh : known->second;
+      const auto &image = image_for();
       auto block = std::make_unique<RuntimeBlock>();
-      std::tie(block->bytes, block->file_offset) = image.function(target - location.bias);
+      auto function = image.function(target - location.bias);
+      block->bytes = std::move(function.bytes);
+      block->file_offset = function.file_offset;
       if (!matches_runtime_bytes(target, location, *block))
         throw std::runtime_error("runtime callee bytes disagree with the mapped ELF");
       const auto decoded = native_entry::scan(target, block->bytes);
-      const bool nonleaf = !decoded.decode_failed && decoded.diagnostic.empty() &&
-          std::ranges::any_of(decoded.instructions, [](const auto &inst) {
+      const bool decode_verified = !decoded.decode_failed && decoded.diagnostic.empty() &&
+          !decoded.instructions.empty();
+      const bool nonleaf = decode_verified &&
+          std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto &inst) {
             return inst.flow == NativeFlow::call;
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
+      if (function.weak && nonleaf) {
+        gap = static_cast<std::uint8_t>(DispatchGap::weak_scope);
+        remember_rejection(image_key, target, DispatchGap::weak_scope, false);
+        throw std::runtime_error("dynamically exported weak function cannot be redirected safely");
+      }
+      if (!decode_verified) {
+        remember_rejection(image_key, target, DispatchGap::translation_failed, false);
+        throw std::runtime_error("runtime callee has permanently unsupported verified bytes");
+      }
       if (nonleaf) {
+        if (outside_plt_scope) {
+          gap = static_cast<std::uint8_t>(DispatchGap::outside_plt_scope);
+          remember_rejection(image_key, target, DispatchGap::outside_plt_scope, true);
+          throw std::runtime_error("PLT target is outside the executable and calling library");
+        }
         const auto first_slot = watch.runtime_count;
         prepare_runtime_scope(*block, watch, target, module_index, decoded);
         if (!location.main_image) {
@@ -4445,8 +5004,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         block->mapping = translate(block->sites, function, xstate, nullptr, &block->tail_entry);
       }
       if (!watch.recycler_started) {
-        std::thread(reclaim_code, &watch).detach();
-        watch.recycler_started = true;
+        start_recycler(watch);
       }
       if (fresh) {
         auto *module = watch.channel->module(watch.event_buffer, module_index - 1);
@@ -4492,9 +5050,16 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // The real application call still enters its original callee.
     }
   }
+  watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+  const auto bit = std::uint32_t{1} << gap;
+  const bool already_reported =
+      (__atomic_fetch_or(&site->dispatch_gap_mask, bit, __ATOMIC_RELAXED) & bit) != 0;
+  if (already_reported)
+    return fallback;
   Observation event{};
   event.pc = site->instruction.pc;
   event.destination = target;
+  event.runtime_module = site->runtime_module;
   event.hook = Hook::dispatch_gap;
   event.gap = gap;
   emit(watch, event);
@@ -4562,7 +5127,7 @@ void initialize(Init &init
       spec.set_snapshot_max_bytes(specification.snapshot_max_bytes());
       spec.set_snapshot_max_string_bytes(specification.max_string_bytes());
       spec.set_snapshot_max_depth(specification.snapshot_max_depth());
-      for (const auto &source : std::span(snapshot->read_only).first(snapshot->read_only_count)) {
+      for (const auto &source : ::tracer::compat::span(snapshot->read_only).first(snapshot->read_only_count)) {
         auto &range = *spec.add_snapshot_rtti_ranges();
         range.set_begin(source.begin);
         range.set_end(source.end);
@@ -4571,7 +5136,10 @@ void initialize(Init &init
     }
   }
 #endif
+  prepare_identity_pid_cache();
   watch->pid = ::getpid();
+  watch->identity_watch_id = init.identity_watch_id;
+  watch->provisional_method_watch = init.provisional_method_watch;
   watch->offset = init.scalar;
   if (init.field_width != 1 && init.field_width != 2 && init.field_width != 4 && init.field_width != 8)
     throw std::runtime_error("invalid native write field width");
@@ -4627,16 +5195,70 @@ void initialize(Init &init
         !module || module->l_addr != init.module_bias)
       throw std::runtime_error("cannot pin the verified shared image at its live load bias");
   }
-  const std::span functions(init.functions, init.function_count);
+  const ::tracer::compat::span functions(init.functions, init.function_count);
   for (const auto &function : functions)
     for (std::size_t i = 0; i < function.count; ++i)
       watch->sites.push_back({function.instructions[i], watch.get(), function.instructions[0].pc});
+  if (watch->identity_watch_id) {
+    bool constructor_entry = false, constructor_return = false;
+    bool destructor_entry = false, destructor_return = false;
+    struct ConstructorCoverage {
+      bool entered = false;
+      bool uncertain = true;
+      bool returned = false;
+    };
+    std::map<Address, ConstructorCoverage> constructors;
+    for (const auto &site : watch->sites) {
+      switch (site.instruction.hook) {
+      case Hook::constructor_enter: {
+        constructor_entry = true;
+        auto &coverage = constructors[site.instruction.boundary_pc];
+        coverage.entered = true;
+        coverage.uncertain &= site.instruction.uncertain_construct;
+        break;
+      }
+      case Hook::constructor_return:
+        constructor_return = true;
+        constructors[site.instruction.boundary_pc].returned = true;
+        break;
+      case Hook::create:
+        constructor_entry = constructor_return = true;
+        break;
+      case Hook::destructor_enter:
+      case Hook::destroy_begin:
+        destructor_entry = true;
+        break;
+      case Hook::destructor_return:
+      case Hook::destroy_end:
+        destructor_return = true;
+        break;
+      case Hook::destroy_both:
+        destructor_entry = destructor_return = true;
+        break;
+      default: break;
+      }
+    }
+    const bool all_constructors_provisional = !constructors.empty() &&
+        ::tracer::compat::ranges::all_of(constructors, [](const auto &entry) {
+          const auto &coverage = entry.second;
+          return coverage.entered && coverage.uncertain && coverage.returned;
+        });
+    // A method-only group may still observe exact constructors when no
+    // destructor boundary is available. It can support provisional calls,
+    // but must never create lifetime IDs from that incomplete coverage.
+    const bool method_only = watch->no_values && !watch->value_write.active();
+    const bool provisional_coverage = method_only && constructor_entry && constructor_return &&
+        !destructor_entry && !destructor_return && all_constructors_provisional &&
+        watch->complete_constructor_returns.empty();
+    watch->identity_lifecycle_covered = (constructor_entry && constructor_return &&
+        destructor_entry && destructor_return) || provisional_coverage;
+  }
   const XState xstate;
   std::size_t first = 0;
   for (auto &function : functions) {
     if (!function.count)
       continue;
-    auto sites = std::span(watch->sites).subspan(first, function.count);
+    auto sites = ::tracer::compat::span(watch->sites).subspan(first, function.count);
     install_static_fragment(*watch, sites, function, xstate);
     first += function.count;
   }
@@ -4644,16 +5266,79 @@ void initialize(Init &init
   if (!watch->static_bodies.empty())
     watch->channel->static_fragments.store(watch->static_bodies.size(), std::memory_order_release);
   if (!watch->static_bodies.empty() || (watch->module_pin && watch->runtime_limit)) {
-    std::thread(reclaim_code, watch.get()).detach();
-    watch->recycler_started = true;
+    start_recycler(*watch);
   }
   watch->previous = retained.load(std::memory_order_relaxed);
   retained.store(watch.release(), std::memory_order_release);
 }
 } // namespace
+
+namespace identity {
+std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) noexcept {
+  try {
+    if (!watch_id || !receiver)
+      return std::nullopt;
+    auto *watch = retained.load(std::memory_order_acquire);
+    while (watch && watch->identity_watch_id != watch_id)
+      watch = watch->previous;
+    if (!watch || identity_lookup_pid() != watch->pid || !watch->identity_lifecycle_covered ||
+        !(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+
+    if (::tracer::compat::ranges::any_of(lifecycle_frames, [&](const auto &frame) {
+          return frame.watch == watch && frame.event.object == receiver;
+        }))
+      return std::nullopt;
+
+    if (watch->receiver_typeinfo &&
+        !matches_type(receiver, watch->receiver_typeinfo, watch->borrow.base_offset))
+      return std::nullopt;
+    std::shared_lock identity_lock(watch->identity_mutex);
+    if (!watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
+    }
+    if (!watch->provisional_method_watch)
+      return Identity{};
+    if (const auto history = watch->generations.find(receiver);
+        history != watch->generations.end() &&
+        (history->second.uncertain_live || history->second.provisional_live))
+      return Identity{};
+
+    // A method can observe a receiver constructed without a hooked entry,
+    // including a trivial copy in storage used by an earlier lifetime.
+    identity_lock.unlock();
+    const std::lock_guard lock(watch->mutex);
+    const std::unique_lock exclusive_lock(watch->identity_mutex);
+    if (!(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
+    }
+    auto &history = watch->generations[receiver];
+    if (!history.uncertain_live && !history.provisional_live) {
+      history.observed = true;
+      history.provisional_live = true;
+      history.provisional_reason = ProvisionalReason::unobserved_construction;
+    }
+    return Identity{};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+} // namespace identity
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v37(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v41(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;
@@ -4664,7 +5349,7 @@ extern "C" int tracer_agent_object_cache_v37(tracer::object_cache::Init *request
 }
 
 #if defined(__aarch64__)
-extern "C" int tracer_agent_arm_snapshot_v2(tracer::arm_snapshot::Init *request) {
+extern "C" int tracer_agent_arm_snapshot_v3(tracer::arm_snapshot::Init *request) {
   try {
     tracer::object_cache::initialize(request->code, request);
     return 0;

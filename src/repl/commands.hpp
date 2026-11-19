@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tracer_repl {
@@ -12,6 +13,21 @@ enum class CommandKind {
   server_status,
   server_stop,
   attach,
+  launch,
+  children,
+  resume,
+  terminate,
+  target_call,
+  target_call_result,
+  syscalls,
+  sample_cpu,
+  sample_allocations,
+  faults,
+  watchpoint,
+  instructions_start,
+  instructions_stop,
+  instructions_replay,
+  library_load,
   processes,
   sessions,
   use,
@@ -28,11 +44,33 @@ enum class CommandKind {
   memory_maps,
   memory_read,
   memory_scan,
+  memory_patch,
+  memory_write,
+  memory_allocate,
+  memory_free,
+  memory_restore,
+  memory_import_hook,
+  page_monitor_start,
+  page_monitor_stop,
+  live_update,
+  live_preview,
+  live_watch,
+  live_status,
+  live_revert,
+  live_recover,
+  live_mock,
+  live_update_data,
+  live_scan_heap,
   object_start,
   object_prepare,
   object_preview,
   object_status,
   object_stop,
+  object_probe_prepare,
+  object_probe_preview,
+  object_probe_start,
+  object_probe_status,
+  object_probe_stop,
   probe_entry,
   probe_reload,
   prepare,
@@ -63,6 +101,16 @@ enum class CommandKind {
   cpp_import,
   cpp_generate,
   cpp_options,
+  plugin_load,
+  plugin_enable,
+  plugin_disable,
+  plugin_reload,
+  plugin_list,
+  plugin_run,
+  plugin_commands,
+  agent_plugin_load,
+  agent_plugin_reload,
+  agent_plugin_run,
   shell,
   complete,
   type,
@@ -93,7 +141,10 @@ struct Command {
   std::uint64_t number(const std::string &name, std::uint64_t fallback) const;
 };
 
-Command parse_command(const std::string &input);
+inline constexpr std::size_t max_command_size = 65536;
+std::size_t command_continuation(std::string_view line);
+void normalize_command_continuations(std::string &input);
+Command parse_command(std::string input);
 std::uint64_t unsigned_number(const std::string &text, const std::string &name,
                               std::uint64_t maximum = UINT64_MAX);
 std::uint64_t address_number(const std::string &text);

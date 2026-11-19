@@ -1,6 +1,6 @@
 #pragma once
+#include "tracer/compat.hpp"
 #include <array>
-#include <span>
 #include <string_view>
 
 #include "tracer/protocol.hpp"
@@ -37,7 +37,7 @@ inline std::uint64_t strip_return_signature(std::uint64_t pc) noexcept {
 using NativeCodeRegisters = std::array<std::uint64_t, 17>;
 #endif
 NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
-    std::span<std::uint64_t> pcs, std::span<std::uint64_t> stack_pointers) noexcept;
+    ::tracer::compat::span<std::uint64_t> pcs, ::tracer::compat::span<std::uint64_t> stack_pointers) noexcept;
 } // namespace tracer
 
 #if defined(__x86_64__)

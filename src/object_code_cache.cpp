@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_code_cache.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <poll.h>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -34,6 +36,7 @@
 #include "object_watch_plan.hpp"
 #include "object_watch.hpp"
 #include "proc_identity.hpp"
+#include "mapped_path.hpp"
 #include "tracer/protocol.hpp"
 
 namespace tracer::object_cache {
@@ -51,12 +54,15 @@ struct SharedFile {
       throw std::invalid_argument("shared-file capture requires an absolute server-local path");
     descriptor = ::open(path.c_str(), O_PATH | O_CLOEXEC);
     struct stat info{};
-    if (descriptor < 0 || ::fstat(descriptor, &info) || !S_ISREG(info.st_mode) || !info.st_ino) {
+    if (descriptor < 0 || ::fstat(descriptor, &info) || !S_ISREG(info.st_mode)) {
       if (descriptor >= 0)
         ::close(descriptor);
       throw std::invalid_argument("cannot pin the regular file selected for shared storage");
     }
-    identity = {info.st_dev, info.st_ino};
+    identity.device = info.st_dev;
+    identity.inode = info.st_ino;
+    const auto reference = "/proc/" + std::to_string(::getpid()) + "/fd/" + std::to_string(descriptor);
+    std::copy(reference.begin(), reference.end(), identity.reference.begin());
   }
   ~SharedFile() {
     if (descriptor >= 0)
@@ -68,7 +74,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v37";
+  constexpr char export_name[] = "tracer_agent_object_cache_v41";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -205,7 +211,7 @@ Dispatch verify_dispatch(const object_watch::Plan &plan, Address getter) {
 std::pair<Address, std::size_t> entry_patch_window(Address entry, std::string_view bytes) {
   const auto decoded = native_entry::scan(entry, bytes);
   auto start = entry;
-  if (bytes.starts_with("\xf3\x0f\x1e\xfa"))
+  if (::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa"))
     start += 4; // Preserve the landing instruction for an indirect caller.
   std::size_t size = 0;
   for (const auto &inst : decoded.instructions) {
@@ -320,16 +326,21 @@ api::ModuleMapping code_mapping(const api::ListModulesResponse &maps,
   for (const auto &mapping : maps.mappings())
     if (mapping.path() == path && mapping.begin_address() <= pc &&
         pc < mapping.end_address() && size <= mapping.end_address() - pc &&
-        mapping.inode() && (allow_without_build_id || !mapping.build_id().empty()))
+        (allow_without_build_id || !mapping.build_id().empty()))
       return mapping;
   throw std::runtime_error("code-cache patch has no verified live file-backed executable mapping");
 }
 } // namespace
 
 struct Watch::Impl {
+  struct PidFd {
+    int value = -1;
+    ~PidFd() { if (value >= 0) ::close(value); }
+  } process_handle;
   api::ObjectWatchRequest request;
   std::uint64_t id;
   std::uint32_t pid;
+  const bool verify_method_lifetimes;
   const std::uint64_t process_start;
   const std::string executable;
   std::function<void(api::TraceEvent)> publish;
@@ -349,18 +360,24 @@ struct Watch::Impl {
   std::map<Address, Address> resume_targets;
   std::map<Address, object_watch::Source> sources;
   std::string path;
+  // Retain procfs's pathname after the channel is unlinked and path is cleared.
+  std::string mapped_channel_path;
   Channel *channel = nullptr;
-  struct stat channel_identity{};
   const SharedFile shared_file;
   const std::size_t event_buffer;
   const std::size_t runtime_limit;
   std::vector<api::ObjectWatchStatus::Redirect> redirects;
   std::atomic<std::uint64_t> head{0}, publish_errors{0}, coverage_gaps{0};
   std::map<std::uint64_t, api::TraceEvent> open_lifetimes;
-  std::uint64_t final_observations = 0;
-  std::jthread pump;
-  std::jthread admissions;
+  std::atomic<std::uint64_t> final_observations{0};
+  std::atomic<bool> closure_emitted{false};
+  std::atomic<bool> published{false};
+  std::thread pump;
+  std::atomic<bool> stop_pump{false};
+  std::thread admissions;
+  std::atomic<bool> stop_admissions{false};
   mutable std::mutex admission_mutex;
+  std::mutex finish_mutex;
   std::string admission_failure;
   std::string admission_diagnostic;
   bool installed = false, draining = false;
@@ -368,22 +385,25 @@ struct Watch::Impl {
 
   Impl(const api::ObjectWatchRequest &spec, std::uint64_t watch_id, std::uint32_t target,
        const std::string &executable, const std::string &event_path,
-       std::function<void(api::TraceEvent)> sink)
+       std::function<void(api::TraceEvent)> sink, bool verify_method_lifetimes)
       : request(spec), id(watch_id), pid(target),
+        verify_method_lifetimes(verify_method_lifetimes),
         process_start(pid ? proc::start_time(proc::directory(pid) / "stat") : 0),
         executable(executable), publish(std::move(sink)),
-        plan(target, executable, spec), shared_file(spec.shared_file()),
+        plan(target, executable, spec, verify_method_lifetimes), shared_file(spec.shared_file()),
         event_buffer(spec.event_buffer() ? spec.event_buffer() : default_event_buffer),
         runtime_limit(spec.follow_calls() ? (spec.runtime_limit() ? spec.runtime_limit() :
                                              default_runtime_limit) : 0) {
+#if defined(SYS_pidfd_open)
+    if (request.staged_registration())
+      process_handle.value = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+#endif
     if (event_buffer < 2 || event_buffer > max_event_buffer)
       throw std::runtime_error("invalid code-cache event buffer size");
     if (runtime_limit > max_runtime_limit || (spec.runtime_limit() && !spec.follow_calls()))
       throw std::invalid_argument("invalid runtime code-cache translation limit");
     admitted_stores = plan.stores;
-    if (request.follow_calls() && ((request.first_seen() && !plan.layout.value_write.active()) ||
-        request.writer_entry() || plan.caller_start || !request.owner_type().empty() ||
-        plan.layout.logical_collection()))
+    if (request.follow_calls() && !plan.follow_calls_eligible(request))
       throw std::invalid_argument("runtime call following requires a standalone writer scope");
 #if defined(__aarch64__)
     prepare_arm_fragments();
@@ -391,9 +411,9 @@ struct Watch::Impl {
       for (const auto &[start, bytes] : plan.writer_ranges)
         prepare_runtime_calls(native_entry::scan(start, bytes));
 #else
-    const bool complex_nonleaf = plan.layout.value_write.active() && [&] {
+    const bool complex_nonleaf = request.first_seen() && plan.layout.value_write.active() && [&] {
       const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
-      return std::ranges::any_of(body.instructions, [](const auto &inst) {
+      return std::any_of(std::begin(body.instructions), std::end(body.instructions), [](const auto &inst) {
         return inst.flow == NativeFlow::call;
       });
     }();
@@ -415,7 +435,7 @@ struct Watch::Impl {
         const bool fragments = !request.first_seen() &&
             (!plan.shared_writer() || request.follow_calls()) &&
             !plan.caller_start && !request.writer_entry() &&
-            std::ranges::any_of(body.instructions, [](const auto &inst) {
+            std::any_of(std::begin(body.instructions), std::end(body.instructions), [](const auto &inst) {
               return inst.flow == NativeFlow::call;
             });
         fragmented_writer |= fragments;
@@ -423,7 +443,7 @@ struct Watch::Impl {
           admitted_stores += prepare_writer_fragments(body);
         } else {
           auto function = verify_function(plan, start, bytes.size(), {});
-          admitted_stores += std::ranges::count_if(function, [](const auto &inst) {
+          admitted_stores += std::count_if(std::begin(function), std::end(function), [](const auto &inst) {
             return writer(inst.hook);
           });
           functions.push_back(std::move(function));
@@ -441,8 +461,10 @@ struct Watch::Impl {
           if (inst.size == 1 && inst.bytes[0] == 0xc3)
             inst.hook = Hook::collection_end;
       }
-      if (!plan.caller_start && (!plan.shared_writer() || request.follow_calls())) {
-        fragmented_lifecycle = plan.layout.primary_rtti || plan.virtual_destructor ||
+      if (plan.lifetimes_only ||
+          (!plan.caller_start &&
+           (verify_method_lifetimes || !plan.shared_writer() || request.follow_calls()))) {
+        fragmented_lifecycle = plan.lifetimes_only || plan.layout.primary_rtti || plan.virtual_destructor ||
             !plan.delegating_constructor_tails.empty() || !request.owner_type().empty() ||
             std::any_of(plan.boundaries.begin(), plan.boundaries.end(), [&](const auto &entry) {
               const auto [pc, size] = entry;
@@ -504,7 +526,7 @@ struct Watch::Impl {
           const auto enter = constructor ? Hook::constructor_enter : Hook::destructor_enter;
           const auto leave = constructor ? Hook::constructor_return : Hook::destructor_return;
           const bool needs_entry = constructor ?
-              std::ranges::any_of(plan.delegating_constructor_tails,
+              std::any_of(plan.delegating_constructor_tails.begin(), plan.delegating_constructor_tails.end(),
                   [&](const auto &tail) { return tail.second == pc; }) : plan.virtual_destructor;
           const auto fragment_count = functions.size();
           try {
@@ -523,10 +545,10 @@ struct Watch::Impl {
               std::rethrow_exception(fragment_error);
             }
             if (needs_entry) {
-              if (plan.code(pc).starts_with("\xf3\x0f\x1e\xfa"))
+              if (::tracer::compat::starts_with(plan.code(pc), "\xf3\x0f\x1e\xfa"))
                 leaf.erase(leaf.begin());
               if (leaf.empty() ||
-                  std::ranges::any_of(leaf, [](const auto &inst) { return inst.flow != Flow::copy; }))
+                  std::any_of(std::begin(leaf), std::end(leaf), [](const auto &inst) { return inst.flow != Flow::copy; }))
                 throw std::runtime_error(constructor ? "delegating constructor target has no verified entry redirect" :
                     "virtual destructor has no verified entry redirect; indirect destruction would be missed");
             } else if (plan.direct_redirects({pc}).at(pc) != plan.direct_redirects({pc}, true).at(pc)) {
@@ -535,7 +557,7 @@ struct Watch::Impl {
             if (leaf.size() == 1 && !constructor && leaf.front().bytes[0] == 0xc3) {
               leaf.front().hook = Hook::destroy_both;
             } else {
-              if (leaf.size() < 2 || std::ranges::any_of(leaf, [&](const auto &inst) {
+              if (leaf.size() < 2 || std::any_of(std::begin(leaf), std::end(leaf), [&](const auto &inst) {
                     return inst.flow != Flow::copy && inst.target == pc;
                   }))
                 throw;
@@ -673,20 +695,23 @@ struct Watch::Impl {
     }
     if (event_path.empty())
       return;
-    path = (std::filesystem::path(event_path).parent_path() / "object-cache-XXXXXX").string();
+    path = (std::filesystem::canonical(std::filesystem::absolute(event_path).parent_path()) /
+            "object-cache-XXXXXX").string();
     const auto fd = ::mkostemp(path.data(), O_CLOEXEC);
     if (fd < 0)
       throw std::runtime_error("cannot create a private code-cache event channel");
     void *memory = MAP_FAILED;
     const auto size = Channel::mapping_size(event_buffer, runtime_limit);
-    if (::fstat(fd, &channel_identity) == 0 && ::ftruncate(fd, size) == 0)
+    if (::ftruncate(fd, size) == 0)
       memory = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (memory == MAP_FAILED) {
       ::unlink(path.c_str());
       throw std::runtime_error("cannot map the code-cache event channel");
     }
+    mapped_channel_path = path;
     channel = new (memory) Channel;
+    channel->registration_active.store(!request.staged_registration(), std::memory_order_relaxed);
     for (std::size_t index = 0; index < event_buffer; ++index) {
       auto *slot = new (channel->slot(index)) Slot;
       slot->turn.store(index, std::memory_order_relaxed);
@@ -727,10 +752,10 @@ struct Watch::Impl {
     // verify_function has already verified the entire leaf, including faulting
     // instructions. The jump can replace those instructions because the
     // translated body executes them with their original application PCs.
-    const auto &leaf = *std::ranges::find_if(functions, [&](const auto &function) {
+    const auto &leaf = *std::find_if(std::begin(functions), std::end(functions), [&](const auto &function) {
       return function.front().pc == start;
     });
-    const auto patch = bytes.starts_with("\xf3\x0f\x1e\xfa") ? start + 4 : start;
+    const auto patch = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? start + 4 : start;
     auto end = patch;
     for (const auto &inst : leaf) {
       if (inst.pc < patch)
@@ -749,12 +774,13 @@ struct Watch::Impl {
       std::vector<Address> interior;
       for (auto pc = patch + 1; pc < end; ++pc)
         interior.push_back(pc);
-      if (std::ranges::any_of(plan.direct_redirects(interior), [](const auto &edge) {
+      const auto edges = plan.direct_redirects(interior);
+      if (std::any_of(edges.begin(), edges.end(), [](const auto &edge) {
             return !edge.second.empty();
           }))
         throw std::runtime_error("an application edge enters the code-cache writer redirect");
     }
-    if (std::ranges::any_of(leaf, [&](const auto &inst) {
+    if (std::any_of(std::begin(leaf), std::end(leaf), [&](const auto &inst) {
           return inst.flow != Flow::copy && inst.target > patch && inst.target < end;
         }))
       throw std::runtime_error("an application edge enters the code-cache writer redirect");
@@ -793,14 +819,14 @@ struct Watch::Impl {
       const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
       for (const auto &[entry, mutation] : plan.inline_mutations) {
         const auto add_anchor = [&](Address pc) {
-          const auto existing = std::ranges::find_if(functions, [&](const auto &fragment) {
+          const auto existing = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
             return fragment.front().pc == pc;
           });
           if (existing != functions.end()) {
             inline_mutation_anchor(existing->front(), mutation);
             return;
           }
-          const auto anchor = std::ranges::find_if(body.instructions, [&](const auto &candidate) {
+          const auto anchor = std::find_if(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
             return candidate.address == pc;
           });
           if (anchor == body.instructions.end() || anchor->flow != NativeFlow::ordinary ||
@@ -855,14 +881,14 @@ struct Watch::Impl {
       const auto body = native_entry::scan(pc, plan.code(pc).substr(0, size));
       if (body.decode_failed || !body.diagnostic.empty() || body.instructions.empty())
         throw std::runtime_error("cannot verify AArch64 lifetime instructions");
-      const auto external_tail = std::ranges::count_if(body.instructions, [&](const auto &candidate) {
+      const auto external_tail = std::count_if(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
         return candidate.flow == NativeFlow::branch && candidate.target &&
             (*candidate.target < pc || *candidate.target - pc >= size);
       });
       if (external_tail && (!site.deleting_destructor || external_tail != 1))
         throw std::runtime_error("AArch64 lifetime boundary has an unverified outgoing branch");
       auto entry = body.instructions.begin();
-      if (entry->text.starts_with("bti"))
+      if (::tracer::compat::starts_with(entry->text, "bti"))
         ++entry;
       if (entry != body.instructions.end() &&
           (entry->text == "paciasp" || entry->text == "pacibsp"))
@@ -888,7 +914,7 @@ struct Watch::Impl {
       if (entry == body.instructions.end() || !entry->cache_copyable ||
           entry->flow != NativeFlow::ordinary)
         throw std::runtime_error("AArch64 lifetime entry cannot be safely relocated");
-      const auto existing = std::ranges::find_if(functions, [&](const auto &fragment) {
+      const auto existing = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
         return fragment.front().pc == entry->address;
       });
       if (enter == Hook::collection_enter && existing != functions.end() && writer(existing->front().hook)) {
@@ -904,13 +930,13 @@ struct Watch::Impl {
         const auto writer_body = native_entry::scan(plan.writer_start, plan.writer_bytes);
         const auto successors = mutation_successors(writer_body, pc);
         for (const auto next : successors) {
-          const auto successor = std::ranges::find_if(writer_body.instructions, [&](const auto &inst) {
+          const auto successor = std::find_if(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &inst) {
             return inst.address == next;
           });
           if (successor == writer_body.instructions.end() || !successor->cache_copyable ||
               successor->flow != NativeFlow::ordinary)
             throw std::runtime_error("collection mutation has no relocatable original successor");
-          const auto patch = std::ranges::find_if(functions, [&](const auto &fragment) {
+          const auto patch = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
             return fragment.front().pc == next && writer(fragment.front().hook);
           });
           if (patch != functions.end()) {
@@ -979,7 +1005,7 @@ struct Watch::Impl {
     const auto body = native_entry::scan(pc, bytes);
     const auto &code = body.instructions;
     if (!body.decode_failed && body.diagnostic.empty() && !code.empty()) {
-      const auto first_call = std::ranges::find_if(code, [](const auto &inst) {
+      const auto first_call = std::find_if(std::begin(code), std::end(code), [](const auto &inst) {
         return inst.flow != NativeFlow::ordinary || !inst.falls_through;
       });
       // A D0 that directly forwards its receiver to a watched D1 needs
@@ -991,12 +1017,12 @@ struct Watch::Impl {
           native_entry::forwards_receiver(pc, bytes.substr(0, first_call->address - pc)))
         return;
       const auto &tail = code.back();
-      const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+      const auto start = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
       // An inlined D1 followed by a tail jump to operator delete is done
       // destroying the object by the time execution reaches that jump.
       if (tail.flow == NativeFlow::branch && !tail.falls_through && tail.target &&
           plan.is_delete_target(*tail.target) &&
-          std::ranges::none_of(code, [&](const auto &inst) {
+          std::none_of(std::begin(code), std::end(code), [&](const auto &inst) {
             return inst.address != tail.address && inst.flow == NativeFlow::branch &&
                 (!inst.target || *inst.target < pc || *inst.target - pc >= size);
           })) {
@@ -1131,7 +1157,7 @@ struct Watch::Impl {
             if (end - start >= 10)
               break;
           }
-          if (end - start < 10 || std::ranges::any_of(body.instructions, [&](const auto &inst) {
+          if (end - start < 10 || std::any_of(std::begin(body.instructions), std::end(body.instructions), [&](const auto &inst) {
                 return inst.target && *inst.target > start && *inst.target < end;
               }))
             prefix.clear();
@@ -1139,8 +1165,8 @@ struct Watch::Impl {
         }
       }
       const auto start = prefix.empty() ? call.address : prefix.front().pc;
-      const bool overlaps = std::ranges::any_of(incoming, [&](const auto &redirects) {
-        return std::ranges::any_of(redirects.second, [&](Address pc) {
+      const bool overlaps = std::any_of(std::begin(incoming), std::end(incoming), [&](const auto &redirects) {
+        return std::any_of(std::begin(redirects.second), std::end(redirects.second), [&](Address pc) {
           return pc < end && start < pc + patch_size(pc);
         });
       });
@@ -1191,7 +1217,7 @@ struct Watch::Impl {
           return inst.falls_through || !constructor;
         }))
       throw std::runtime_error("cannot verify native lifetime instruction boundaries");
-    const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+    const auto start = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
     auto entry = straight_fragment(plan, body, start, enter);
     if (entry.empty())
       throw std::runtime_error("lifetime entry is too short for a native redirect");
@@ -1205,7 +1231,7 @@ struct Watch::Impl {
     std::vector<ExitFragment> returns;
     const auto original_entry = entry;
     Address next_relay = start + 5;
-    const bool constructor_tail = constructor && std::ranges::any_of(body.instructions, exits_function);
+    const bool constructor_tail = constructor && std::any_of(std::begin(body.instructions), std::end(body.instructions), exits_function);
     bool need_successors = constructor_tail;
     const auto overlaps_entry = [&](const auto &fragment) {
       return fragment.front().pc < entry.back().pc + entry.back().size &&
@@ -1217,11 +1243,12 @@ struct Watch::Impl {
         interior.push_back(byte);
       // Check the original graph as well. The direct-edge index deliberately
       // ignores a function's own back edge to its entry.
-      if (std::ranges::any_of(body.instructions, [&](const auto &candidate) {
+      if (std::any_of(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
             return candidate.target && *candidate.target > begin && *candidate.target < end;
           }))
         return false;
-      return std::ranges::all_of(plan.direct_redirects(interior), [](const auto &edge) {
+      const auto edges = plan.direct_redirects(interior);
+      return std::all_of(edges.begin(), edges.end(), [](const auto &edge) {
         return edge.second.empty();
       });
     };
@@ -1231,7 +1258,7 @@ struct Watch::Impl {
       const bool tail = exits_function(inst);
       if (inst.flow != NativeFlow::returns && !tail)
         continue;
-      if (std::ranges::any_of(returns, [&](const auto &exit) {
+      if (std::any_of(std::begin(returns), std::end(returns), [&](const auto &exit) {
             return exit.code.back().pc == inst.address;
           }))
         continue;
@@ -1296,7 +1323,7 @@ struct Watch::Impl {
           continue;
         const auto entry_end = expanded.back().pc + expanded.back().size;
         if (entry_end > candidate.address || overlaps_fragment(start, entry_end) ||
-            std::ranges::any_of(returns, [&](const auto &exit) {
+            std::any_of(std::begin(returns), std::end(returns), [&](const auto &exit) {
               return exit.code.front().pc < entry_end;
             }) || !check_interior(start, entry_end) || !check_interior(candidate.address, end))
           continue;
@@ -1338,7 +1365,7 @@ struct Watch::Impl {
             overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
           throw std::runtime_error("lifetime return continuation has no disjoint native redirect");
         const auto end = fragment.back().pc + fragment.back().size;
-        if (std::ranges::any_of(roots, [&](const auto root) { return root >= next && root < end; }) ||
+        if (std::any_of(std::begin(roots), std::end(roots), [&](const auto root) { return root >= next && root < end; }) ||
             !check_interior(next, end))
           throw std::runtime_error("an application edge enters the lifetime return continuation");
         fragment.front().boundary_pc = pc;
@@ -1357,6 +1384,7 @@ struct Watch::Impl {
     }
   }
 
+#if defined(__x86_64__)
   void prepare_collection_fragments() {
     using NativeInstruction = native_entry::Instruction;
     const auto writer_body = native_entry::scan(plan.writer_start, plan.writer_bytes);
@@ -1364,7 +1392,7 @@ struct Watch::Impl {
       add_fragment(std::move(fragment), terminal);
     };
     const auto past_endbr = [&](Address pc) {
-      return plan.code(pc).starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+      return ::tracer::compat::starts_with(plan.code(pc), "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
     };
     add(straight_fragment(plan, writer_body, past_endbr(plan.writer_start), Hook::collection_enter), false);
     std::set<Address> covered_returns;
@@ -1596,7 +1624,7 @@ struct Watch::Impl {
     }
     admitted_stores = 0;
     for (const auto &fragment : functions)
-      admitted_stores += std::ranges::count_if(fragment, [](const auto &inst) {
+      admitted_stores += std::count_if(std::begin(fragment), std::end(fragment), [](const auto &inst) {
         return writer(inst.hook);
       });
     if (!admitted_stores && !request.logical_updates() && !request.follow_calls())
@@ -1608,19 +1636,34 @@ struct Watch::Impl {
     plan.unsupported += stores_in_writer - admitted_stores;
   }
 
+#endif
+
   std::size_t patch_size(Address pc) const {
     const auto window = entry_windows.find(pc);
     return window == entry_windows.end() ? 5 : window->second;
+  }
+
+  void stop_workers(bool collect_events) {
+    stop_admissions.store(true, std::memory_order_release);
+    if (admissions.joinable())
+      admissions.join();
+    if (collect_events) {
+      stop_pump.store(true, std::memory_order_release);
+      if (pump.joinable())
+        pump.join();
+    }
   }
 
   ~Impl() {
     if (!channel)
       return;
     channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
+    channel->registration_active.store(false, std::memory_order_release);
     if (!installed && !draining)
       request_reclaim(*channel);
-    admissions = {};
-    pump = {};
+    stop_workers(true);
+    if (request.staged_registration() && published.load(std::memory_order_acquire))
+      close_observations(api::ObjectObservation::WATCH_DETACHED);
     ::munmap(channel, Channel::mapping_size(event_buffer, runtime_limit));
     ::unlink(path.c_str());
   }
@@ -1632,6 +1675,8 @@ struct Watch::Impl {
     event.set_pid(pid);
     event.set_tid(sample.tid);
     event.set_probe_id(id);
+    if (request.staged_registration())
+      event.set_object_probe_registration_id(id);
     event.set_probe_sequence(sequence);
     event.set_agent_dropped_events(channel->dropped.load(std::memory_order_relaxed));
     event.set_monotonic_time_ns(sample.time);
@@ -1679,7 +1724,7 @@ struct Watch::Impl {
     item.set_borrow_id(sample.borrow_id);
     item.set_storage_generation(sample.storage_generation);
     item.set_concrete_type(request.concrete_type());
-    item.set_external_write_order_unknown(shared_file.identity.inode != 0);
+    item.set_external_write_order_unknown(shared_file.identity.active());
     if (sample.has_shared_file_offset) {
       auto &storage = *item.mutable_shared_storage();
       storage.set_device(shared_file.identity.device);
@@ -1714,10 +1759,29 @@ struct Watch::Impl {
       item.set_closure_reason(Observation::UNWOUND);
       item.set_diagnostic("constructor unwound without a verified return");
     } else if (sample.hook == Hook::construction_uncertain) {
-      item.set_diagnostic(sample.gap ? "complete and base constructors share the same entry" :
-                                      "constructor returned with an unverified receiver");
-    } else if (sample.hook == Hook::destroy_end) {
-      item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
+      const char *reason = "constructor returned with an unverified receiver";
+      if (sample.gap)
+        reason = request.staged_registration() ? "complete-object construction could not be verified" :
+                                                "complete and base constructors share the same entry";
+      item.set_diagnostic(reason);
+    } else if (sample.hook == Hook::destroy_begin || sample.hook == Hook::destroy_end) {
+      if (sample.hook == Hook::destroy_end)
+        item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
+      if (request.staged_registration() && !sample.id) {
+        if (sample.provisional_reason == ProvisionalReason::instance_limit)
+          item.set_diagnostic(
+              "provisional destructor boundary after receiver admission limit; "
+              "complete-object construction was verified");
+        else if (sample.provisional_reason == ProvisionalReason::uncertain_construction)
+          item.set_diagnostic(
+              "provisional destructor boundary with unverified complete-object construction");
+        else if (sample.provisional_reason == ProvisionalReason::unobserved_construction)
+          item.set_diagnostic(
+              "provisional destructor boundary for a receiver whose construction was not observed");
+        else
+          item.set_diagnostic(
+              "provisional destructor boundary without a verified lifetime identity");
+      }
     } else if (sample.hook == Hook::lifetime_reused) {
       item.set_closure_reason(Observation::SCOPE_CHANGED);
       item.set_diagnostic("receiver storage reused without an observed destructor");
@@ -1726,8 +1790,8 @@ struct Watch::Impl {
       item.set_diagnostic("asynchronous signal " + std::to_string(sample.gap) +
                           " arrived in a generated helper; application PC unavailable");
     if (sample.hook == Hook::create)
-      item.set_field(plan.layout.union_tag_offset ? object_watch::field_path(request, plan.layout) :
-                     plan.layout.opaque_union ? "<storage>" : request.field());
+      item.set_field(!plan.layout.union_path.empty() ? object_watch::field_path(request, plan.layout) :
+                      plan.layout.opaque_union ? "<storage>" : request.field());
     if (store) {
       item.set_destination(sample.destination);
       item.set_field(object_watch::field_path(request, plan.layout));
@@ -1748,8 +1812,23 @@ struct Watch::Impl {
     }
     if (sample.hook == Hook::dispatch_gap) {
       item.set_destination(sample.destination);
-      item.set_diagnostic(sample.gap == 2 ? "runtime translation limit reached" :
-          "callee could not be translated from verified live executable bytes");
+      switch (static_cast<DispatchGap>(sample.gap)) {
+      case DispatchGap::runtime_limit:
+        item.set_diagnostic("runtime translation limit reached");
+        break;
+      case DispatchGap::lazy_plt:
+        item.set_diagnostic("callee ran natively while the PLT slot was lazily bound");
+        break;
+      case DispatchGap::outside_plt_scope:
+        item.set_diagnostic("PLT callee ran natively because its scope is outside the calling ELF and executable");
+        break;
+      case DispatchGap::weak_scope:
+        item.set_diagnostic("runtime callee ran natively because its weak export cannot be redirected safely");
+        break;
+      default:
+        item.set_diagnostic("callee could not be translated from verified live executable bytes");
+        break;
+      }
     }
     if (sample.hook == Hook::owner_gap)
       item.set_diagnostic("owner membership could not be verified at the original method boundary");
@@ -1757,7 +1836,7 @@ struct Watch::Impl {
       item.set_diagnostic("receiver admission limit reached");
     if (sample.hook == Hook::owner_remove && sample.gap)
       item.set_diagnostic("previous membership absent at transfer boundary");
-    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.inode)
+    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.active())
       item.set_synchronization(request.synchronization());
     if (sample.hook == Hook::collection_bound || sample.hook == Hook::collection_suspend) {
       item.set_destination(sample.destination);
@@ -1781,11 +1860,14 @@ struct Watch::Impl {
         item.set_diagnostic(messages[std::min<std::size_t>(sample.gap, std::size(messages) - 1)]);
       }
     }
-    if (sample.storage_write.size)
+    if (sample.hook == Hook::collection_gap && sample.gap == 10)
+      item.set_diagnostic("store intersects multiple live union objects");
+    if (sample.storage_write.size) {
       object_watch::set_storage_write(item, sample.storage_write,
           sample.values & 1 ? &sample.storage_before : nullptr,
           sample.values & 2 ? &sample.storage_after : nullptr);
-    else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
+      object_watch::set_union_write(item, plan.layout, sample.union_before, sample.union_after);
+    } else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
       object_watch::set_scalar_values(item, plan.layout,
           {sample.values & 1 ? std::optional(sample.old_value) : std::nullopt,
            sample.values & 4 ? std::optional(sample.old_tag) : std::nullopt},
@@ -1881,12 +1963,135 @@ struct Watch::Impl {
       coverage_gaps.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void collect(std::stop_token stop) noexcept {
-    std::uint64_t next = 0;
+  bool emit_final(api::TraceEvent &event, api::ObjectObservation::Kind kind,
+                  api::ObjectObservation::ClosureReason reason) noexcept {
+    const auto final = final_observations.load(std::memory_order_acquire);
+    const auto sequence = head.load(std::memory_order_acquire) + final;
+    if (request.max_events() && sequence >= request.max_events())
+      return false;
+    event.set_protocol_version(kProtocolVersion);
+    event.set_session_id(request.session_id());
+    event.set_pid(pid);
+    event.set_probe_id(id);
+    if (request.staged_registration())
+      event.set_object_probe_registration_id(id);
+    event.set_probe_sequence(sequence + 1);
+    event.set_agent_dropped_events(channel->dropped.load(std::memory_order_relaxed));
+    event.set_function_name("object.trace");
+    event.set_monotonic_time_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto &observation = *event.mutable_object_observation();
+    observation.set_kind(kind);
+    observation.set_concrete_type(request.concrete_type());
+    observation.set_source_unavailable(true);
+    observation.set_external_write_order_unknown(shared_file.identity.active());
+    observation.set_closure_reason(reason);
+    try {
+      publish(std::move(event));
+    } catch (...) {
+      publish_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    final_observations.fetch_add(1, std::memory_order_release);
+    return true;
+  }
+
+  void close_observations(api::ObjectObservation::ClosureReason reason) noexcept {
+    using Observation = api::ObjectObservation;
+    if (closure_emitted.exchange(true, std::memory_order_acq_rel))
+      return;
+    for (auto &[lifetime_id, event] : open_lifetimes) {
+      event.mutable_object_observation()->set_lifetime_id(lifetime_id);
+      if (!emit_final(event, Observation::OBSERVATION_ENDED, reason))
+        break;
+    }
+    open_lifetimes.clear();
+    if (request.staged_registration() && published.load(std::memory_order_acquire) &&
+        (reason == Observation::TARGET_EXITED || reason == Observation::WATCH_DETACHED)) {
+      api::TraceEvent event;
+      emit_final(event, Observation::OBSERVATION_ENDED, reason);
+    }
+  }
+
+  bool target_exited() const noexcept {
+    if (process_handle.value >= 0) {
+      pollfd descriptor{process_handle.value, POLLIN, 0};
+      const auto ready = ::poll(&descriptor, 1, 0);
+      if (ready > 0 && (descriptor.revents & (POLLIN | POLLHUP | POLLERR)))
+        return true;
+    }
+    try {
+      const auto stat_path = proc::directory(pid) / "stat";
+      std::ifstream stat(stat_path);
+      std::string line;
+      if (!std::getline(stat, line))
+        return true;
+      const auto close = line.rfind(')');
+      if (close == std::string::npos || close + 2 >= line.size())
+        return true;
+      const auto state = line[close + 2];
+      return state == 'Z' || state == 'X' || proc::start_time(stat_path) != process_start;
+    } catch (...) {
+      return true;
+    }
+  }
+
+  void drain_after_exit(std::uint64_t &next) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
     for (;;) {
+      const auto tail = channel->tail.load(std::memory_order_acquire);
+      if (next >= tail)
+        break;
+      auto &slot = *channel->slot(next % event_buffer);
+      if (slot.turn.load(std::memory_order_acquire) == next + 1) {
+        const auto event = slot.event;
+        slot.turn.store(next + event_buffer, std::memory_order_release);
+        try {
+          deliver(event, next + 1);
+        } catch (...) {
+          publish_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        head.store(++next, std::memory_order_release);
+        continue;
+      }
+      if (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      // A target that died while publishing may leave a reserved but
+      // incomplete sequence. Skip it after the bounded drain so later ready
+      // rows and the closure can still be delivered in order.
+      publish_errors.fetch_add(1, std::memory_order_relaxed);
+      ++next;
+      head.store(next, std::memory_order_release);
+    }
+  }
+
+  void collect() noexcept {
+    std::uint64_t next = 0;
+    auto next_process_check = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(100);
+    for (;;) {
+      const auto now = std::chrono::steady_clock::now();
+      if (request.staged_registration() &&
+          channel->registration_active.load(std::memory_order_acquire) &&
+          now >= next_process_check) {
+        next_process_check = now + std::chrono::milliseconds(100);
+        if (target_exited()) {
+          drain_after_exit(next);
+          channel->registration_active.store(false, std::memory_order_release);
+          channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
+          close_observations(api::ObjectObservation::TARGET_EXITED);
+          {
+            const std::lock_guard lock(admission_mutex);
+            installed = false;
+            diagnostic = "target exited";
+          }
+          return;
+        }
+      }
       auto &slot = *channel->slot(next % event_buffer);
       if (slot.turn.load(std::memory_order_acquire) != next + 1) {
-        if (stop.stop_requested())
+        if (stop_pump.load(std::memory_order_acquire))
           return;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
@@ -1955,8 +2160,8 @@ struct Watch::Impl {
               throw std::runtime_error("runtime scope instructions could not be verified");
             std::vector<Address> interior;
             for (const auto &patch : requested) {
-              const auto instruction = std::ranges::lower_bound(body.instructions, patch.pc, {},
-                                                               &native_entry::Instruction::address);
+              const auto instruction = std::lower_bound(body.instructions.begin(), body.instructions.end(), patch.pc,
+                  [](const auto &inst, Address address) { return inst.address < address; });
               if (instruction == body.instructions.end() || instruction->address != patch.pc ||
                   patch.size == 0 || patch.size > patch.original.size() ||
                   patch.size > width - (patch.pc - start) || !patch.gateway ||
@@ -1965,7 +2170,7 @@ struct Watch::Impl {
                    (instruction->flow != NativeFlow::call || instruction->size != patch.size)) ||
                   (patch.dispatch && (!patch.call || patch.size < 10 || patch.dispatch >= (Address{1} << 63))) ||
                   !windows.emplace(patch.pc, patch.size).second ||
-                  std::ranges::any_of(redirects, [&](const auto &owned) {
+                  std::any_of(std::begin(redirects), std::end(redirects), [&](const auto &owned) {
                     return owned.pc() < patch.pc + patch.size &&
                            patch.pc < owned.pc() + owned.original().size();
                   }))
@@ -2047,25 +2252,28 @@ struct Watch::Impl {
           unsigned long long begin, end, offset, inode;
           unsigned device_major, device_minor;
           char permissions[5]{};
-          if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
-                          &begin, &end, permissions, &offset, &device_major, &device_minor, &inode) != 7)
+          int path_offset = 0;
+          if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n",
+                          &begin, &end, permissions, &offset, &device_major, &device_minor, &inode,
+                          &path_offset) != 7)
             continue;
-          same_channel |= inode == channel_identity.st_ino &&
-              device_major == major(channel_identity.st_dev) && device_minor == minor(channel_identity.st_dev);
+          const auto mapped_path = tracer::detail::canonical_mapped_path(line.substr(path_offset));
+          same_channel |= line.substr(path_offset) == mapped_channel_path && offset == 0 &&
+              end - begin >= Channel::mapping_size(event_buffer, runtime_limit) &&
+              std::string_view(permissions) == "rw-s";
           same_code |= begin <= start && start < end && width <= end - start &&
               permissions[0] == 'r' && permissions[1] == '-' && permissions[2] == 'x' &&
-              inode == admission.inode && device_major == major(admission.device) &&
-              device_minor == minor(admission.device) && start - begin <= admission.file_offset &&
+              mapped_path == module_path && start - begin <= admission.file_offset &&
               admission.file_offset - (start - begin) == offset;
           if (permissions[0] == 'r' && permissions[1] == '-' &&
-              permissions[2] == 'x' && permissions[3] == 'p' && !inode)
+              permissions[2] == 'x' && permissions[3] == 'p' && line.substr(path_offset).empty())
             gateways.emplace_back(begin, end);
         }
         if (!same_channel || !same_code)
           throw std::runtime_error("runtime scope mapping changed before the redirects could be committed");
         const auto modules = client::list_debug_module_mappings(pid);
         for (const auto destination : destinations)
-          if (std::ranges::none_of(gateways, [&](const auto &range) {
+          if (std::none_of(std::begin(gateways), std::end(gateways), [&](const auto &range) {
                 return range.first <= destination && destination < range.second;
               }))
             throw std::runtime_error("runtime scope gateway is outside private executable memory");
@@ -2123,7 +2331,6 @@ struct Watch::Impl {
       if (current.begin_address() != prior.begin_address() ||
           current.end_address() != prior.end_address() ||
           current.file_offset() != prior.file_offset() ||
-          current.device() != prior.device() || current.inode() != prior.inode() ||
           current.build_id() != prior.build_id())
         throw std::runtime_error("live mapping identity changed at a code-cache redirect");
     }
@@ -2141,8 +2348,9 @@ struct Watch::Impl {
 
 Watch::Watch(const api::ObjectWatchRequest &request, std::uint64_t id, std::uint32_t pid,
              const std::string &executable, const std::string &event_path,
-             std::function<void(api::TraceEvent)> publish)
-    : impl_(std::make_unique<Impl>(request, id, pid, executable, event_path, std::move(publish))) {}
+             std::function<void(api::TraceEvent)> publish, bool verify_method_lifetimes)
+    : impl_(std::make_unique<Impl>(request, id, pid, executable, event_path,
+                                  std::move(publish), verify_method_lifetimes)) {}
 Watch::~Watch() = default;
 
 void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
@@ -2150,6 +2358,9 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   auto &p = *impl_;
   p.verify_live(process);
   Init init;
+  init.identity_watch_id = p.request.staged_registration() ? p.id : 0;
+  init.provisional_method_watch = p.request.staged_registration() &&
+      p.verify_method_lifetimes;
   if (p.path.size() >= sizeof(init.path))
     throw std::runtime_error("code-cache event channel path is too long");
   std::memcpy(init.path, p.path.c_str(), p.path.size() + 1);
@@ -2169,7 +2380,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   init.runtime_limit = p.runtime_limit;
   init.shared_file = p.shared_file.identity;
   init.max_events = p.request.max_events();
-  init.no_values = p.request.no_values();
+  init.no_values = p.request.no_values() || p.request.lifetimes_only();
   init.stop_on_overflow = p.request.overflow_policy() == api::ObjectWatchRequest::STOP_CAPTURE;
   init.cfi_stack = p.request.cfi_stack();
   init.atomic = p.plan.layout.atomic;
@@ -2277,8 +2488,10 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     throw;
   }
   process.remote_free(remote, size);
-  ::unlink(p.path.c_str());
-  p.path.clear();
+  if (::unlink(p.path.c_str()) == 0) {
+    p.mapped_channel_path += " (deleted)";
+    p.path.clear();
+  }
 
   for (unsigned index = 0; index < p.functions.size(); ++index) {
     if (p.functions[index].empty())
@@ -2332,7 +2545,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       for (const auto &[exit, relay] : p.short_lifetime_relays) {
         if (relay <= caller || relay + 5 > caller + bytes.size())
           continue;
-        const auto destination = std::ranges::find_if(p.functions, [&](const auto &function) {
+        const auto destination = std::find_if(std::begin(p.functions), std::end(p.functions), [&](const auto &function) {
           return function.front().pc == exit;
         });
         if (destination == p.functions.end())
@@ -2346,10 +2559,10 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     }
   }
 
-  p.pump = std::jthread([&p](std::stop_token stop) { p.collect(stop); });
+  p.pump = std::thread([&p] { p.collect(); });
   if (p.runtime_limit) {
-    p.admissions = std::jthread([&p](std::stop_token stop) {
-      while (!stop.stop_requested()) {
+    p.admissions = std::thread([&p] {
+      while (!p.stop_admissions.load(std::memory_order_acquire)) {
         if (p.channel->admission.phase.load(std::memory_order_acquire) == RuntimeAdmission::ready)
           p.admit_runtime_scope();
         else
@@ -2399,10 +2612,24 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       "in-process AArch64 leaf translation with verified scalar and atomic redirects";
 #else
       p.direct_writer_calls ?
-      "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified direct writer call sites only"
-      " (use --writer-entry to require entry coverage)" :
+      std::string("in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG"
+                  " and verified direct writer call sites only") +
+          (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
       "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
+  if (!p.plan.lifetime_coverage_diagnostic.empty())
+    p.diagnostic += ". " + p.plan.lifetime_coverage_diagnostic;
+}
+
+void Watch::set_registration_active(bool active) noexcept {
+  if (active)
+    impl_->published.store(true, std::memory_order_release);
+  if (impl_->channel)
+    impl_->channel->registration_active.store(active, std::memory_order_release);
+}
+
+bool Watch::is_registration(std::uint64_t id) const noexcept {
+  return id && impl_->request.staged_registration() && impl_->id == id;
 }
 
 void Watch::stop_runtime_admissions() {
@@ -2413,7 +2640,7 @@ void Watch::stop_runtime_admissions() {
       throw std::runtime_error(p.admission_failure);
     p.reply_to_admission(RuntimeAdmission::disabled);
   }
-  p.admissions = {};
+  p.stop_workers(false);
 }
 
 bool Watch::restore(injector::Process &process) {
@@ -2422,7 +2649,8 @@ bool Watch::restore(injector::Process &process) {
     return true;
   p.draining = true;
   try {
-    if (!process.patch_code_batch(p.patches(true), [&] {
+    const auto patches = p.patches(true);
+    if (!process.patch_code_batch(patches, [&] {
           p.verify_mappings();
           if (p.channel->runtime_prefix_gate.load(std::memory_order_acquire) & ~enabled)
             throw RuntimePrefixBusy{};
@@ -2460,14 +2688,15 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
     unsigned long long begin, end, offset, inode;
     unsigned dev_major, dev_minor;
     char permissions[5]{};
-    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
-                    &begin, &end, permissions, &offset, &dev_major, &dev_minor, &inode) != 7)
+    int path_offset = 0;
+    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n",
+                    &begin, &end, permissions, &offset, &dev_major, &dev_minor, &inode,
+                    &path_offset) != 7)
       return false;
     live_ranges.emplace_back(begin, end);
-    if (inode == p.channel_identity.st_ino && dev_major == major(p.channel_identity.st_dev) &&
-        dev_minor == minor(p.channel_identity.st_dev))
+    if (line.substr(path_offset) == p.mapped_channel_path)
       return false;
-    if (permissions[2] == 'x' && std::ranges::any_of(p.redirects, [&](const auto &redirect) {
+    if (permissions[2] == 'x' && std::any_of(std::begin(p.redirects), std::end(p.redirects), [&](const auto &redirect) {
           return redirect.translated_pc() >= begin && redirect.translated_pc() < end;
         }))
       return false;
@@ -2490,7 +2719,7 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
       if (std::string_view(bytes.data(), size) == redirect.installed())
         return false;
     } else if (amount != -1 || errno != EFAULT ||
-               std::ranges::any_of(live_ranges, [&](const auto &range) {
+               std::any_of(std::begin(live_ranges), std::end(live_ranges), [&](const auto &range) {
                  return redirect.pc() < range.second &&
                         redirect.pc() + size > range.first;
                })) {
@@ -2509,11 +2738,13 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
   const bool process_exited = reason == Observation::TARGET_EXITED;
   const bool mappings_changed = reason == Observation::MAPPING_CHANGED;
   auto &p = *impl_;
+  const std::lock_guard finish_lock(p.finish_mutex);
   {
     const std::lock_guard lock(p.admission_mutex);
+    p.draining = true;
     p.reply_to_admission(RuntimeAdmission::disabled);
   }
-  p.admissions = {};
+  p.stop_workers(false);
   p.channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
   if (!process_exited && !mappings_changed &&
       p.channel->capture_limit.load(std::memory_order_acquire) == Channel::overflow)
@@ -2526,47 +2757,26 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  p.pump = {};
-  const auto emit_final = [&](api::TraceEvent &event, Observation::Kind kind) {
-    const auto sequence = p.head.load(std::memory_order_acquire) + p.final_observations;
-    if (p.request.max_events() && sequence >= p.request.max_events())
-      return false;
-    event.set_protocol_version(kProtocolVersion);
-    event.set_session_id(p.request.session_id());
-    event.set_pid(p.pid);
-    event.set_probe_id(p.id);
-    event.set_probe_sequence(sequence + 1);
-    event.set_agent_dropped_events(p.channel->dropped.load(std::memory_order_relaxed));
-    event.set_function_name("object.trace");
-    event.set_monotonic_time_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-    auto &observation = *event.mutable_object_observation();
-    observation.set_kind(kind);
-    observation.set_concrete_type(p.request.concrete_type());
-    observation.set_source_unavailable(true);
-    observation.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
-    observation.set_closure_reason(reason);
-    p.publish(std::move(event));
-    ++p.final_observations;
-    return true;
-  };
+  p.stop_workers(true);
+  if (process_exited) {
+    auto next = p.head.load(std::memory_order_acquire);
+    p.drain_after_exit(next);
+  }
   if (mappings_changed) {
     p.coverage_gaps.fetch_add(1, std::memory_order_relaxed);
     api::TraceEvent event;
     event.mutable_object_observation()->set_diagnostic("the observed execution mappings changed");
-    emit_final(event, Observation::COVERAGE_GAP);
+    p.emit_final(event, Observation::COVERAGE_GAP, reason);
   }
-  for (auto &[id, event] : p.open_lifetimes) {
-    event.mutable_object_observation()->set_lifetime_id(id);
-    if (!emit_final(event, Observation::OBSERVATION_ENDED))
-      break;
-  }
-  p.open_lifetimes.clear();
-  p.draining = false;
-  if (process_exited || mappings_changed) {
-    p.installed = false;
-    p.diagnostic = mappings_changed ? "execution mapping changed and old redirects are absent" :
-                                     "target exited";
+  p.close_observations(reason);
+  {
+    const std::lock_guard lock(p.admission_mutex);
+    p.draining = false;
+    if (process_exited || mappings_changed) {
+      p.installed = false;
+      p.diagnostic = mappings_changed ? "execution mapping changed and old redirects are absent" :
+                                       "target exited";
+    }
   }
 }
 
@@ -2582,14 +2792,17 @@ api::ObjectWatchStatus Watch::status() const {
   report.set_store_sites(p.admitted_stores);
   report.set_unsupported_sites(p.plan.unsupported);
   report.set_no_values(p.request.no_values());
-  report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
+  report.set_external_write_order_unknown(p.shared_file.identity.active());
   const auto received = p.head.load(std::memory_order_acquire);
-  const auto errors = std::min(received, p.publish_errors.load(std::memory_order_relaxed));
-  report.set_observations(received - errors + p.final_observations);
+  const auto total = received + p.final_observations.load(std::memory_order_acquire);
+  const auto errors = std::min(total, p.publish_errors.load(std::memory_order_relaxed));
+  report.set_observations(total - errors);
   report.set_executed_stores(p.channel->executed_stores.load(std::memory_order_relaxed));
   report.set_dropped(p.channel->dropped.load(std::memory_order_relaxed) +
                      p.publish_errors.load(std::memory_order_relaxed));
   report.set_coverage_gaps(p.coverage_gaps.load(std::memory_order_relaxed));
+  report.set_runtime_gap_hits(p.channel->runtime_gap_hits.load(std::memory_order_relaxed));
+  report.set_helper_reentries(p.channel->helper_reentries.load(std::memory_order_relaxed));
   report.set_runtime_translations(p.channel->runtime_translations.load(std::memory_order_acquire));
   report.set_runtime_reclaimed(p.channel->runtime_reclaimed.load(std::memory_order_acquire));
   report.set_static_fragments(p.channel->static_fragments.load(std::memory_order_acquire));
@@ -2626,12 +2839,16 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_store_sites(p.admitted_stores);
   report.set_unsupported_sites(p.plan.unsupported);
   report.set_no_values(p.request.no_values());
-  report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
+  report.set_external_write_order_unknown(p.shared_file.identity.active());
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
       p.plan.layout.scoped_storage() ? "verified native scoped storage and redirect windows" :
-      p.direct_writer_calls ? "verified direct writer call sites only (use --writer-entry to require entry coverage)" :
+      p.direct_writer_calls ?
+      std::string("verified direct writer call sites only") +
+          (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
                         "verified leaf translations and candidate redirect windows");
+  if (!p.plan.lifetime_coverage_diagnostic.empty())
+    *report.mutable_diagnostic() += ". " + p.plan.lifetime_coverage_diagnostic;
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
   if (p.pid) {
     for (const auto &[entry, sites] : p.incoming)
@@ -2653,13 +2870,13 @@ api::ObjectWatchStatus Watch::preview() const {
 namespace tracer::object_watch {
 clangtracer::v1::ObjectWatchStatus preview(
     const clangtracer::v1::ObjectWatchRequest &request, std::uint32_t pid,
-    const std::string &executable) {
+    const std::string &executable, bool verify_method_lifetimes) {
   using Request = clangtracer::v1::ObjectWatchRequest;
   if (request.follow_calls() && request.backend() != Request::CODE_CACHE)
     throw std::invalid_argument("runtime call following requires code-cache write capture");
   clangtracer::v1::ObjectWatchStatus result;
   if (request.backend() == Request::CODE_CACHE) {
-    result = object_cache::Watch(request, 0, pid, executable, {}, {}).preview();
+    result = object_cache::Watch(request, 0, pid, executable, {}, {}, verify_method_lifetimes).preview();
   } else {
     Plan plan(pid, executable, request);
     if (pid)

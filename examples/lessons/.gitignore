@@ -1,0 +1,18 @@
+# Outputs created while following the lessons.
+target
+target-split
+*.debug
+*.sqlite
+*.db
+*.db-*
+*.pb
+*.json
+*.textproto
+recovered-*/
+prepared*/
+*-watch/
+generated/
+mappings.hpp
+build/
+.cache/
+shared-context-target

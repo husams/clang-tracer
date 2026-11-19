@@ -35,7 +35,8 @@ def run(args, no_values):
         if args.loader_ready:
             launch += ["--loader-ready"]
         launch += [request, args.fixture]
-        trace = subprocess.Popen([*launch, "hold"], cwd=root,
+        env = dict(os.environ, TRACER_TEST_STARTUP_STOP_FILE="stop.now")
+        trace = subprocess.Popen([*launch, "stop.now"], cwd=root, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         cleanup.callback(lambda: (root / "stop.now").touch())
         cleanup.callback(stop, trace)
@@ -88,7 +89,7 @@ def run(args, no_values):
         assert not Path(f"/proc/{pid}/exe").exists()
         if args.module:
             (root / "preinit.now").unlink()
-        run = subprocess.run(launch, cwd=root,
+        run = subprocess.run(launch if args.module else [*launch, "stop.now"], cwd=root, env=env,
                              capture_output=True, text=True, timeout=20)
         assert run.returncode == 0 and "MAIN value=23" in run.stderr, run
         assert len([line for line in run.stdout.splitlines() if "objectObservation" in line]) == 4, run

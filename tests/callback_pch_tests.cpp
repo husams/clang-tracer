@@ -15,11 +15,10 @@
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/PCHContainerOperations.h>
+#include <clang/Interpreter/Interpreter.h>
 #include <clang/Lex/PreprocessorOptions.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/IR/Module.h>
-#include <clang/Interpreter/Interpreter.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
 #include <signal.h>
@@ -142,8 +141,18 @@ void check_dependencies(const std::vector<std::string> &base_arguments) {
   arguments.push_back("-I" + earlier.string());
   arguments.push_back("-I" + temporary.path.string());
   auto compiler = make_compiler(arguments);
+  struct sigaction handler {}, previous {}, current {};
+  handler.sa_handler = [](int) {};
+  require(::sigemptyset(&handler.sa_mask) == 0 &&
+              ::sigaction(SIGUSR1, &handler, &previous) == 0,
+          "cannot install the application's SIGUSR1 handler");
   auto artifact =
       tracer::callback_pch::prepare(compiler->getInvocation(), Mode::Syntax);
+  const bool handler_preserved = ::sigaction(SIGUSR1, nullptr, &current) == 0 &&
+                                 current.sa_handler == handler.sa_handler;
+  require(::sigaction(SIGUSR1, &previous, nullptr) == 0,
+          "cannot restore the application's SIGUSR1 handler");
+  require(handler_preserved, "PCH generation replaced the application's SIGUSR1 handler");
   require(artifact.has_value(), "syntax PCH was not built");
   require(syntax_ok(arguments, "static_assert(TRACER_PCH_TEST_SENTINEL == 1);",
                     &*artifact),
@@ -276,7 +285,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> arguments(tracer::runtime::jit_flags.begin(),
                                        tracer::runtime::jit_flags.end());
     arguments.insert(arguments.end(),
-                     {"-std=c++23", "-x", "c++", "-fPIC", "-O0",
+                     {"-std=c++17", "-x", "c++", "-fPIC", "-O0",
                       std::string("-resource-dir=") + argv[1]});
     if (argc > 2 && std::string_view(argv[2]) == "--unavailable-cache") {
       check_unavailable_cache(arguments);

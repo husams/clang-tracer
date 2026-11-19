@@ -247,13 +247,13 @@ HELP_TOPICS = {
                 "Include the original result in trace snapshots and display.",
             ),
             ("--include HEADER", "Header on the server host; may be repeated."),
-            ("--module TEXT", "Mapped path or path substring to search explicitly."),
-            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
-            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
             (
                 "--compile-option ARG",
                 "Append one compiler option; may be repeated in order.",
             ),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",

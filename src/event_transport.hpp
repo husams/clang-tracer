@@ -18,19 +18,17 @@ struct EventDelivery {
   std::atomic<int> last_send_errno{0};
 };
 
-// A bounded multi-producer/single-consumer queue. Callers never wait for space
-// or socket readiness; only the dedicated sender retries a congested socket.
+// A growing multi-producer/single-consumer queue. Only the dedicated sender
+// retries a congested socket. Producers fail only on allocation failure.
 class EventTransport {
 public:
-  static constexpr std::size_t kCapacity = 4096;
   static constexpr std::size_t kInlineEventBytes = 64 * 1024;
   static constexpr char kExternalEventMarker = '\0';
   // Linux UAPI values, including when building with an older SDK.
   static constexpr int kAddSeals = 1033, kGetSeals = 1034;
   static constexpr int kReadOnlySeals = 0x02 | 0x04 | 0x08;
   struct Packet {
-    std::atomic<std::size_t> turn{0};
-    std::size_t position = 0;
+    Packet* next = nullptr;
     EventDelivery *delivery = nullptr;
     bool valid = false;
     std::string bytes;
@@ -52,9 +50,8 @@ public:
   static bool begin_drain(EventDelivery &delivery) noexcept;
 
 private:
-  std::unique_ptr<Packet[]> slots_;
-  alignas(64) std::atomic<std::size_t> enqueue_{0};
-  alignas(64) std::size_t dequeue_ = 0;
+  std::atomic<Packet*> incoming_{nullptr};
+  Packet* ready_ = nullptr;
   std::atomic<bool> stopping_{false}, notified_{false};
   std::atomic<unsigned> active_{0};
   int wake_fd_ = -1;
@@ -65,7 +62,7 @@ private:
   std::thread worker_;
 
   void notify() noexcept;
-  bool ready() const noexcept;
+  bool ready() noexcept;
   void run() noexcept;
   void report_agent_diagnostics_if_due() noexcept;
   bool send(EventDelivery &, const void *, std::size_t) noexcept;

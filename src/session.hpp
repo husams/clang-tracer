@@ -13,11 +13,14 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "agent_plugin_protocol.hpp"
+#include "live_transaction.hpp"
 
 #include "tracer.grpc.pb.h"
 #include "tracer/protocol.hpp"
 
 namespace tracer {
+namespace live { struct AgentRequest; }
 namespace injector {
 class Process;
 class EntryTrap;
@@ -28,6 +31,8 @@ class Watch;
 namespace object_cache {
 class Watch;
 }
+
+namespace live { struct Plan; }
 
 class AgentRuntimeIncompatible final : public std::runtime_error {
 public:
@@ -57,12 +62,34 @@ public:
                  const std::string &source_directory,
                  clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
+  clangtracer::v1::InstructionTrace start_instruction_trace(
+      const clangtracer::v1::StartInstructionTraceRequest &request,
+      const std::string &expected_code);
+  clangtracer::v1::InstructionTrace stop_instruction_trace();
+  clangtracer::v1::MemoryPatch apply_memory_patch(
+      std::uint64_t address, std::string expected, std::string replacement,
+      std::vector<clangtracer::v1::MemoryMapping> mappings);
+  clangtracer::v1::MemoryPatch restore_memory_patch(std::uint64_t id);
+  clangtracer::v1::MemoryAllocation allocate_memory(std::uint32_t size);
+  clangtracer::v1::MemoryAllocation free_memory(std::uint64_t id);
+  clangtracer::v1::TargetLibrary load_target_library(std::string path);
+  clangtracer::v1::PageMonitorResult start_page_monitor(
+      const clangtracer::v1::StartPageMonitorRequest &request);
+  clangtracer::v1::PageMonitorResult stop_page_monitor();
+  clangtracer::v1::AgentPluginResponse
+  agent_plugin(const clangtracer::v1::AgentPluginRequest &request);
   void detach();
   clangtracer::v1::ObjectWatchStatus object_watch(
       const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
-      std::function<void(clangtracer::v1::TraceEvent)> publish);
+      std::function<void(clangtracer::v1::TraceEvent)> publish,
+      bool verify_method_lifetimes = false);
+  void preflight_object_probe();
+  bool has_object_probe_registration(std::uint64_t registration) const;
+  void set_object_probe_active(std::uint64_t registration, bool active);
   static clangtracer::v1::ObjectWatchStatus prepare_object_watch(
       const clangtracer::v1::ObjectWatchRequest &request);
+  clangtracer::v1::LiveUpdateStatus live_update(const clangtracer::v1::LiveUpdateRequest &request,
+                                               const std::function<bool()> &cancelled = {});
   void shutdown() noexcept;
   void record_failure(const std::string &message);
   void refresh_process_state() noexcept;
@@ -79,6 +106,17 @@ public:
   [[nodiscard]] static std::uint64_t ProcessStartTime(std::uint32_t pid);
 
 private:
+  struct InstructionCapture {
+    clangtracer::v1::InstructionTrace trace;
+    std::uint32_t max_records;
+    std::uintptr_t handle;
+    std::uintptr_t stop;
+    std::uintptr_t callback_handle;
+    bool has_callback;
+    bool registers;
+    std::uint64_t memory_address;
+    std::uint32_t memory_size;
+  };
   struct PthreadCreatePatch {
     std::uintptr_t entry = 0;
     std::uintptr_t trampoline = 0;
@@ -115,13 +153,46 @@ private:
   std::string executable_;
   std::optional<clangtracer::v1::JitRuntimeProfile> jit_runtime_;
   bool unsafe_target_ = false;
+  std::uintptr_t live_address_ = 0;
+  live::Transaction live_;
+  std::shared_ptr<live::Plan> live_preview_;
+  std::string live_preview_key_;
+  std::uint64_t live_preview_revision_ = 0;
+  std::uint64_t live_preview_process_start_ = 0;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
+  std::uintptr_t plugin_address_ = 0;
+  std::uintptr_t plugin_v2_address_ = 0;
+  bool plugins_may_be_active_ = false;
   std::uintptr_t capacity_address_ = 0;
-  std::uintptr_t object_cache_address_ = 0;
+  std::uintptr_t reclaim_address_ = 0;
+  std::uintptr_t start_page_monitor_address_ = 0;
+  std::uintptr_t stop_page_monitor_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
+  void reclaim_probe_locked(ProbeRecord &probe, injector::Process &process);
+  std::optional<InstructionCapture> instructions_;
+  std::optional<clangtracer::v1::InstructionTrace> last_instruction_trace_;
+  std::optional<clangtracer::v1::PageMonitorResult> page_monitor_;
+  clangtracer::v1::PageMonitorResult stop_page_monitor_locked(
+      std::chrono::steady_clock::time_point deadline);
+  struct MemoryPatchRecord {
+    clangtracer::v1::MemoryPatch value;
+    std::string expected, replacement;
+    std::vector<clangtracer::v1::MemoryMapping> mappings;
+  };
+  std::vector<MemoryPatchRecord> memory_patches_;
+  struct AllocationRecord {
+    clangtracer::v1::MemoryAllocation value;
+    std::string path;
+  };
+  std::vector<AllocationRecord> allocations_;
+  std::map<std::string, std::uintptr_t> resident_libraries_;
+  void free_memory_locked(AllocationRecord &record, std::chrono::steady_clock::time_point deadline);
+  void write_memory_patch_locked(MemoryPatchRecord &record, bool restore,
+                                 std::chrono::steady_clock::time_point deadline);
+  std::uintptr_t object_cache_address_ = 0;
   std::unique_ptr<object_watch::Watch> object_watch_;
   std::unique_ptr<object_cache::Watch> object_cache_;
   std::unique_ptr<injector::EntryTrap> entry_trap_;
@@ -130,9 +201,39 @@ private:
   bool pthread_create_patch_committed_ = false;
 
   void attach_process(tracer::injector::Process &process,
-                      std::chrono::steady_clock::time_point deadline);
+                      std::chrono::steady_clock::time_point deadline,
+                      pid_t excluded_tid = 0, pid_t required_tid = 0);
+  clangtracer::v1::InstructionTrace stop_instruction_trace_locked(
+      std::chrono::steady_clock::time_point deadline);
+  clangtracer::v1::LiveUpdateStatus activate_live_locked(
+      const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
+      const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result,
+      std::size_t input_limit);
+  std::optional<clangtracer::v1::LiveUpdateStatus> read_live_extension_report_locked(
+      injector::Process &process, const live::AgentRequest &response);
+  std::optional<clangtracer::v1::LiveUpdateStatus> poll_pending_live_data_locked();
+  clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
+      clangtracer::v1::LiveAgentExtension input,
+      const std::function<void(live::AgentRequest &)> &publication = {},
+      std::size_t input_limit = live::default_payload_bytes);
+  clangtracer::v1::LiveUpdateStatus collect_live_extension_locked(
+      std::chrono::steady_clock::time_point deadline,
+      const std::function<void(live::AgentRequest &)> &publication);
+  clangtracer::v1::LiveUpdateStatus finish_managed_locked(clangtracer::v1::LiveUpdateStatus result);
+  clangtracer::v1::LiveUpdateStatus recover_managed_locked();
+  clangtracer::v1::LiveUpdateStatus apply_live_extension_locked(
+      const clangtracer::v1::LiveUpdateRequest &request, clangtracer::v1::LiveUpdateStatus result,
+      const std::function<bool()> &cancelled);
+  clangtracer::v1::LiveUpdateStatus revert_live_locked(std::uint64_t revision);
   void check_identity_locked();
-  void require_probe_control_locked(std::uint64_t removing = 0) const;
+  bool invoke_agent_plugin_locked(AgentPluginCall& request, const std::string& source,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  const std::string& offer = {},
+                                  const std::string& expected_executable = {});
+  void clear_agent_plugins_locked(std::chrono::steady_clock::time_point deadline);
+  void require_probe_control_locked(std::uint64_t removing = 0,
+                                    std::uint64_t registration = 0) const;
+  void require_object_watch_sites_locked(std::uint64_t registration) const;
   void stop_object_watch_locked();
   void stop_object_cache_locked(bool detaching = false);
   bool retire_changed_object_cache_locked(std::chrono::steady_clock::time_point deadline);

@@ -3,11 +3,14 @@
 #include "commands.hpp"
 #include "interpreter.hpp"
 #include "syntax.hpp"
+#include "../snapshot_limits.hpp"
 
 #include <algorithm>
 #include <iomanip>
 #include <ostream>
 #include <stdexcept>
+#include <sstream>
+#include <string>
 #include <string_view>
 
 namespace tracer_repl {
@@ -23,7 +26,7 @@ struct CommandTopic {
 
 constexpr string_view stream_options =
     "--count N --timeout SECONDS --after CURSOR --probe ID\n"
-    "--phase PRE|POST --name SELECTOR --session ID | --all";
+    "--phase PRE|POST|EXCEPTION --name SELECTOR --session ID | --all";
 constexpr string_view resolution_options =
     "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
     "--module TEXT --compile-option FLAG\n"
@@ -31,6 +34,40 @@ constexpr string_view resolution_options =
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"
     "--print-arguments --print-result --snapshot-return-pointee";
+
+// One line per option, from the table the prepare tool and the agent validate against.
+std::string limit_options_text() {
+  std::ostringstream text;
+  for (const auto &spec : tracer::kLimitSpecs) {
+    text << "--" << spec.name << " N (default " << tracer::default_limit(spec.name);
+    text << ", " << spec.minimum << "-";
+    if (spec.maximum == tracer::kUnlimited) text << "unlimited";
+    else text << spec.maximum;
+    text << (spec.prepare_time ? ", prepare" : ", run time") << "): " << spec.meaning << "; ";
+  }
+  return text.str();
+}
+const std::string limit_summary =
+    "Pointer and reference members are followed automatically; --no-automatic-members follows none. "
+    "Capture limits, each visible in the event when it cuts something: " + limit_options_text() +
+    "'unlimited' selects the largest value (for --follow-depth, --string-bytes and --snapshot-slice that is a fixed maximum the tracer imposes), 'off' selects 0 where 0 is allowed. "
+    "Prepare-time options shape the package; %probe inject accepts all of them and its value wins, but members that were not discovered at prepare time cannot be added. "
+    "Each option is also read from the environment variable TRACER_PREPARE_<NAME> by the prepare tool; docs/native-repl.md lists them. ";
+
+const std::string prepare_summary =
+    std::string(
+        "Build a reusable probe package from source, an explicit signature, or the module index. "
+        "Without headers or an explicit signature, preparation uses the default index. "
+        "Repeat --include for extra headers. "
+        "Preparation uses compile_commands.json in the command's working directory by default. "
+        "It prefers the first include's recorded compile command and falls back to the first source beside it. "
+        "Use --module to pin the package to a specific build. "
+        "Prepared headers can declare tracer_snapshot::FollowPointers<Record> specializations listing direct raw pointer fields to follow; pointee types and polymorphic implementations are discovered from the included source inputs. This policy applies to prepared argument, receiver and result records. "
+        "Use --snapshot-return-pointee when injecting a raw pointer-return probe. "
+        "Use --metadata-only to skip the separate C++ adapter files. ") +
+    limit_summary +
+    "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
+    "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -44,6 +81,33 @@ const CommandTopic commands[] = {
     {"server stop", "%server stop", "Stop the server started by this REPL and restore its targets."},
     {"attach", "%attach [PID [--start-time TICKS]]", "Attach to a target. Omit PID for the local picker, or supply the observed start time with a PID.",
      "%attach 12345"},
+    {"launch", "%launch EXECUTABLE [--arg VALUE] [--env NAME=VALUE] [--cwd DIR]\n"
+     "  [--stdin FILE] [--stdout NEW_FILE] [--stderr NEW_FILE] [--timeout SECONDS] [--preload GATE.so] [--supervise] [--gate-children]",
+     "Launch a local C++ application and attach at its startup checkpoint. Repeat --arg and --env."},
+    {"children", "%children", "List paused exec descendants of owned launches with --gate-children."},
+    {"resume", "%resume [PID]", "Release the startup checkpoint of an attached owned target or a gated exec child."},
+    {"terminate", "%terminate [PID]", "Kill and reap a target launched by this REPL."},
+    {"call", "%call NAME [--arg SCALAR] [--timeout SECONDS]",
+     "Invoke one explicitly registered function on a paused target's startup thread. Repeat --arg."},
+    {"call-result", "%call-result [--timeout SECONDS]",
+     "Collect the result of a target call after the wait timed out or was interrupted."},
+    {"syscalls", "%syscalls [--count N] [--timeout SECONDS]",
+     "Capture Linux syscall entry and exit records on the selected local target's existing threads."},
+    {"faults", "%faults [--count N] [--timeout SECONDS]",
+     "Observe delivered native fault signals without changing the target's handlers. Requires access to Linux tracefs."},
+    {"sample allocations", "%sample allocations [--count N] [--timeout SECONDS]",
+     "Profile glibc malloc, calloc and realloc requests on existing target threads with Linux perf uprobes."},
+    {"sample cpu", "%sample cpu [--count N] [--timeout SECONDS]",
+     "Sample user-space instruction addresses on the selected local target's existing threads."},
+    {"watchpoint",
+     "%watchpoint --tid TID --address ADDRESS --size BYTES --mapping TOKEN --access write|read-write [--count N] [--timeout SECONDS]",
+     "Collect one thread's hardware watchpoint hits on a naturally aligned 1, 2, 4 or 8 byte range."},
+    {"instructions start",
+     "%instructions start --tid TID --address ADDRESS --size BYTES --mapping TOKEN [--count N] [--timeout SECONDS] [--registers] [--callback-library PATH] [--memory-address ADDRESS --memory-size BYTES] [--discover]",
+     "Trace one thread with optional general-purpose snapshots, a trusted native callback, or scalar memory-access filtering. --discover records executed call destinations instead. Use %memory maps for the token."},
+    {"instructions replay", "%instructions replay FILE", "Replay a saved bounded instruction capture without a target."},
+    {"instructions stop", "%instructions stop [--save NEW_FILE]",
+     "Stop and drain the selected session's capture, then print original instruction addresses and selected details."},
     {"processes", "%processes [--filter TEXT]", "List local target processes that match the filter."},
     {"sessions", "%sessions",
      "List sessions known to the connected server, one per line with ID, PID and state. "
@@ -54,7 +118,24 @@ const CommandTopic commands[] = {
     {"status", "%status", "Show connection details, the selected session, and retained collections."},
     {"detach", "%detach [SESSION]",
      "Detach the selected or named session and remove its probes. SESSION may be a unique ID prefix."},
-    {"modules", "%modules [--details]", "List application modules. Details show executable mappings, file identity, and a mapping token."},
+    {"modules", "%modules [[--filter TEXT] [--details] | --elf PATH | --watch [--count N] [--timeout SECONDS]]",
+     "List application modules in the selected process. The filter matches a case-sensitive path substring. "
+     "Details show executable mappings, file identity, and a mapping token. "
+     "Use --elf to inspect ELF imports, exports and sections or --watch to report mapping changes.",
+     "%modules --filter libdemo.so --details"},
+    {"library load", "%library load PATH", "Load a trusted Linux x86-64 shared object into the selected target until it exits."},
+    {"memory write", "%memory write ADDRESS --mapping TOKEN --expect HEX --replace HEX",
+     "Write up to 256 verified bytes to a private writable mapping. Restore with %memory restore."},
+    {"memory allocate", "%memory allocate BYTES", "Allocate up to 1 MiB of zeroed writable memory owned by the session."},
+    {"memory free", "%memory free ID", "Free a session allocation after restoring its patches."},
+    {"memory patch", "%memory patch --module PATH --elf-address ADDRESS --mapping TOKEN --expect HEX --replace HEX",
+     "Patch verified equal-width instructions at a function entry and retain original bytes for restoration."},
+    {"memory import-hook", "%memory import-hook --module PATH --symbol NAME --original ADDRESS --address ADDRESS --mapping TOKEN --abi linux-x86-64-sysv",
+     "Redirect one resolved ELF import slot to an ABI-compatible function in the main executable."},
+    {"memory restore", "%memory restore ID", "Restore original executable or import-slot bytes."},
+    {"memory monitor-start", "%memory monitor-start --tid TID --address ADDRESS --size BYTES --mapping TOKEN [--timeout SECONDS]",
+     "Record the nominated thread's first read or write to each page of a dedicated mapping."},
+    {"memory monitor-stop", "%memory monitor-stop", "Restore page protections and print first accesses."},
     {"module", "", "Index ELF modules and browse or export recovered types and symbols."},
     {"module index", "%module index (--file ELF | --module PATH --mapping TOKEN) [--output INDEX] [--debug-file FILE] [--max-entries N] [--max-depth N]",
      "Create a reusable module index and select it for the current REPL. File input works offline."},
@@ -72,6 +153,23 @@ const CommandTopic commands[] = {
      "  [--addresses] [--mapping TOKEN] [--address PC]",
      "Find supported C++ callables. Use --addresses for verified entries or --address with the mapping token to look up a PC.",
      "%symbols --filter Calculator --limit 20 --addresses"},
+    {"live", "", "Preview, apply, inspect, and revert verified native code replacements."},
+    {"live update", "%live update FILE... [--compdb FILE] [--build MANIFEST] [--retention-limit N] [--payload-limit BYTES]\n"
+     "  [--managed true | --after-file FILE --after-function NAME --for-each TYPE]",
+     "Publish a verified -O0 group. Local entries need a unique ELF file marker and a patchable entry."},
+    {"live preview", "%live preview FILE... [--compdb FILE] [--build MANIFEST]",
+     "Show the exact native entries and blockers for a saved source snapshot."},
+    {"live status", "%live status", "List the active revision and retained JIT generation count."},
+    {"live watch", "%live watch FILE [FILE ...] [--build FILE] [--compdb FILE]",
+     "Watch saved files and automatically preview and apply eligible changes. Press Ctrl-C to stop watching."},
+    {"live mock", "%live mock SIGNATURE --file FILE --function FUNCTION [--fixture FILE] [--bind ALIAS=SIGNATURE] [--recursion original]",
+     "Compile a typed replacement into the target and activate it as a live revision."},
+    {"live update-data", "%live update-data FILE [--discover-file FILE --discover-function NAME] [--module MODULE] [--address ADDRESS] [--from-scan ID ...]",
+     "Run a C++ callback once per selected object with verified ownership or borrowing."},
+    {"live scan-heap", "%live scan-heap --type TYPE [--type TYPE] [--module MODULE]",
+     "Find candidate objects in the target heap and report the evidence for each candidate."},
+    {"live revert", "%live revert [REVISION]", "Restore the parent or specified revision. Revision 0 is the original build."},
+    {"live recover", "%live recover", "Recover a managed publication in the current server session."},
     {"memory", "", "List, read, or scan mapped memory."},
     {"memory maps", "%memory maps",
      "List all mapped ranges and permissions in the selected session and issue a memory snapshot token."},
@@ -83,9 +181,10 @@ const CommandTopic commands[] = {
      "The default result limit is 64 and the maximum is 1024.",
      R"(%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff")"},
     {"object", "", "Watch object lifetimes, ownership, method snapshots and stores on Linux."},
-    {"object prepare", "%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
+    {"object prepare", "%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
      "Save a reusable object definition and verified ELF bindings without attaching. "
-     "Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
+     "For a shared-library writer, add --executable APP and keep --module LIB; a lone shared object "
+     "has no process interpreter. Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
     {"object preview", "%object preview --plan DIRECTORY",
      "Resolve the plan against the selected process and check live code bytes without installing patches."},
     {"object start", "%object start --type TYPE --field FIELD --code SELECTOR "
@@ -95,7 +194,10 @@ const CommandTopic commands[] = {
      "Start a native watch with matching DWARF. Ptrace is the diagnostic default. "
      "Code cache translates supported writers and lifecycle fragments. "
      "Repeat --code to select multiple writers for a standalone main-image field. "
-     "Use --follow-calls to resolve callees at runtime from the selected scope, with --runtime-limit N to bound translations. "
+     "For an eligible standalone write scope, use --follow-calls to resolve callees at runtime, with --runtime-limit N to bound translations. "
+     "A non-leaf shared writer in that scope requires --follow-calls. If its writer is not in the main executable, name its ELF with --module. "
+     "--follow-calls is limited to standalone writes; it cannot be combined with --owner, collection or caller scopes, "
+     "--writer-entry, or --first-seen unless the watched value has a supported structured layout. "
      "Use --shared-file PATH to correlate shared storage across live processes. "
      "Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. "
      "On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. "
@@ -106,11 +208,23 @@ const CommandTopic commands[] = {
      "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
      "Use --mode logical-writes for keyed collection changes and --mutation destroy=SYMBOL for destruction. "
      "For libstdc++ string, variant and any storage writes, use --first-seen and declare --synchronization. "
+     "Select a nested union with --field PATH and supply --union-tag PATH and --union-case TAG=MEMBER for typed capture. "
      "Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. "
      "Use --no-values to record every completed write and omit field samples. "
      "Record observations with %record FILE --sqlite --name object.trace."},
     {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},
     {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
+    {"object-probe prepare", "%object-probe prepare TYPE --method METHOD --include HEADER --compdb FILE --translation-unit TU --callbacks SOURCE --output FILE",
+      "Prepare an offline type package. A field write package uses --field FIELD --code WRITER."},
+    {"object-probe preview", "%object-probe preview --package FILE [--module MAPPING] [start options]",
+      "Bind an attached target and check patch windows. Use the same options for preview and start."},
+    {"object-probe start", "%object-probe start --package FILE [--module MAPPING] [--method-module MAPPING] "
+        "[--follow-calls] [--no-values] [--first-seen] [--union-tag FIELD --union-case TAG=MEMBER "
+        "--synchronization thread-confined|caller-lock]",
+      "Activate the verified object probe. Follow calls for write-only registrations. "
+      "Use first-seen with a standalone writer and a write-only package. Repeat union-case for each admitted tag."},
+    {"object-probe status", "%object-probe status [ID]", "Report group coverage and restoration."},
+    {"object-probe stop", "%object-probe stop [ID]", "Close callback admission and restore the group's patches."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"
@@ -118,7 +232,8 @@ const CommandTopic commands[] = {
      "Preview bulk C++ matches, ABI status and retained probe capacity without installing probes.",
      R"example(%trace preview --module "libapp*" --include "app::*" --exclude "app::detail::*")example"},
     {"trace apply", "%trace apply --manifest FILE [--callback FILE]",
-     "Install a typed observer for each eligible manifest match. Restore newly installed probes on partial failure.",
+     "Install a typed observer for each eligible match. The apply deadline is 120 seconds by default. "
+     "Override it with the REPL's --timeout. Partial failures restore the batch's probes.",
      "%trace apply --manifest trace.textproto"},
     {"trace remove", "%trace remove BATCH_ID",
      "Remove or retry restoration of the probes owned by a batch in the selected session."},
@@ -129,36 +244,27 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--no-automatic-members] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
+     "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]\n"
      "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
      "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
-     "Build a reusable probe package from source, an explicit signature, or the module index. "
-     "Without headers or an explicit signature, preparation uses the default index. "
-     "Repeat --include for extra headers. "
-     "Preparation uses compile_commands.json in the command's working directory by default. "
-     "It prefers the first include's recorded compile command and falls back to the first source beside it. "
-     "Use --module to pin the package to a specific build. "
-     "Prepared headers can declare tracer_snapshot::FollowPointers<Record> specializations listing direct raw pointer fields to follow; pointee types and polymorphic implementations are discovered from the included source inputs. This policy applies to prepared argument, receiver and result records. "
-     "Use --snapshot-return-pointee when injecting a raw pointer-return probe. "
-     "Use --metadata-only to skip the separate C++ adapter files. "
-     "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
-     "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
+     prepare_summary,
      R"example(%probe prepare "HFW::Item::create()" --include item.hpp --include item-impl.hpp --include item-snapshot-policy.hpp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
-    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
+    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]\n"
+     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
-    {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]",
-     "Install a probe on the selected target. Omit --callback to capture events with the built-in observer. "
-     "The auto backend tries the verified entry first, then a verified --caller or an entry trap for supported short getters. "
-     "Use --backend entry to require an entry jump. "
-     "For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. "
-     "Use --snapshot-return-pointee with a matching record layout and live, stable pointees immediately after return. "
-     "result() gives the address and result_as<T>() decodes an owned copy.",
+    {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
+     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee] [--backend auto|entry] [--caller SELECTOR]\n"
+     "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
+     "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]",
+     "Omit --callback to capture events with the built-in observer. For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
      R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
-    {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY]",
+    {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY] [--watch [--count N] [--timeout SECONDS]]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},
     {"probes", "%probes [--cwd DIRECTORY]", "List the probes in the selected session."},
     {"interceptor", "", "Manage named C++ callback drafts."},
@@ -172,8 +278,8 @@ const CommandTopic commands[] = {
      R"example(%interceptor upload hook --target "demo::compute(int)")example"},
 
     {"events", "%events [STREAM OPTIONS] [--as NAME]",
-     "Print live events and keep a bounded collection named live by default.",
-     "%events --count 5 --phase POST"},
+     "Print live events and keep a bounded collection named live by default. Use --callback-errors exclude or only to select callback outcomes.",
+     "%events --count 5 --phase POST --callback-errors only"},
     {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
     {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
     {"events diff", "%events diff NAME --pre N --post N [--key PATH=MEMBER]...",
@@ -181,20 +287,20 @@ const CommandTopic commands[] = {
     {"events stack", "%events stack NAME --index N",
      "Print all captured stack frames for one retained event.",
      "%events stack fullstack --index 0"},
-    {"events calls", "%events calls NAME", "Pair PRE and POST events and show call durations and missing halves."},
+    {"events calls", "%events calls NAME", "Pair PRE with POST or EXCEPTION and show call durations and missing events."},
     {"events stats", "%events stats NAME",
      "Summarize live or replayed calls per probe, with duration histograms, caller edges and loss."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE --as NAME",
+    {"events open", "%events open FILE --as NAME [--callback-errors include|exclude|only]",
      "Open a Protobuf or SQLite recording offline as a bounded, named collection. Compatible C++ types stored in SQLite load automatically.",
-     "%events open capture.db --as saved"},
+     "%events open capture.db --as saved --callback-errors only"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
-    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
-     "%collect --count 10 --timeout 15 --phase POST --as results"},
+    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default. Use --callback-errors exclude or only to select successful callbacks or callback failures.",
+     "%collect --count 10 --timeout 15 --phase POST --callback-errors only --as failures"},
     {"record", "%record FILE [--sqlite] [STREAM OPTIONS]",
-     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay.",
-     "%record capture.db --sqlite --name account.adjusted --count 12"},
+     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay. Use --callback-errors exclude or only to select callback outcomes.",
+     "%record capture.db --sqlite --name account.adjusted --callback-errors only --count 12"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
@@ -216,6 +322,18 @@ const CommandTopic commands[] = {
     {"cpp options compdb", "%cpp options compdb DATABASE --file FILE",
      "Load flags from an exact compilation database entry or a C++ source in the same directory.",
      "%cpp options compdb build/compile_commands.json --file src/target.cpp"},
+    {"plugin", "", "Load and run trusted local C++ plugins in the REPL."},
+    {"plugin load", "%plugin load FILE --as NAME", "Compile or reuse a cached object and load it in its own JIT scope."},
+    {"plugin enable", "%plugin enable FILE --as NAME", "Load a trusted C++ plugin and remember it for future REPL sessions."},
+    {"plugin disable", "%plugin disable NAME", "Stop loading a plugin automatically in future REPL sessions."},
+    {"plugin reload", "%plugin reload NAME", "Stage a fresh generation for a loaded plugin and replace it if loading succeeds."},
+    {"plugin list", "%plugin list", "List loaded plugins and their active generations."},
+    {"plugin run", "%plugin run NAME COMMAND", "Run a command registered by a loaded plugin."},
+    {"plugin commands", "%plugin commands NAME", "Show a plugin's commands and their help."},
+    {"plugin agent", "", "Load and run trusted C++ plugins inside the selected target."},
+    {"plugin agent load", "%plugin agent load FILE --as NAME", "Load C++ source in the selected target's injected agent."},
+    {"plugin agent reload", "%plugin agent reload NAME [FILE]", "Reload an installed agent plugin from its manifest. Provide FILE to select a source or reload a standalone plugin."},
+    {"plugin agent run", "%plugin agent run NAME COMMAND", "Invoke a plugin command inside the selected target."},
     {"shell", "%shell \"COMMAND\"", "Run a local shell command and print its output.", R"(%shell "pwd")"},
     {"complete", "%complete \"C++ PREFIX\"", "List semantic C++ completions without evaluating the expression.",
      R"(%complete "tracer.")"},
@@ -251,22 +369,25 @@ if (data.size()) {
   auto e = data.at(0);
   std::cout << e.phase() << ' ' << e.function_name() << '\n';
 })",
+     "Use callback_error() and callback_error_message() to inspect callback failures. "
      "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
      "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
-     "to inspect captured fields without rebuilding an application type.", "Event"},
+     "to inspect captured fields without rebuilding an application type. "
+     "Use stack() to iterate over the captured frames.", "Event"},
     {"Collection", "A retained set of events with capture counters and status.",
      R"(auto data = tracer.batch("results");
 std::cout << data.received << " received, " << data.evicted << " evicted\n";
 if (data.size()) tracer.print(data.at(0));)",
      "Use size() for the retained count and at() for checked indexing. "
      "complete, cancelled, and timed_out describe how the capture ended.", "Collection"},
-    {"EventRange", "A synchronous or background capture handle with snapshot iteration.",
+    {"EventRange", "A synchronous or background capture handle that can be iterated in C++17.",
      R"(auto live = tracer.events_async(session, 10, 30);
+for (const auto& e : live) tracer.print(e);
 auto data = live.snapshot();
-for (const auto& e : data) tracer.print(e);
 if (live.running()) live.stop();
 std::cout << live.error() << '\n';)",
-     "Iteration reads a stable snapshot of currently retained events. Later snapshots may include new arrivals. "
+     "Iteration starts at the oldest retained event and waits for later ones until the count, timeout, stop() or Ctrl+C. "
+     "snapshot() returns the currently retained events without waiting. "
      "stop() preserves retained events. Release all copies of the range to free its capture reservation.", "EventRange"},
     {"EventValue", "An owned snapshot of a scalar, string, object, or container from a captured event.",
      R"(auto e = tracer.batch("results").at(0);
@@ -297,7 +418,11 @@ auto order = e.argument_as<app::Order>(0);)",
      R"(auto e = tracer.batch("results").at(0);
 auto input = e.argument_as<int>(0);)",
      "Use the captured C++ type. Use argument_snapshot(index) to inspect fields without a type mapping."},
-    {"Event::result_as", "Decode a captured return value as an owned C++ value.",
+    {"Event::stack", "Return the captured stack frames in order as an owned vector.",
+     R"(auto e = tracer.batch("results").at(0);
+for (const auto& frame : e.stack()) { std::cout << frame.pc << ' ' << frame.function << '\n'; })",
+     "An event with no stored frames returns an empty vector."},
+    {"Event::result_as", "Decode a captured return value as an owned C++ value (a Reconstructed<T> for records that cannot be constructed locally, such as handles holding pointers or references; do not move, copy or destroy it or reset its unique_ptr members).",
      R"(auto e = tracer.batch("results").at(0);
 if (e.phase() == "POST" && e.has_result()) {
   auto result = e.result_as<int>();
@@ -312,6 +437,16 @@ auto state = e.state_as<app::State>();)",
      "Use state_snapshot(index) to inspect fields without a mapping, or %cpp import for a local type definition."},
     {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
     {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
+    {"modules", "List application module paths in the selected process.",
+     R"(auto paths = tracer.modules("libdemo.so");)",
+     "Pass an optional case-sensitive path substring. The ModuleList supports iteration, "
+     "size(), empty(), and at(index)."},
+    {"module_info", "Read the executable mappings for one module in the selected process.",
+     R"(auto info = tracer.module_info("libdemo.so");
+std::cout << info.path << ' ' << info.mapping_token << '\n';)",
+     "Pass the exact path or a unique basename. Missing and ambiguous names throw std::invalid_argument. "
+     "Each entry in info.mappings contains begin_address, end_address (exclusive), "
+     "file_offset, device, inode, and build_id."},
     {"prepare", "Generate a reusable probe package from local headers.",
      R"example(tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");)example",
      "Pass one header, a braced list, or a vector of header paths. Order the probe's declaration header first, "
@@ -354,7 +489,7 @@ query.names = {"account.adjusted"};
 query.count = 20;
 auto data = tracer.replay("capture.db", query);
 if (data.size()) tracer.print(data.at(0));)",
-     "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
+     "Set names, phase, pid, session_id, callback_errors, or count to narrow the read. Names match exact function "
      "selectors or custom event names. Count zero reads all matches and retains the latest that fit. "
      "SQLite replay loads compatible recorded C++ types and generates their mappings before the next input."},
     {"batch", "Get a Collection from a named capture or replay.",
@@ -365,7 +500,7 @@ if (data.size()) tracer.print(data.at(0));)",
      R"(auto data = tracer.batch("results");
 tracer.print(data);
 if (data.size()) tracer.print(data.at(0));)"},
-    {"adaptors", "Filter, slice, and transform Collection and EventRange values with pipelines.",
+    {"adaptors", "Filter, slice, and transform Collection and EventRange values with C++17 pipelines.",
      R"(auto data = tracer.batch("results");
 auto is_post = [](const auto& e) { return e.phase() == "POST"; };
 auto first_post = data | filter(is_post) | first();

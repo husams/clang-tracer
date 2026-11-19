@@ -4,9 +4,9 @@ set(TRACER_JIT_FLAGS "" CACHE STRING "Semicolon-separated default compiler flags
 set(_tracer_jit_entries "")
 set(_tracer_jit_count 0)
 set(_tracer_runtime_jit_flags ${TRACER_JIT_FLAGS})
-if(NOT TRACER_JIT_FLAGS AND CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
+if(TRACER_SDK_ROOT OR (NOT TRACER_JIT_FLAGS AND CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES))
   # Embedded Clang skips driver configuration files. Match the build compiler's
-  # standard library when the application has no explicit toolchain profile.
+  # standard library for SDK builds and when no JIT profile is configured.
   list(APPEND _tracer_runtime_jit_flags -nostdinc++)
   foreach(_include IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
     list(APPEND _tracer_runtime_jit_flags -isystem "${_include}")

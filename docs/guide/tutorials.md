@@ -49,7 +49,7 @@ The POST event now includes `new_sum`; the target still returns 42. Remove the a
 
 ## Trace a function template instantiation
 
-Extend the first lab's `target.cpp` with this function above `main`. Inside the existing newline branch, add `std::printf("echo<int>(42) = %d\n", echo<int>(42));` before the flush. Rebuild and restart the target using the same commands as the first lab.
+Save this function in `echo.hpp` and add `#include "echo.hpp"` to the first lab's `target.cpp`. Inside the existing newline branch, add `std::printf("echo<int>(42) = %d\n", echo<int>(42));` before the flush. Rebuild and restart the target. Use the [compilation database setup](#prepare-a-reusable-probe) with the compiler used to build the target.
 
 ```cpp
 template <class T>
@@ -75,13 +75,14 @@ public:
 };
 ```
 
-Start a fresh REPL and attach using the new PID. Quote the complete selector, including the concrete template arguments and function parameters. With `--prepared-mode off`, the tracer recovers the signature from DWARF.
+Start a fresh REPL and attach using the new PID. Quote the complete selector, including the concrete template arguments and function parameters. Build a prepared package from `echo.hpp` to supply the concrete signature on this branch.
 
 ```bash
 %attach 12345
 %symbols --filter "echo<"
-%probe validate "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off
-%probe inject "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off --print-result
+%probe prepare "echo<int>(int)" --include echo.hpp --translation-unit target.cpp --module ./target --output prepared-echo
+%probe validate "echo<int>(int)" --callback echo-hook.cpp --prepared prepared-echo --prepared-mode require
+%probe inject "echo<int>(int)" --callback echo-hook.cpp --prepared prepared-echo --prepared-mode require --print-result
 %collect --name "echo<int>(int)" --count 2 --timeout 30 --as echo_call
 %events list echo_call
 ```
@@ -111,11 +112,11 @@ Trigger a call during collection. The summary should show one PRE/POST pair. To 
 %events stats fullstack
 ```
 
-Trigger one call. The stack shows the entry and available caller frames, with native PC, function/module, and source location where recovered. Both phases describe the entry stack. `full` follows the supported unwind chain and can report a partial unwind. If a deep stack exceeds shared transport capacity, raise the managed server's `--context-event-bytes` and, if needed, `--context-transport-memory-bytes` before starting a new session. See the [stack lab sources](https://github.com/husams/clang-tracer/tree/main/examples/call-stacks) for application-only filtering and callback-side symbolization.
+Trigger one call. The stack shows the entry and available caller frames, with native PC, function/module, and source location where recovered. Both phases describe the entry stack. `full` follows the supported unwind chain and can report a partial unwind. If a deep stack exceeds shared transport capacity, raise the managed server's `--context-event-bytes` and, if needed, `--context-transport-memory-bytes` before starting a new session. See the [stack lab sources](https://github.com/husams/clang-tracer/tree/c++17/examples/call-stacks) for application-only filtering and callback-side symbolization.
 
 ## Capture in the background and query in C++
 
-Use the probe with `--print-result` from the stack lab. Start a background range, trigger two target calls, and examine a stable snapshot. The predicate and transformation run in the REPL.
+Use the probe with `--print-result` from the stack lab. Start a background range, which returns immediately, then iterate it. Iteration waits for events and yields each one as the agent streams it, so trigger the two target calls while the loop runs. The predicate and transformation run in the REPL.
 
 ```cpp
 using namespace tracer_repl;
@@ -123,16 +124,14 @@ auto range = tracer.events_async(session, 4, 60);
 ```
 
 ```cpp
-auto snapshot = range.snapshot();
-auto sums = snapshot
+auto sums = range
     | filter([](const Event& event) { return event.phase() == "POST"; })
-    | transform([](const Event& event) { return event.result_as<int>(); })
-    | to_vector();
+    | transform([](const Event& event) { return event.result_as<int>(); });
 for (auto value : sums) std::cout << value << '\n';
 range.stop();
 ```
 
-Expect two values of 42 when both calls have finished. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#event-ranges) for further examples.
+Each 42 prints as its call returns. The loop ends after the four requested events, at the 60-second timeout, on `range.stop()`, or on Ctrl+C, which leaves the collector running. `range.snapshot()` returns the events retained so far without waiting. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#c17-event-ranges) for further examples.
 
 ## Record and replay offline
 
@@ -191,7 +190,7 @@ Rebuild and restart the target. Generate a package with a new output directory a
 %events show prepared_call --index 1
 ```
 
-Trigger one call and check for 42. `require` verifies that injection uses the package. Multiple `--include` options can bring in callback payload declarations. `--cwd` runs the probe command relative to another project directory, and `--extra-arg` passes supplemental compiler flags. Use the offline preparer from the [command reference](commands.md#offline-probe-preparation) for the equivalent shell workflow. Run the [prepared method lab](https://github.com/husams/clang-tracer/tree/main/examples/prepared-injectors) to capture a receiver and replay a custom typed event.
+Trigger one call and check for 42. `require` verifies that injection uses the package. Multiple `--include` options can bring in callback payload declarations. `--cwd` runs the probe command relative to another project directory, and `--extra-arg` passes supplemental compiler flags. Use the offline preparer from the [command reference](commands.md#offline-probe-preparation) for the equivalent shell workflow. Run the [prepared method lab](https://github.com/husams/clang-tracer/tree/c++17/examples/prepared-injectors) to capture a receiver and replay a custom typed event.
 
 ## Decode objects, containers, and method receivers
 
@@ -215,11 +214,11 @@ auto sample = tracer.batch("orders").at(0);
 auto order = sample.argument_as<app::Order>(0);
 ```
 
-Alternatively `%cpp import model.hpp --type app::Order` generates, caches, and loads a mapping in one step. Automatic mapping requires supported public members and an accessible default constructor. Use `EventCodec<T>` for construction through a factory, or `argument_snapshot(0).field("id")` to inspect fields without a mapping. For a method receiver, inspect `receiver_snapshot()` in the client and use `call.self()` in the agent. The [typed C++ argument example](https://github.com/husams/clang-tracer/tree/main/examples/order-arguments) covers references, pointers, headerless DWARF recovery, and opt-in application headers.
+Alternatively `%cpp import model.hpp --type app::Order` generates, caches, and loads a mapping in one step. Automatic mapping requires supported public members and an accessible default constructor. Use `EventCodec<T>` for construction through a factory, or `argument_snapshot(0).field("id")` to inspect fields without a mapping. For a method receiver, inspect `receiver_snapshot()` in the client and use `call.self()` in the agent. The [typed C++ argument example](https://github.com/husams/clang-tracer/tree/c++17/examples/order-arguments) covers references, pointers, headerless DWARF recovery, and opt-in application headers.
 
 ## Observe shared context and thread propagation
 
-Run the [shared-context example](https://github.com/husams/clang-tracer/tree/main/examples/shared-context) from a configured source checkout with examples enabled. Start the server and target, then install the same observer on the outer and worker functions.
+Run the [shared-context example](https://github.com/husams/clang-tracer/tree/c++17/examples/shared-context) from a configured source checkout with examples enabled. Start the server and target, then install the same observer on the outer and worker functions.
 
 ```bash
 cmake --build build-rhel --target shared-context-target
@@ -422,31 +421,17 @@ request 2: authenticate(77)=1 price_item(120)=24 price_item(350)=35 price_item(9
 
 All four observers declare `Interceptor(State<RequestState>)`, and `RequestState` derives from `shared_state<RequestScope>`, so probes that run inside the same request receive the same object. The state starts with the outermost probed call, here `handle_checkout`, and ends when that call returns, which keeps the two overlapping requests apart. Only `request.cpp` publishes an event, and `%collect --name` selects it, so you receive one event per request instead of one per call. `%events show requests --index 0` prints the same state as a `decoded state RequestState` line without any C++. Finish with `%detach`. [Shared context](../shared-context.md) describes the state API.
 
-## Automate tracing with Python
+## Trace from the native CLI
 
-Start the target from the first lab and a server listening on loopback. In the same directory as `hook.cpp`, run the [Python client example](developer.md#resolve-validate-install-and-restore) with the real PID. Trigger one target call when prompted. The script prints two events, removes the probe and detaches. Repeat with `watch_events` for a cursor-based stream or use `record_traces` to write a framed recording that the native REPL can replay.
+Use the [first-probe target](user.md#create-a-target-and-a-basic-probe).
+Start a server in a separate terminal.
 
 ```bash
 clang-tracer-server --listen 127.0.0.1:50051
 ```
 
-The [Python client walkthrough](../../python/README.md) includes launch, readiness and shutdown, console examples, and recording. Installed examples in `share/clang-tracer/examples/python` exercise the Python API end to end.
-
-## Trace from the Python console or the native CLI
-
-Use the running target and server from the previous lab. Run `clang-tracer-console --endpoint 127.0.0.1:50051`, then enter these commands. Trigger one call while collecting.
-
-```bash
-attach 12345
-symbols --filter "add("
-probe validate "add(int, int)" --callback hook.cpp
-probe inject "add(int, int)" --callback hook.cpp --print-result
-collect 2 --timeout 30
-detach
-exit
-```
-
-For explicit raw ABI mode, save this as `legacy.cpp` and attach the target again. `nm ./target` can confirm the linkage name for the example build.
+In the client terminal, set `PID` to the PID printed by the target and use
+the same loopback endpoint. Save this entry-only observer as `legacy.cpp`. `nm ./target` can confirm the linkage name for the example build.
 
 ```cpp
 extern "C" long long trace_callback(const TraceContext& context) {
@@ -456,6 +441,7 @@ extern "C" long long trace_callback(const TraceContext& context) {
 ```
 
 ```bash
+export CLANG_TRACER_ENDPOINT=127.0.0.1:50051
 clang-tracer attach "$PID"
 clang-tracer trace "$PID" --function _Z3addii --return int32 \
   --arg int32 --arg int32 --callback legacy.cpp
@@ -475,4 +461,60 @@ cd /usr/local/share/clang-tracer/examples/native-repl-jit
 ./run.sh --interactive
 ```
 
-The first run performs bulk trace setup, capture, SQLite recording, and offline C++ analysis. It reports `JIT_EXAMPLE_PASSED=3`. The interactive run lets you explore mapping inspection, function entry previews and observer reload. See the [example walkthrough](https://github.com/husams/clang-tracer/tree/main/examples/native-repl-jit).
+The first run performs bulk trace setup, capture, SQLite recording, and offline C++ analysis. It reports `JIT_EXAMPLE_PASSED=3`. The interactive run lets you explore mapping inspection, function entry previews and observer reload. See the [example walkthrough](https://github.com/husams/clang-tracer/tree/c++17/examples/native-repl-jit).
+
+## Lesson 16: follow polymorphic items through two probes
+
+Build and start the [lesson 16 project](../../examples/lessons/16-polymorphic-items/README.md) on Linux. Use the compiler and standard library from the tracer's build profile. For a GCC 8.5 SDK tracer, pass the SDK's `clang++` as `make CXX=/path/to/sdk/bin/clang++` (and set its runtime search path if required by that SDK). Mixing system and SDK headers can leave only addresses with an unsupported standard-library diagnostic.
+
+```bash
+cd examples/lessons/16-polymorphic-items
+make
+./target
+```
+
+Start `clang-tracer-repl` in a second terminal in the same directory and substitute the PID printed by the target. Prepare and inject the factory first:
+
+```text
+%attach PID
+%probe prepare "ItemFactory::create(const std::string&) const" --include item_factory.hpp --translation-unit target.cpp --output prepared-create
+%probe inject "ItemFactory::create(const std::string&) const" --prepared prepared-create --prepared-mode require --snapshot-return-pointee
+%collect --name "ItemFactory::create(const std::string&) const" --phase POST --count 3 --timeout 30 --as items
+```
+
+Press Enter once while collecting. Run `%cpp load report.cpp`: expect `ItemV1`, `ItemV2`, and `ItemV3` and their inherited fields and containers. Continue in **the same REPL**:
+
+```text
+%probe prepare "Item::encode(const std::string&) const" --include item_factory.hpp --translation-unit target.cpp --output prepared-encode
+%probe inject "Item::encode(const std::string&) const" --prepared prepared-encode --prepared-mode require
+%collect --name "Item::encode(const std::string&) const" --phase POST --count 3 --timeout 30 --as encoded
+```
+
+Press Enter once more. Expect the second injection to report `reused imported types:` rather than redefining the shared classes. Run `%cpp load encoded.cpp`. The factory result snapshot owns the returned item's fields. For `encode`, use the receiver snapshot to find `impl_snapshot` and use `result_as<std::string>()` for the encoded text. Finish with `%detach` and `%quit`. Try the [explicit pointer policy](advanced.md#write-a-followpointers-policy) next.
+
+## Lesson 17: trace writes without rebuilding the target
+
+Use the [prebuilt object-watch exercise](../native-repl.md#run-a-scalar-write-watch-on-x86-64). Build the fixture once, start it, and leave it running. In the REPL, prepare a plan with `--field value --backend code-cache` from its existing ELF, attach, and preview. Preview should report `binding=same-build` and a verified store site. Start the plan and record two `object.trace` events to SQLite. Enter `g` in the fixture while recording.
+
+Replay in the REPL after stopping the watch and detaching:
+
+```text
+%events open object-writes.db --as saved
+%events list saved
+%events show saved --index 1
+%events stack saved --index 1
+```
+
+Expect one creation and a write from 17 to 23. Check `%object status WATCH_ID` after stopping: the watch should be inactive with no restoration pending. Restart the fixture, use a fresh recording path, and add `--no-values` to start. Expect a `FIELD_WRITTEN` event without before or after samples. This distinction matters when a store writes back the same value. For logical container changes during a method, use the [advanced method-watch lesson](advanced.md#watch-logical-state-at-method-boundaries).
+
+## Lesson 18: stream and release a counted range
+
+Use the [first-probe target](user.md#create-a-target-and-a-basic-probe), attached with its add probe installed. In the REPL start a counted background range and iterate:
+
+```cpp
+auto live = tracer.events_async(session, 4, 30);
+for (const auto& e : live) std::cout << e.phase() << ' ' << e.sequence() << '\n';
+auto retained = live.snapshot();
+```
+
+Press Enter once in the target while iteration waits. Expect PRE and POST immediately, with the REPL still waiting. Press Enter again to reach four events and return to the prompt. Check `retained.complete` and `retained.size()`. You can start another capture while holding `live`: the completed range only keeps storage for its retained events. Release range copies when done. If iteration ends early, inspect `live.error()` and the snapshot counters before assuming every call was captured.

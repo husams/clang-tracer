@@ -1,6 +1,5 @@
 #include <array>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -102,8 +101,8 @@ int main() {
   require(tracer::compat::countr_zero(0x40u) == 6 && tracer::compat::countr_zero(0x80000000u) == 31,
           "countr_zero returned an incorrect count");
 
-  alignas(AlignedValue) std::byte storage[sizeof(AlignedValue)];
-  auto* aligned = reinterpret_cast<AlignedValue*>(storage);
+  typename std::aligned_storage<sizeof(AlignedValue), alignof(AlignedValue)>::type storage;
+  auto* aligned = reinterpret_cast<AlignedValue*>(&storage);
   AlignedValue* constructed = tracer::compat::construct_at(aligned, 42);
   require(constructed == aligned && constructed->value == 42 &&
               reinterpret_cast<std::uintptr_t>(constructed) % alignof(AlignedValue) == 0,

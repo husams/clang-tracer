@@ -2,10 +2,12 @@
 
 #include "prepared_types.hpp"
 #include "prepared_header_discovery.hpp"
+#include "record_factory.hpp"
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/Expr.h>
 #include <clang/Basic/SourceManager.h>
+#include <clang/Sema/Sema.h>
 #include <llvm/ADT/StringExtras.h>
 
 #include <algorithm>
@@ -29,7 +31,7 @@ struct AdapterDeclarations {
 
 class AdapterEmitter {
 public:
-  static AdapterDeclarations emit(clang::ASTContext &ast,
+  static AdapterDeclarations emit(clang::ASTContext &ast, clang::Sema &sema,
                                   const clang::HeaderSearch &toolchain_search,
                                   const clang::FunctionDecl &function,
                                   const std::vector<std::string> &headers,
@@ -38,7 +40,7 @@ public:
     std::vector<NestedRequest> late_requests;
     for (;;) {
       const auto reserved = late_requests.size();
-      AdapterEmitter pass(ast, toolchain_search, late_requests);
+      AdapterEmitter pass(ast, sema, toolchain_search, late_requests);
       pass.emit_declarations(function, headers, pointer_layouts, snapshot_types);
       if (!pass.first_late_dependency_)
         return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
@@ -56,10 +58,10 @@ private:
     bool complete;
   };
 
-  AdapterEmitter(clang::ASTContext &ast,
+  AdapterEmitter(clang::ASTContext &ast, clang::Sema &sema,
                  const clang::HeaderSearch &toolchain_search,
                  std::vector<NestedRequest> &late_requests)
-      : ast_(ast), policy_(ast.getLangOpts()),
+      : ast_(ast), sema_(sema), policy_(ast.getLangOpts()),
         header_discovery_(ast, toolchain_search), late_requests_(late_requests) {
     policy_.SuppressTagKeyword = true;
     policy_.FullyQualifiedName = true;
@@ -165,6 +167,51 @@ private:
       visit(parameter->getType(), complete);
   }
 
+  std::string emit_factory_constructor(const record_factory::Recipe &recipe) {
+    const auto &ctor = *recipe.constructor;
+    const auto argument_name = [](unsigned index) {
+      return "__tracer_ctor_arg" + std::to_string(index);
+    };
+    std::string source = access(ctor.getAccess()) + ": ";
+    if (ctor.isExplicit())
+      source += "explicit ";
+    source += ctor.getParent()->getNameAsString() + "(";
+    for (unsigned index = 0; index < ctor.getNumParams(); ++index) {
+      if (index)
+        source += ", ";
+      const auto type = ctor.getParamDecl(index)->getType();
+      visit(type);
+      source += spelling(type, argument_name(index));
+    }
+    source += ")";
+    const auto *prototype = ctor.getType()->castAs<clang::FunctionProtoType>();
+    if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
+        prototype->isNothrow())
+      source += " noexcept";
+    bool first = true;
+    for (const auto &initializer : recipe.initializers) {
+      source += first ? " : " : ", ";
+      first = false;
+      source += initializer.field ? initializer.field->getNameAsString()
+                                  : spelling(initializer.base);
+      source += "(";
+      for (std::size_t index = 0; index < initializer.arguments.size(); ++index) {
+        if (index)
+          source += ", ";
+        const auto &argument = initializer.arguments[index];
+        const auto name = argument_name(argument.index);
+        if (argument.move) {
+          standard_headers_.insert("utility");
+          source += "::std::move(" + name + ")";
+        } else {
+          source += name;
+        }
+      }
+      source += ")";
+    }
+    return source + " {}\n";
+  }
+
   // Reserve direct signature dependencies before additional headers or another
   // signature type can cause their owning record to be emitted.
   void register_nested(const clang::NamedDecl &decl, bool complete = true) {
@@ -194,6 +241,16 @@ private:
     }
   }
 
+  const char *exception_suffix(const clang::FunctionDecl &decl) {
+    auto *prototype = decl.getType()->castAs<clang::FunctionProtoType>();
+    if (clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()))
+      prototype = sema_.ResolveExceptionSpec(decl.getLocation(), prototype);
+    if (!prototype || clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) ||
+        prototype->getExceptionSpecType() == clang::EST_DependentNoexcept)
+      unsupported(decl, "exception specification could not be resolved");
+    return prototype->isNothrow() ? " noexcept" : "";
+  }
+
   std::string callable(const clang::FunctionDecl &decl, bool selected = true) {
     std::string source;
     if (decl.isExternC())
@@ -207,6 +264,7 @@ private:
     if (method && method->isVirtual())
       source += "virtual ";
     const bool destructor = llvm::isa<clang::CXXDestructorDecl>(decl);
+    const bool constructor = llvm::isa<clang::CXXConstructorDecl>(decl);
     const auto *conversion = llvm::dyn_cast<clang::CXXConversionDecl>(&decl);
     std::string name;
     if (linkage_alias)
@@ -230,15 +288,17 @@ private:
       if (method->getRefQualifier() == clang::RQ_LValue) name += " &";
       if (method->getRefQualifier() == clang::RQ_RValue) name += " &&";
     }
-    if (decl.getType()->castAs<clang::FunctionProtoType>()->isNothrow())
-      name += " noexcept";
-    source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
+    name += exception_suffix(decl);
+    // Constructors and destructors have no return type to spell.
+    source += (destructor || constructor || conversion) ? name : spelling(decl.getReturnType(), name);
     if (!symbol.empty())
       source += " __asm__(\"" + symbol + "\")";
     if (decl.isPureVirtual())
       source += " = 0";
     else if (decl.isDeletedAsWritten())
       source += " = delete";
+    else if (destructor && decl.isExplicitlyDefaulted() && decl.isInlined())
+      source += " = default";
     return source + ";\n";
   }
 
@@ -639,6 +699,7 @@ private:
       source += ";\n";
     }
     bool emitted_selected = false;
+    bool emitted_default_constructor = false;
     for (const auto *method : record.methods()) {
       if (method->isImplicit())
         continue;
@@ -664,6 +725,7 @@ private:
       if ((!ctor && !destructor) ||
           (!custom && !method->isExplicitlyDefaulted() && !method->isDeletedAsWritten()))
         continue;
+      emitted_default_constructor |= ctor && ctor->getNumParams() == 0;
       source += access(method->getAccess()) + ": ";
       if (destructor)
         source += "~";
@@ -679,14 +741,22 @@ private:
       source += ")";
       if (custom) {
         // Keep the call ABI without compiling application lifetime code.
-        const auto *prototype = method->getType()->castAs<clang::FunctionProtoType>();
-        if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
-            prototype->isNothrow())
-          source += " noexcept";
+        source += exception_suffix(*method);
       } else {
         source += method->isDeletedAsWritten() ? " = delete" : " = default";
       }
+      // This lifetime declaration already is the selected constructor or destructor.
+      emitted_selected |= selected_method_ &&
+          method->getCanonicalDecl() == selected_method_->getCanonicalDecl();
       source += ";\n";
+    }
+    if (const auto recipe = record_factory::infer(record)) {
+      source += emit_factory_constructor(*recipe);
+    } else if (record.hasUserDeclaredConstructor() && !emitted_default_constructor &&
+               (!record.hasDefaultConstructor() || record.isDynamicClass() || record.getNumBases())) {
+      // Dropping application constructor bodies must not give a layout-only
+      // adapter an implicit constructor for local snapshot reconstruction.
+      source += "private: " + record.getNameAsString() + "() = delete;\n";
     }
     if (!emitted_selected && selected_method_ &&
         selected_method_->getParent()->getCanonicalDecl() == record.getCanonicalDecl() &&
@@ -727,6 +797,7 @@ private:
   }
 
   clang::ASTContext &ast_;
+  clang::Sema &sema_;
   clang::PrintingPolicy policy_;
   HeaderDiscovery header_discovery_;
   const clang::CXXMethodDecl *selected_method_ = nullptr;

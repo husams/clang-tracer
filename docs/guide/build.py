@@ -15,24 +15,25 @@ from pygments.util import ClassNotFound
 
 GUIDE = Path(__file__).resolve().parent
 ROOT = GUIDE.parent.parent
-GITHUB = "https://github.com/husams/clang-tracer/blob/main/"
+GITHUB = "https://github.com/husams/clang-tracer/blob/c++17/"
 CHAPTERS = {
     "Get started": {
         "user": "docs/guide/user.md",
         "tutorials": "docs/guide/tutorials.md",
     },
-    "Reference": {
-        "commands": "docs/guide/commands.md",
-        "developer": "docs/guide/developer.md",
+    "Advanced": {
+        "advanced": "docs/guide/advanced.md",
     },
     "Walkthroughs": {
         "install": "docs/build-rhel.md",
+        "gcc85": "docs/gcc85-compatibility.md",
+        "gcc85-results": "docs/gcc85-runtime-results.md",
         "repl": "docs/native-repl.md",
-        "python": "python/README.md",
         "storage": "docs/event-storage.md",
         "context": "docs/shared-context.md",
     },
     "Runnable examples": {
+        "lesson-items": "examples/lessons/16-polymorphic-items/README.md",
         "example-callback": "examples/basic-callbacks/README.md",
         "example-legacy": "examples/legacy-callbacks/README.md",
         "example-interceptor": "examples/cpp-interceptors/README.md",
@@ -42,8 +43,21 @@ CHAPTERS = {
         "example-stack": "examples/call-stacks/README.md",
         "example-shared": "examples/shared-context/README.md",
         "example-jit": "examples/native-repl-jit/README.md",
-        "example-python": "examples/python/README.md",
         "validation": "docs/validation.md",
+    },
+    "Optional Python": {
+        "python-client": "docs/guide/python-client.md",
+        "python": "python/README.md",
+        "example-python": "examples/python/README.md",
+    },
+    "References": {
+        "commands": "docs/guide/commands.md",
+        "developer": "docs/guide/developer.md",
+        "cpp17": "docs/guide/cpp17.md",
+    },
+    "Appendixes": {
+        "command-reference": "docs/guide/command-reference.md",
+        "api-reference": "docs/guide/api-reference.md",
     },
 }
 CHAPTER_IDS = {ROOT / path: key for group in CHAPTERS.values() for key, path in group.items()}
@@ -58,6 +72,8 @@ def format_code(tokens, index, options, env):
     language = token.info.split()[0] if token.info.strip() else "text"
     if language == "text" and re.search(r"^%[a-z]", token.content, re.MULTILINE):
         language = "bash"
+    if language == "plain":
+        return f'<pre class="syntax"><code>{html.escape(token.content)}</code></pre>\n'
     try:
         lexer = get_lexer_by_name(language)
     except ClassNotFound:
@@ -118,9 +134,12 @@ def render():
                     duplicate += 1
                 used_ids.add(anchor)
                 token.attrSet("id", anchor)
-                if token.tag in {"h1", "h2"}:
-                    label = "Overview" if token.tag == "h1" else html.escape(title)
-                    headings.append(f'<a href="#{anchor}">{label}</a>')
+                deep_reference = key in {"command-reference", "api-reference"}
+                if token.tag in {"h1", "h2"} or (deep_reference and token.tag == "h3"):
+                    label = "Overview" if token.tag == "h1" else title
+                    if key == "command-reference" and title.startswith("Command "):
+                        label = "%" + title.removeprefix("Command ")
+                    headings.append(f'<a href="#{anchor}">{html.escape(label)}</a>')
                 if token.tag == "h1":
                     chapter_title = html.escape(title)
                 token.tag = f"h{min(int(token.tag[1:]) + 1, 6)}"

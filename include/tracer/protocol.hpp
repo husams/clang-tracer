@@ -1,7 +1,12 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace tracer {
 inline constexpr std::uint32_t kProtocolVersion = 2;
@@ -16,8 +21,12 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 26 replaces the inline callback stack array with an invocation view.
 // Version 27 configures the shared-context event budget in the bootstrap.
 // Version 28 also carries the shared transport memory budget.
-// Version 29 describes entry, call-site, and trap patch ownership separately.
-inline constexpr std::uint32_t kBootstrapVersion = 29;
+// Version 30 combines scalar control and native patch ownership.
+// Version 31 carries the type registration ID for grouped method callbacks.
+// Version 32 requires dynamically growing probe storage in the target agent.
+// Version 33 replaces fixed argument/named-value arrays with invocation views;
+// signature argument types are loaded from the serialized ProbeSpec.
+inline constexpr std::uint32_t kBootstrapVersion = 33;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -25,8 +34,6 @@ struct ContextTransportBudget {
   std::uint64_t memory_bytes = kDefaultContextTransportMemoryBytes;
 };
 inline constexpr unsigned kMaxPatchBytes = 64;
-inline constexpr unsigned kMaxArguments = 8;
-inline constexpr unsigned kMaxProbes = 32;
 inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
 enum class StackStatus : std::uint32_t {
@@ -84,7 +91,7 @@ enum class CallableKind : std::uint32_t {
   Function = 1,
   Method = 2
 };
-enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
+enum class TracePhase : std::uint32_t { Pre = 1, Post = 2, Exception = 3 };
 enum class LogLevel : std::uint8_t { Info, Warning, Error };
 
 struct ValueSnapshot;
@@ -92,7 +99,9 @@ struct ValueSnapshotMember {
   const char *name = nullptr;
   const ValueSnapshot *snapshot = nullptr;
 };
-inline constexpr std::size_t kMaxSnapshotMembers = 128;
+// The followed members one snapshot may carry and how deep they nest are the
+// options --follow-members and --follow-depth (snapshot_limits.hpp); the
+// agent learns them from the probes it installs (snapshot_runtime_limits.hpp).
 
 struct ValueSnapshot {
   enum Status : std::uint32_t {
@@ -131,21 +140,57 @@ struct CallbackPrintOptions {
   bool result = false;
 };
 
+struct NativeStackStorage;
+
+struct ScalarOverrides {
+  bool allow_arguments = false;
+  bool allow_result = false;
+  bool allow_replacement = false;
+  unsigned char* argument_set = nullptr;
+  bool result_set = false;
+  bool replacement_set = false;
+  std::uint64_t* arguments = nullptr;
+  std::uint64_t result = 0;
+  std::uint64_t replacement = 0;
+
+  template <class T> static std::uint64_t pack(T value) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(T));
+    return bits;
+  }
+
+  template <class T> static T unpack(std::uint64_t bits) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    T value;
+    std::memcpy(&value, &bits, sizeof(T));
+    return value;
+  }
+};
+
 struct TraceContext;
 namespace detail {
+inline bool append_named_value(const TraceContext*, const char*, std::size_t, const TraceValue&,
+                               std::uint32_t, std::uint32_t) noexcept;
 extern "C" bool tracer_enqueue_log(const TraceContext *, const char *,
                                    std::size_t, LogLevel) noexcept;
 }
-struct NativeStackStorage;
 
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
+  // Populated only when the receiver matched a published object-watch
+  // registration at this invocation's entry. These values are copied into
+  // the invocation so PRE and POST refer to the same lifetime generation.
+  std::uint64_t object_watch_id = 0;
+  std::uint64_t object_id = 0;
+  std::uint64_t object_generation = 0;
+  bool object_identity_verified = false;
   const ValueSnapshot *receiver_snapshot = nullptr;
   std::uint32_t argument_count = 0;
   std::uint32_t reserved = 0;
-  TraceValue arguments[kMaxArguments]{};
-  const char *argument_names[kMaxArguments]{};
+  TraceValue* arguments = nullptr;
+  const char** argument_names = nullptr;
   CallbackPrintOptions printing{};
   std::uint64_t call_id = 0;
   TracePhase phase = TracePhase::Pre;
@@ -153,11 +198,17 @@ struct TraceContext {
   struct NamedValue {
     std::uint32_t kind = 0; // 1 = explicit argument, 2 = object field.
     std::uint32_t argument_index = 0;
-    char name[64]{};
+    const char* name = nullptr;
+    std::size_t name_size = 0;
     TraceValue value{};
   };
   mutable std::uint32_t named_count = 0;
-  mutable NamedValue named_values[16]{};
+  mutable NamedValue* named_values = nullptr;
+  void* named_storage = nullptr;
+  // Allocation belongs to the native invocation, even when a callback runs
+  // with the isolated shared-context standard library.
+  bool (*append_named)(const TraceContext*, const char*, std::size_t, const TraceValue&,
+                       std::uint32_t, std::uint32_t) noexcept = &detail::append_named_value;
   // Entry caller state, recovered from Clang's forced wrapper frame pointer.
   // Only RBP/RSP/RIP are known initially; unsupported CFI stops explicitly.
   std::uint64_t wrapper_frame = 0;
@@ -172,15 +223,63 @@ struct TraceContext {
   void (*stack_capture)(const TraceContext *, unsigned,
                         bool) noexcept = nullptr;
   mutable StackTrace stack{};
+  // Agent-owned storage backing this invocation's stack view.
+  mutable NativeStackStorage *stack_storage = nullptr;
+  // Wrapper-owned storage. Callbacks receive private staging storage.
+  ScalarOverrides *scalar_overrides = nullptr;
+  std::uint64_t original_entry_time_ns = 0;
+  void *original_state = nullptr;
+  std::uint64_t (*invoke_original)(void *) = nullptr;
   // True means the message was queued for best-effort agent logging.
   bool log(std::string_view message,
            LogLevel level = LogLevel::Info) const noexcept {
     return detail::tracer_enqueue_log(this, message.data(), message.size(),
                                      level);
   }
-  // Agent-owned storage backing this invocation's stack view.
-  mutable NativeStackStorage *stack_storage = nullptr;
 };
+
+namespace detail {
+// This owning type never crosses the callback ABI. TraceContext carries only
+// a POD view plus a native append function, so callbacks with an isolated or
+// different standard-library ABI cannot allocate into a native std::container.
+struct NamedValueStorage {
+  std::vector<std::unique_ptr<std::string>> names;
+  std::vector<TraceContext::NamedValue> values;
+
+  void clear() noexcept {
+    std::vector<TraceContext::NamedValue>().swap(values);
+    std::vector<std::unique_ptr<std::string>>().swap(names);
+  }
+};
+
+inline bool append_named_value(const TraceContext* context, const char* name, std::size_t length,
+                               const TraceValue& value, std::uint32_t kind,
+                               std::uint32_t index) noexcept {
+  if (!context || !context->named_storage) {
+    return false;
+  }
+  auto& storage = *static_cast<NamedValueStorage*>(context->named_storage);
+  if (context->named_count != storage.values.size()) {
+    return false;
+  }
+  try {
+    auto owned = std::make_unique<std::string>(name, length);
+    TraceContext::NamedValue entry;
+    entry.kind = kind;
+    entry.argument_index = index;
+    entry.name = owned->c_str();
+    entry.name_size = length;
+    entry.value = value;
+    storage.names.push_back(std::move(owned));
+    storage.values.push_back(entry);
+    context->named_values = storage.values.data();
+    ++context->named_count;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+} // namespace detail
 
 enum class NativePatch : std::uint32_t { Entry = 0, CallSite = 1, Trap = 2 };
 
@@ -189,8 +288,11 @@ struct Request {
   CallableKind kind = CallableKind::Unspecified;
   ValueType result = ValueType::Unspecified;
   std::uint32_t argument_count = 0;
-  ValueType arguments[kMaxArguments]{};
+  // Populated in the agent from the serialized ProbeSpec, never dereferenced
+  // across the bootstrap process boundary.
+  const ValueType* arguments = nullptr;
   std::uint64_t probe_id = 0;
+  std::uint64_t object_watch_id = 0;
   char session_id[64]{};
   char symbol[512]{};
   char source_path[1024]{};

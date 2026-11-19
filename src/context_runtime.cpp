@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <new>
@@ -29,9 +30,6 @@ struct WorkerContext final {
       context->~Context();
   }
 };
-constexpr std::size_t kFrameSlots = 64;
-constexpr std::size_t kWorkspaceSlots = 64;
-constexpr std::size_t kRequests = context_engine::kMaxSlots;
 
 struct FrameToken final {
   SharedSourceRuntime *runtime = nullptr;
@@ -47,12 +45,9 @@ struct HookToken final {
   context_engine::Context *context = nullptr;
   context_facade::NativeHookContext native{};
   const TraceContext *trace = nullptr;
-  std::array<context_engine::SlotRequest, kRequests> requests{};
+  std::vector<context_engine::SlotRequest> requests{};
   std::size_t request_count = 0;
-  std::array<context_engine::ContextCapturePool::Lease,
-             context_engine::kCaptureEventsPerHook>
-      captures{};
-  std::size_t next_capture = 0;
+  std::deque<context_engine::ContextCapturePool::Lease> captures{};
   alignas(context_execution::CurrentHook) std::byte
       current_storage[sizeof(context_execution::CurrentHook)];
   context_execution::CurrentHook *current = nullptr;
@@ -68,14 +63,12 @@ struct HookToken final {
   bool active = false;
   bool direct = false;
   bool events_planned = false;
-  bool hook_budget_exhausted = false;
-  bool pool_exhausted = false;
 };
 
 struct AccessToken final {
   SharedSourceRuntime *runtime = nullptr;
   context_engine::Context *context = nullptr;
-  std::array<context_engine::SlotRequest, kRequests> requests{};
+  std::vector<context_engine::SlotRequest> requests{};
   std::size_t request_count = 0;
   alignas(context_execution::AccessLease) std::byte
       lease_storage[sizeof(context_execution::AccessLease)];
@@ -88,20 +81,21 @@ struct AccessToken final {
 };
 
 struct RuntimeThreadState final {
-  std::array<FrameToken, kFrameSlots> frames{};
+  std::deque<FrameToken> frames{};
   HookToken hook{};
   AccessToken access{};
 };
 
 struct WorkspaceSlot final {
-  std::atomic<bool> occupied{false};
   alignas(WorkerContext) std::byte worker_storage[sizeof(WorkerContext)];
   alignas(RuntimeThreadState) std::byte
       thread_state_storage[sizeof(RuntimeThreadState)];
   WorkerContext *worker = nullptr;
   RuntimeThreadState *thread_state = nullptr;
 
-  void construct() noexcept {
+  ~WorkspaceSlot() { destroy(); }
+
+  void construct() {
     worker = new (worker_storage) WorkerContext();
     thread_state = new (thread_state_storage) RuntimeThreadState();
   }
@@ -115,10 +109,7 @@ struct WorkspaceSlot final {
   }
 };
 
-static_assert(sizeof(WorkspaceSlot) * kWorkspaceSlots <=
-                  context_engine::kCaptureRuntimeWorkspaceBytes,
-              "native runtime workspace exceeds its 4 MiB budget");
-std::array<WorkspaceSlot, kWorkspaceSlots> workspace_pool{};
+std::atomic<std::size_t> workspace_count{0};
 std::atomic<std::uint64_t> native_event_sequence{0};
 thread_local context_engine::Context *tls_context = nullptr;
 thread_local const tracer::Call *tls_root_call = nullptr;
@@ -128,20 +119,19 @@ void release_workspace(WorkspaceSlot *slot) noexcept {
   if (!slot)
     return;
   slot->destroy();
-  slot->occupied.store(false, std::memory_order_release);
+  workspace_count.fetch_sub(1, std::memory_order_relaxed);
+  std::unique_ptr<WorkspaceSlot> owned(slot);
 }
 
 WorkspaceSlot *try_acquire_workspace() noexcept {
-  for (auto &slot : workspace_pool) {
-    bool expected = false;
-    if (!slot.occupied.compare_exchange_strong(expected, true,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_relaxed))
-      continue;
-    slot.construct();
-    return &slot;
+  try {
+    auto slot = std::make_unique<WorkspaceSlot>();
+    slot->construct();
+    workspace_count.fetch_add(1, std::memory_order_relaxed);
+    return slot.release();
+  } catch (...) {
+    return nullptr;
   }
-  return nullptr;
 }
 
 struct ThreadWorkspaceLease final {
@@ -270,8 +260,8 @@ resolve_request(SharedSourceRuntime &runtime, context_engine::Identity state,
 
 struct Captured final {
   SharedSourceRuntime *runtime = nullptr;
-  std::array<context_engine::CaptureSchemaView, kRequests> schemas{};
-  std::array<context_engine::CaptureStateView, kRequests> states{};
+  std::vector<context_engine::CaptureSchemaView> schemas{};
+  std::vector<context_engine::CaptureStateView> states{};
   std::size_t schema_count = 0;
   std::size_t state_count = 0;
   bool failed = false;
@@ -283,7 +273,7 @@ void collect_state(void *opaque, context_engine::Identity runtime_scope,
                    const context_engine::ScopeRegistration &registration,
                    void *payload) noexcept {
   auto &out = *static_cast<Captured *>(opaque);
-  if (out.failed || out.state_count == out.states.size()) {
+  if (out.failed) {
     out.failed = true;
     return;
   }
@@ -306,20 +296,28 @@ void collect_state(void *opaque, context_engine::Identity runtime_scope,
                    });
   std::uint64_t state_epoch = base_epoch;
   if (duplicate == out.schemas.begin() + out.schema_count) {
-    if (out.schema_count == out.schemas.size() ||
-        out.schema_count >
-            std::numeric_limits<std::uint64_t>::max() - base_epoch) {
+    if (out.schema_count > std::numeric_limits<std::uint64_t>::max() - base_epoch) {
       out.failed = true;
       return;
     }
     state_epoch += out.schema_count;
     schema.epoch_schema_id = state_epoch;
-    out.schemas[out.schema_count++] = schema;
+    try {
+      out.schemas.push_back(schema);
+      ++out.schema_count;
+    } catch (...) {
+      out.failed = true;
+      return;
+    }
   } else {
     state_epoch = duplicate->epoch_schema_id;
   }
-  out.states[out.state_count++] =
-      registered->capture_view(runtime_scope, state_epoch, payload);
+  try {
+    out.states.push_back(registered->capture_view(runtime_scope, state_epoch, payload));
+    ++out.state_count;
+  } catch (...) {
+    out.failed = true;
+  }
 }
 
 std::uint64_t next_native_event_sequence() noexcept {
@@ -378,10 +376,7 @@ context_engine::Context &worker_context() {
 }
 
 std::size_t workspace_slots_in_use() noexcept {
-  std::size_t count = 0;
-  for (const auto &slot : workspace_pool)
-    count += slot.occupied.load(std::memory_order_acquire) ? 1u : 0u;
-  return count;
+  return workspace_count.load(std::memory_order_acquire);
 }
 
 context_engine::Context *
@@ -416,13 +411,11 @@ SharedSourceRuntime::SharedSourceRuntime(
       publish_context_(publish_context) {
   if (!metadata_.epoch_schema_id || metadata_.source_id.size() != 16 ||
       metadata_.task_id.size() != 16 ||
-      (!metadata_.parent_task_id.empty() &&
-       metadata_.parent_task_id.size() != 16) ||
-      (!metadata_.invocation_id.empty() &&
-       metadata_.invocation_id.size() != 16) ||
-      (!metadata_.probe_id.empty() && metadata_.probe_id.size() != 16) ||
-      metadata_.capture_hook_id >= context_engine::kCaptureHooks || !publish_)
+      (!metadata_.parent_task_id.empty() && metadata_.parent_task_id.size() != 16) ||
+      (!metadata_.invocation_id.empty() && metadata_.invocation_id.size() != 16) ||
+      (!metadata_.probe_id.empty() && metadata_.probe_id.size() != 16) || !publish_) {
     throw std::invalid_argument("invalid shared-context event metadata");
+  }
   for (const auto &scope : scopes_) {
     if (!scope || !scope->registration)
       throw std::invalid_argument(
@@ -539,7 +532,11 @@ void *SharedSourceRuntime::native_frame_enter(void *opaque) {
   auto *context = active_context();
   if (!context)
     context = &worker_context();
-  for (auto &slot : slots().frames) {
+  auto& frames = slots().frames;
+  if (std::none_of(frames.begin(), frames.end(), [](const auto& slot) { return !slot.active; })) {
+    frames.emplace_back();
+  }
+  for (auto& slot : frames) {
     if (slot.active)
       continue;
     slot.runtime = &runtime;
@@ -594,17 +591,16 @@ void *SharedSourceRuntime::native_hook_begin(
   if (!context)
     context = &worker_context();
   auto &hook = slots().hook;
-  if (hook.active || count > hook.requests.size() || (count && !descriptors))
+  if (hook.active || (count && !descriptors)) {
     engine_error(context_engine::ErrorCode::capacity);
+  }
+  hook.requests.resize(count);
   hook.runtime = &runtime;
   hook.context = context;
   hook.trace = trace;
   hook.direct = direct;
   hook.events_planned = all_visible;
-  hook.hook_budget_exhausted = false;
-  hook.pool_exhausted = false;
   hook.request_count = 0;
-  hook.next_capture = 0;
   hook.native = {context_facade::NativeHookContext::kMagic,
                  {&runtime.function_table(), &runtime},
                  call,
@@ -621,20 +617,7 @@ void *SharedSourceRuntime::native_hook_begin(
     hook.requests[hook.request_count++] = std::move(request);
   }
 
-  // Reserve all bounded event buffers before any payload mutex wait.
-  if (all_visible)
-    for (auto &capture : hook.captures) {
-      capture = runtime.capture_pool_.try_reserve(
-          runtime.metadata_.capture_hook_id, runtime.metadata_.capture_event_bytes);
-      if (!capture) {
-        if (runtime.capture_pool_.outstanding(
-                runtime.metadata_.capture_hook_id) >=
-            context_engine::kCaptureEventsPerHook)
-          hook.hook_budget_exhausted = true;
-        else
-          hook.pool_exhausted = true;
-      }
-    }
+  hook.captures.clear();
 
   try {
     hook.current =
@@ -735,6 +718,7 @@ void *SharedSourceRuntime::native_access_begin(
       access.runtime = nullptr;
       access.context = nullptr;
       access.request_count = 0;
+      access.requests.clear();
       access.borrowed = false;
       access.active = false;
     }
@@ -744,8 +728,7 @@ void *SharedSourceRuntime::native_access_begin(
                          slots().hook.active ? slots().hook.trace : nullptr);
     return nullptr;
   };
-  if (access.active || count > access.requests.size() ||
-      (count && !descriptors)) {
+  if (access.active || (count && !descriptors)) {
     if (borrowing)
       return reject(context_engine::ErrorCode::active_access);
     report_native_status(context_engine::ErrorCode::active_access,
@@ -756,6 +739,7 @@ void *SharedSourceRuntime::native_access_begin(
   access.runtime = &runtime;
   access.context = context;
   access.request_count = 0;
+  access.requests.clear();
   for (std::size_t i = 0; i < count; ++i) {
     context_engine::SlotRequest request;
     if (borrowing) {
@@ -774,7 +758,8 @@ void *SharedSourceRuntime::native_access_begin(
                            slots().hook.active ? slots().hook.trace : nullptr);
       engine_error(context_engine::ErrorCode::incompatible_registration);
     }
-    access.requests[access.request_count++] = std::move(request);
+    access.requests.push_back(std::move(request));
+    ++access.request_count;
   }
   // A visitor nested in a direct hook borrows that hook's already planned and
   // locked set. The generated lifetime analysis guarantees the visitor cannot
@@ -952,8 +937,7 @@ bool SharedSourceRuntime::native_event(void *opaque, const TraceContext *trace,
         name);
     return false;
   }
-  if (!trace || !hook.active || hook.runtime != &runtime ||
-      hook.trace != trace || hook.next_capture == hook.captures.size()) {
+  if (!trace || !hook.active || hook.runtime != &runtime || hook.trace != trace) {
     runtime.capture_drops_.fetch_add(1, std::memory_order_relaxed);
     report_capture_drop(trace, "capture_hook_mismatch");
     return false;
@@ -969,16 +953,22 @@ bool SharedSourceRuntime::native_event(void *opaque, const TraceContext *trace,
         context_execution::Action::event_dropped, trace->call_id, 0, name);
     return false;
   }
-  auto &lease = hook.captures[hook.next_capture++];
+  if (!hook.events_planned) {
+    runtime.capture_drops_.fetch_add(1, std::memory_order_relaxed);
+    report_capture_drop(trace, "capture_unplanned_event");
+    return false;
+  }
+  try {
+    hook.captures.push_back(runtime.capture_pool_.try_reserve(
+        runtime.metadata_.capture_hook_id, runtime.metadata_.capture_event_bytes));
+  } catch (...) {
+    runtime.capture_drops_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  auto& lease = hook.captures.back();
   if (!lease) {
     runtime.capture_drops_.fetch_add(1, std::memory_order_relaxed);
-    report_capture_drop(trace, hook.events_planned
-                                   ? (hook.hook_budget_exhausted
-                                          ? "capture_hook_budget_exhausted"
-                                          : hook.pool_exhausted
-                                                ? "capture_pool_exhausted"
-                                                : "capture_reservation_exhausted")
-                                   : "capture_unplanned_event");
+    report_capture_drop(trace, "capture_allocation_failed");
     return false;
   }
   const auto capture = [&](context_engine::HookAccess &access) noexcept {
@@ -1046,7 +1036,7 @@ bool SharedSourceRuntime::native_event(void *opaque, const TraceContext *trace,
     return capture(*hook.access);
 
   // Event-only hooks and hooks that have finished a visitor use a fresh
-  // complete snapshot interval. All workspace was reserved in hook_begin.
+  // complete snapshot interval. Capture storage grows with the event request.
   bool captured = false;
   try {
     context_execution::AccessLease lease_guard;

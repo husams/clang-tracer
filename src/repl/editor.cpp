@@ -1,9 +1,12 @@
 #include "editor.hpp"
 
+#include "commands.hpp"
 #include "completion.hpp"
 #include "controller.hpp"
 #include "editor_completion.hpp"
 #include "syntax.hpp"
+
+#include <llvm/ADT/StringRef.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -15,6 +18,7 @@
 
 namespace tracer_repl {
 namespace {
+using llvm::StringRef;
 using std::string_view;
 using Color = replxx::Replxx::Color;
 constexpr string_view whitespace = " \t\r\n";
@@ -76,7 +80,7 @@ const Snippet* find_snippet(string_view text) {
   for (const auto& snippet : snippets)
     if (snippet.trigger == trigger ||
         (snippet.final_field_hint && snippet.trigger == trimmed) ||
-        (snippet.trigger == "#include" && trigger.size() >= 5 && snippet.trigger.starts_with(trigger)))
+        (snippet.trigger == "#include" && trigger.size() >= 5 && StringRef(snippet.trigger).starts_with(trigger)))
       return &snippet;
   return nullptr;
 }
@@ -119,8 +123,8 @@ EditorCompletions keywords(string_view text) {
   auto start = text.size();
   while (start > 0 && identifier_byte(text[start - 1])) --start;
   const auto left = text.substr(0, start);
-  if (start == text.size() || left.ends_with('.') || left.ends_with("->") ||
-      left.ends_with("::") || inside_literal(text, false)) return {};
+  if (start == text.size() || StringRef(left).ends_with('.') || StringRef(left).ends_with("->") ||
+      StringRef(left).ends_with("::") || inside_literal(text, false)) return {};
   return {text.size() - start, cpp_keywords(text.substr(start))};
 }
 } // namespace
@@ -205,9 +209,11 @@ void Input::changed(std::string& text, int& cursor) {
   const auto shift = [old_end, new_end](std::size_t offset) {
     return new_end + (offset - old_end);
   };
-  std::erase_if(closers_, [begin, old_end](std::size_t offset) {
+  const auto removed = std::remove_if(closers_.begin(), closers_.end(),
+                                      [begin, old_end](std::size_t offset) {
     return offset >= begin && offset < old_end;
   });
+  closers_.erase(removed, closers_.end());
   for (auto& offset : closers_)
     if (offset >= old_end) offset = shift(offset);
   if (!fields_.empty()) {
@@ -295,12 +301,22 @@ Input::Result Input::tab(char32_t key, bool backwards) {
 Input::Result Input::enter(char32_t key) {
   const auto state = editor_.get_state();
   std::string text = state.text();
+  if (command(text)) {
+    const auto line = string_view(text).substr(line_start(text));
+    if (!continue_commands_ || command_continuation(line) == string_view::npos)
+      return editor_.invoke(Action::COMMIT_LINE, key);
+    text += '\n';
+    text += indent;
+    const auto end = text.size();
+    set(std::move(text), end);
+    return Result::CONTINUE;
+  }
   const auto pos = byte_offset(text, state.cursor_position());
   const auto left = string_view(text).substr(0, pos);
   const auto tracked = std::find(closers_.begin(), closers_.end(), pos) != closers_.end();
   const bool split_pair = tracked && pos > 0 && closing(text[pos - 1]) == text[pos] &&
                           string_view(")]}").find(text[pos]) != string_view::npos;
-  if (command(text) || (!split_pair && !incomplete_cpp(text) && !incomplete_cpp(std::string(left))))
+  if (!split_pair && !incomplete_cpp(text) && !incomplete_cpp(std::string(left)))
     return editor_.invoke(Action::COMMIT_LINE, key);
 
   const auto line = left.substr(line_start(left));
@@ -329,7 +345,7 @@ Input::Result Input::pair(char32_t key) {
     if (close != text.npos && text[close] == typed &&
         (close == pos || (typed == '}' && line == indentation(line))) &&
         std::find(closers_.begin(), closers_.end(), close) != closers_.end()) {
-      std::erase(closers_, close);
+      closers_.erase(std::remove(closers_.begin(), closers_.end(), close), closers_.end());
       const auto from = line_start(left);
       const auto to = line_start(string_view(text).substr(0, close));
       text.erase(from, to - from);
@@ -343,7 +359,7 @@ Input::Result Input::pair(char32_t key) {
   const bool before_text = next == 0 && identifier_byte(text[pos]);
   const bool in_literal = inside_literal(left, is_command);
   const auto first = line.find_first_not_of(" \t");
-  const bool include = first != line.npos && line.substr(first).starts_with("#include") &&
+  const bool include = first != line.npos && StringRef(line.substr(first)).starts_with("#include") &&
       line.substr(first + 8).find_first_not_of(" \t") == line.npos;
   const bool quote = typed == '"' || typed == '\'';
   const bool separator = typed == '\'' && !left.empty() && identifier_byte(left.back());
@@ -396,7 +412,10 @@ replxx::Replxx::completions_t Input::complete(const std::string& text, int& leng
 
   EditorCompletions results;
   if (command(text)) {
-    results = complete_command(string_view(text).substr(first), after);
+    std::string prefix = text.substr(first);
+    // Keep byte offsets stable so completion can replace text in the editor.
+    normalize_command_continuations(prefix);
+    results = complete_command(prefix, after);
   } else if (auto include = complete_include(text, after)) {
     results = std::move(*include);
   } else if (cpp_) {
@@ -448,12 +467,13 @@ void Input::colorize(const std::string& text, replxx::Replxx::colors_t& colors) 
   }
 }
 
-std::optional<std::string> Input::read(const std::string& prompt) {
+std::optional<std::string> Input::read(const std::string& prompt, bool continue_commands) {
   if (!terminal_) {
     std::string line;
     if (!std::getline(std::cin, line)) return {};
     return line;
   }
+  continue_commands_ = continue_commands;
   for (;;) {
     previous_.clear();
     fields_.clear();

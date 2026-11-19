@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -114,7 +115,8 @@ public:
   bool append(const clangtracer::context::v1::ContextFrame &frame,
               std::uint64_t &position);
   bool append(const clangtracer::context::v1::ContextBatch &batch,
-              std::uint64_t &position);
+              std::uint64_t &position,
+              std::size_t max_replay_bytes = std::numeric_limits<std::size_t>::max());
   std::vector<JournalRecord> read_after(std::uint64_t position,
                                         std::size_t max_records,
                                         std::size_t max_bytes) const;

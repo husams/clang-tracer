@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <iomanip>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <clang/Interpreter/Interpreter.h>
 #include <clang/Interpreter/PartialTranslationUnit.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
@@ -47,8 +49,6 @@
 #include <clang/Sema/Lookup.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/IR/Module.h>
-#include <clang/Interpreter/Interpreter.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Option/ArgList.h>
@@ -183,13 +183,15 @@ public:
                                   clang::CodeCompletionResult *results,
                                   unsigned count) override {
     out_.prefix = sema.getPreprocessor().getCodeCompletionFilter().str();
+    const bool check_access = sema.getLangOpts().AccessControl;
     for (unsigned i = 0; i < count; ++i) {
       const auto &result = results[i];
       std::string name;
       if (result.Kind == clang::CodeCompletionResult::RK_Declaration &&
           !result.Hidden && result.Declaration->getIdentifier() &&
-          result.Declaration->getAccess() != clang::AS_private &&
-          result.Declaration->getAccess() != clang::AS_protected)
+          (!check_access ||
+           (result.Declaration->getAccess() != clang::AS_private &&
+            result.Declaration->getAccess() != clang::AS_protected)))
         name = result.Declaration->getNameAsString();
       else if (result.Kind == clang::CodeCompletionResult::RK_Keyword &&
                context.getBaseType().isNull())
@@ -621,7 +623,22 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     include += "#include \"" + header + "\"\n";
   }
   std::vector<std::string> types;
+  std::optional<std::set<std::string>> external_destructors;
+  bool destructors_final = false;
   for (std::string type; input >> std::quoted(type);) {
+    if (type == "@tracer-external-destructors") {
+      external_destructors.emplace();
+      for (std::string symbol; input >> std::quoted(symbol);) {
+        if (symbol == "@tracer-destructors-final") {
+          destructors_final = true;
+          continue;
+        }
+        if (symbol.empty() || symbol.size() > 4096)
+          throw std::runtime_error("invalid external destructor symbol");
+        external_destructors->insert(std::move(symbol));
+      }
+      break;
+    }
     if (type.empty() || type.size() > 4096 || types.size() >= 128)
       throw std::runtime_error("invalid record selector");
     types.push_back(type);
@@ -655,7 +672,8 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     }
     throw std::runtime_error("could not check record construction traits");
   };
-  auto generated = generate_record_mappings(compiler, types, viable);
+  auto generated = generate_record_mappings(compiler, types, viable,
+      external_destructors ? &*external_destructors : nullptr, destructors_final);
   parse(generated.source);
   std::string validation;
   for (const auto &type : generated.types)
@@ -851,7 +869,7 @@ std::optional<CppCompletions> complete_cpp_directive(std::string_view source) {
            "define", "elif", "elifdef", "elifndef", "else", "endif", "error",
            "if", "ifdef", "ifndef", "include", "include_next", "line",
            "pragma", "undef", "warning"}) {
-    if (directive.starts_with(line)) result.items.emplace_back(directive);
+    if (llvm::StringRef(directive).starts_with(line)) result.items.emplace_back(directive);
   }
   return result;
 }

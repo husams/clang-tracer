@@ -47,7 +47,8 @@ std::vector<Highlight> highlight_command(const std::string& text) {
         if (value.size() > 1 && value.front() == '-') value.remove_prefix(1);
         if (first == '-' && !value.empty() && clang::isAsciiIdentifierStart(value.front())) {
           result.push_back({begin, end, Style::option});
-        } else if (word == "PRE" || word == "POST" || word == "true" || word == "false" ||
+        } else if (word == "PRE" || word == "POST" || word == "EXCEPTION" ||
+                   word == "true" || word == "false" ||
                    (!value.empty() && std::all_of(value.begin(), value.end(), clang::isDigit))) {
           result.push_back({begin, end, Style::literal});
         }
@@ -62,9 +63,8 @@ const clang::LangOptions& cpp_language() {
   static const auto language = [] {
     clang::LangOptions options;
     options.CPlusPlus = options.CPlusPlus11 = options.CPlusPlus14 =
-        options.CPlusPlus17 = options.CPlusPlus20 = options.CPlusPlus23 = true;
-    options.Coroutines = true;
-    options.Bool = options.LineComment = options.Digraphs = options.Char8 = true;
+        options.CPlusPlus17 = true;
+    options.Bool = options.LineComment = options.Digraphs = true;
     return options;
   }();
   return language;

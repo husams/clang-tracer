@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <functional>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -14,6 +15,7 @@
 
 #include "admission.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/reclaim.h"
 
 namespace tracer::object_launch { class Child; }
 
@@ -24,6 +26,15 @@ struct CodePatch {
   const void *expected = nullptr;
   const void *replacement = nullptr;
   std::size_t size = 0;
+};
+
+struct CodeRange {
+  std::uintptr_t address = 0;
+  std::size_t size = 0;
+  // Native functions may end with a call whose saved return PC is just past
+  // the symbol. Executable mappings use half-open bounds.
+  bool return_at_end = true;
+  bool active_at_start = false;
 };
 
 // The caller owns the ptrace stop and has excluded other executing threads.
@@ -54,10 +65,13 @@ public:
   Process &operator=(Process &&other) noexcept;
 
   void attach(pid_t process_id,
-              ::tracer::compat::span<const ApplicationModule> application_modules = {});
+              ::tracer::compat::span<const ApplicationModule> application_modules = {},
+              pid_t excluded_tid = 0, pid_t required_tid = 0);
   // A stopped task suffices for code restoration. This mode cannot run
   // remote calls or syscalls, and does not require a loader rendezvous.
   void attach_for_patch(pid_t process_id);
+  // The caller verifies that the complete rendezvous range is executable
+  // application text. AArch64 admission requires room for SVC and BRK at PC.
   void attach_at_application_point(pid_t process_id, std::uintptr_t entry, std::size_t size);
   void adopt_executable_entry(object_launch::Child &child,
                               std::chrono::steady_clock::time_point deadline,
@@ -75,6 +89,7 @@ public:
   [[nodiscard]] pid_t pid() const noexcept { return process_id_; }
 
   [[nodiscard]] std::uintptr_t instruction_pointer() const;
+  [[nodiscard]] bool signal_blocked(int signal) const;
 
   [[nodiscard]] std::uintptr_t remote_allocate(std::size_t size);
   void remote_read(std::uintptr_t address, void *destination,
@@ -93,16 +108,21 @@ public:
   // It must not throw.
   [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                      const std::function<void()> &validate_mappings = {},
-                                     const std::function<void()> &on_commit = {});
-  void remote_free(std::uintptr_t address, std::size_t size);
+                                     const std::function<void()> &on_commit = {},
+                                     ::tracer::compat::span<const CodeRange> drained_ranges = {},
+                                     bool allow_already_replaced = false);
+  [[nodiscard]] bool retired_code_quiescent(const TracerRetiredCode &code);
+  [[nodiscard]] std::uintptr_t remote_map_file(std::string_view path, std::size_t size);
+  void remote_free(std::uintptr_t address, std::size_t size,
+                   const std::function<void()> &verify = {});
 
   [[nodiscard]] std::uintptr_t
   remote_call(std::uintptr_t function,
               const std::array<std::uintptr_t, 6> &arguments = {},
               std::size_t argument_count = 0);
 
-  [[nodiscard]] std::uintptr_t resolve_remote_symbol(
-      std::string_view name, const CodePatch *owned_patch = nullptr);
+  [[nodiscard]] std::uintptr_t resolve_remote_symbol(std::string_view name,
+                                                     const CodePatch* owned_patch = nullptr);
 
 private:
   struct PeerFreeze;
@@ -120,12 +140,14 @@ private:
 
   void attach_impl(pid_t process_id,
                    ::tracer::compat::span<const ApplicationModule> application_modules,
-                   bool patch_only, std::uintptr_t rendezvous = 0, std::size_t rendezvous_size = 0);
+                   bool patch_only, std::uintptr_t rendezvous = 0, std::size_t rendezvous_size = 0,
+                   pid_t excluded_tid = 0, pid_t required_tid = 0);
   void ensure_attached() const;
   void ensure_usable() const;
   void poison_process() noexcept;
   [[nodiscard]] std::uintptr_t
-  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments);
+  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments,
+                 const std::function<void()> &verify = {});
   [[nodiscard]] std::uintptr_t
   remote_call_raw(std::uintptr_t function,
                   const std::array<std::uintptr_t, 6> &arguments,

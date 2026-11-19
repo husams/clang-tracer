@@ -218,7 +218,7 @@ shows the supported state shapes.
 
 ## Build and run
 
-Use Linux x86-64, C++23, matching LLVM/Clang development packages (21 or 22),
+Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),
 Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, SQLite development
 headers, CMake, and Ninja. Supply PIC static Protobuf/gRPC and their transport
 dependencies to isolate the injected agent from the application's libraries.
@@ -240,11 +240,6 @@ service bindings from `proto/tracer.proto`. The agent's Protobuf and shared-cont
 gRPC transport are linked privately; its build rejects dependency symbol exports
 and shared transport dependencies. The integration tests use real target processes
 and generated gRPC clients, including a target with incompatible dependency symbols.
-
-To run the suite from OverlayFS, use
-`tests/overlay_integration.sh "$(realpath build)"`. This optional regression
-runner needs user and mount namespaces plus OverlayFS support; it overlays
-only its private build view and leaves the host build directory unchanged.
 
 For RHEL-compatible systems, see [build, toolchain and deployment instructions](docs/build-rhel.md).
 `build-rhel.sh` accepts custom compiler/LLVM paths or a CMake toolchain file;
@@ -403,6 +398,9 @@ private to that injector, and the existing syntax/layout checks still run.
 Changed headers or include-search results invalidate the cache. Unsupported
 compiler profiles, unavailable cache storage, and headers with startup or
 shutdown effects use the original compilation path.
+With the GCC 8 runtime, only `cstdint` and `cstddef` are cached; the remaining
+headers stay textual to preserve compatibility and include order. The recorded
+C++20 cache speedup has not been established for this reduced prefix.
 
 Normal CLI verification covered non-exported free functions and methods in
 already-running PIE and fixed-address executables, plus a mapped shared library,
@@ -436,13 +434,13 @@ a private filesystem so the target's working directory stays unchanged.
 ```
 
 Without `--compdb`, Clang searches the first header's parent directories for a
-database. If none exists, optional standalone headers use the default C++23
+database. If none exists, optional standalone headers use the default C++20
 context. An explicit missing/empty database fails clearly. Multiple headers use
 the first header's command; inspect the printed inference when build variants
 or nearby sources use different flags. Output/dependency-generation flags and
 the donor source input are removed. Supplied headers must be accessible in the
 target filesystem and must still pass the DWARF layout/type checks. These flags
-configure the header AST; callback compilation retains its C++23 context.
+configure the header AST; callback compilation retains its C++20 context.
 
 The raw exported-symbol interface with explicit `--return`/`--arg` remains
 available. It does not provide a typed receiver. The CLI no longer accepts
@@ -724,30 +722,31 @@ the server and attempts to restore active hooks.
 The native backend supports Linux x86-64 processes with concurrent application
 threads, including a CPU-busy leader inside nested C++ functions and methods.
 Attachment prefers the leader and can select an eligible existing worker when
-the leader is blocked in futex, epoll, pipe reads, or another unsupported syscall.
+the leader blocks in futex, epoll, pipe reads or another unsupported syscall.
 The process PID remains the session identity; the selected TID runs native
 control operations. Workers must have a valid thread pointer. Tasks in
-`nanosleep` or `clock_nanosleep` retain the existing sleep admission policy.
-Other blocked syscalls are left intact, and external job-control stops are
-preserved.
+`nanosleep` or `clock_nanosleep` retain the existing sleep admission policy;
+other blocked syscalls and external job-control stops are preserved.
 
-Admission no longer requires an instruction in `main`, a `main` symbol, or an
-immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
+Modern-libc admission requires neither an instruction in `main`, a `main`
+symbol nor an immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
 frame through executable segments of the main ELF image or a DSO in the session's
 discovered snapshot, selecting the matching image and captured load bias at each
 frame. Executable and library symbols may be stripped; unwind metadata must
 remain. The walk ends at libc's
-identified `__libc_start_call_main` → `__libc_start_main` startup chain, or, for
-a directly started pthread worker, exact `start_thread` → `__clone`/`__clone3`
-functions. The relevant startup symbols are required. Additional runtime wrapper
-frames, including unproven C++ thread-library wrappers, remain unsupported for
-userspace admission; such workers can still qualify through the sleep policy.
+identified `__libc_start_call_main` → `__libc_start_main` startup chain, whose
+symbols are still required. The SDK's glibc 2.23 calls `main` directly, so busy
+leader admission still requires the exact ELF `main` below `__libc_start_main`.
+Directly started pthread workers may instead use exact `start_thread` →
+`__clone`/`__clone3` startup functions. With the older SDK, `start_thread` is
+validated in the separate mapped `libpthread.so.0`, and `__clone` in libc.
+Unproven C++ thread-library wrapper frames remain unsupported for userspace
+admission; those workers can still qualify through the sleep policy.
 
-If no task qualifies before the operation deadline, the server returns
-`FAILED_PRECONDITION` with per-TID syscall numbers, known names and rejection reasons.
-Diagnostics list up to 32 rejected tasks and report the number omitted.
-Fully released admission failures create no failed session to clean up during
-shutdown. Failures after bootstrap retain their normal recovery state.
+When no task qualifies before the operation deadline, the server returns
+`FAILED_PRECONDITION` with up to 32 per-TID syscall/rejection details and an
+omitted-task count. Fully released initial admission failures leave no failed
+session to clean up at shutdown; later bootstrap failures retain recovery state.
 
 The complete chain is bounded to 128 frames including startup. Each recovered
 stack pointer must advance within the original readable stack mapping, and saved
@@ -780,11 +779,6 @@ session takes a fresh snapshot for libraries loaded later; it does not make
 unsupported CFI or runtime behavior safe.
 The existing `nanosleep`/`clock_nanosleep` admission path remains available outside
 critical sections, with its prior interrupted-sleep timing/restart limitation.
-The CLI regression covers sleeping-worker attachment with a leader blocked in
-`futex`, `epoll_wait`, `poll`, `read`, `accept`, `pause`, or `sigwait`. After
-detach, it verifies that the leader remains in its original blocking operation, workers
-remain alive, and every task is untraced. It also verifies the all-blocked
-diagnostic and clean server shutdown after a failed admission.
 Native calls preserve general registers, extended floating-point state, the
 thread's signal mask, and its `errno` value. Signals are blocked during injected
 execution and the saved mask is restored before normal execution resumes.
@@ -833,20 +827,6 @@ signal-handler probes, and control threads holding application/runtime locks are
 outside the current lifecycle contract.
 
 ## Validation and sources
-
-The reconciled worker-admission changes passed **25/25 CTests in 419.70 seconds**
-on `linux-dev` on 2 November 2026; both regression sets also passed from
-OverlayFS (**7/7 in 44.09 seconds**). These results used the C++20 build of
-`main` at the time.
-
-Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
-**24/24 CTests passed in 411.09 seconds**, and the six new regression cases
-passed from OverlayFS in 35.26 seconds. The supplied condition-variable/sleeping
-worker reproduction also attached, detached and shut down successfully.
-
-The session-path backport was verified on 2 November 2026 with the normal
-C++20 build on `linux-dev`. All 18 CTests passed natively in 373.84 seconds
-and from OverlayFS in 378.11 seconds.
 
 Class-instance arguments verified on 30 October 2026 through the normal CLI,
 with Order target source and compilation database temporarily unavailable.
@@ -972,7 +952,7 @@ under `auto-test-results/`. Reproduce the focused live test with
 new evidence is written under `build/auto-test-results/`. Earlier milestone
 results remain recorded in `PROGRESS.md` (local recording).
 
-The [native REPL](docs/native-repl.md) adds an interactive client with owned
+The [native C++17 REPL](docs/native-repl.md) adds an interactive client with owned
 server startup, PID/process attach, interceptor upload, continuous event collection,
 recording, offline inspection and local C++ analysis.
 

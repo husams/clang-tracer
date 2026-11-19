@@ -35,6 +35,10 @@ endforeach()
 install(TARGETS clang-tracer clang-tracer-server clang_tracer_agent
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+if(TARGET clang_tracer_launch_preload)
+  install(TARGETS clang_tracer_launch_preload
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+endif()
 if(TARGET tracer_context_stdlib)
   install(TARGETS tracer_context_stdlib
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
@@ -54,6 +58,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/TracerDocumentation.cmake")
 install(DIRECTORY examples DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer"
   COMPONENT Development FILES_MATCHING
   PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py" PATTERN "*.repl"
+  PATTERN "Makefile"
   PATTERN "__pycache__" EXCLUDE)
 foreach(_example native-repl-values native-repl-jit)
   install(PROGRAMS examples/${_example}/run.sh

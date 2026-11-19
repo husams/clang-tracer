@@ -9,7 +9,7 @@ int Prefix::unused() const { return prefix; }
 int Handler::route(int value) const { return value + factor + base + shared; }
 
 int Handler::scale(int value) {
-  // Keep enough straight-line instructions in the entry window for patching.
+  // GCC 8.5 emits a register ADD. Keep the body long enough to patch on Clang.
   const volatile int result = value * 3;
   return result;
 }

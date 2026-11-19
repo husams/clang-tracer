@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "linux_syscalls.hpp"
+#include "mapped_elf.hpp"
 #include "tracer/compat.hpp"
 
 namespace {
@@ -80,16 +81,22 @@ struct MappingStream {
   std::atomic_flag busy = ATOMIC_FLAG_INIT;
   int fd = -1;
   pid_t pid = 0;
-  dev_t device = 0;
-  ino_t inode = 0;
 };
+// The application may close/reuse our descriptor number. Check its procfs
+// pathname before closing or rewinding it, without filesystem identity IDs.
+bool is_mapping_stream(int fd, pid_t pid) {
+  std::array<char, 128> name{};
+  std::array<char, 64> link{}, expected{};
+  std::snprintf(link.data(), link.size(), "/proc/self/fd/%d", fd);
+  std::snprintf(expected.data(), expected.size(), "/proc/%d/maps", pid);
+  const auto count = ::readlink(link.data(), name.data(), name.size());
+  return count > 0 && std::string_view(name.data(), count) == expected.data();
+}
 std::array<MappingStream, 8> mapping_streams;
 void reset_mapping_streams() {
   const int saved_errno = errno;
   for (auto &stream : mapping_streams) {
-    struct stat identity{};
-    if (stream.fd >= 0 && !::fstat(stream.fd, &identity) &&
-        identity.st_dev == stream.device && identity.st_ino == stream.inode)
+    if (stream.fd >= 0 && is_mapping_stream(stream.fd, stream.pid))
       ::close(stream.fd);
     stream.fd = -1;
     stream.pid = 0;
@@ -113,11 +120,8 @@ struct MappingInput {
           break;
         }
     if (stream) {
-      struct stat identity{};
       if (stream->fd >= 0) {
-        if (::fstat(stream->fd, &identity) ||
-            identity.st_dev != stream->device ||
-            identity.st_ino != stream->inode) {
+        if (!is_mapping_stream(stream->fd, stream->pid)) {
           // The application closed/reused this number: do not close its FD.
           stream->fd = -1;
         } else if (stream->pid != pid ||
@@ -128,13 +132,7 @@ struct MappingInput {
       }
       if (stream->fd < 0) {
         stream->fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-        if (stream->fd >= 0 && ::fstat(stream->fd, &identity)) {
-          ::close(stream->fd);
-          stream->fd = -1;
-        }
         stream->pid = pid;
-        stream->device = identity.st_dev;
-        stream->inode = identity.st_ino;
       }
       fd = stream->fd;
     } else {
@@ -407,16 +405,22 @@ struct Cache {
       stop("native ELF mapped path is unavailable");
     auto key = m.path;
     key.push_back('\0');
-    key += std::to_string(m.device_major) + ':' + std::to_string(m.device_minor) + ':' +
-           std::to_string(m.inode);
+    key += std::to_string(m.begin) + ':' + std::to_string(m.end) + ':' +
+           std::to_string(m.offset);
+    struct stat current{};
+    if (::stat(m.path.c_str(), &current) || !S_ISREG(current.st_mode))
+      stop("native ELF mapped path is unavailable");
+    // Reloading a replacement at the same path and addresses must not reuse
+    // old CFI. Fresh cache entries are also verified against live ELF content.
+    for (const auto value : {current.st_size, current.st_mtim.tv_sec, current.st_mtim.tv_nsec,
+                             current.st_ctim.tv_sec, current.st_ctim.tv_nsec})
+      key += ':' + std::to_string(value);
     const auto existing = images.find(key);
     if (existing != images.end())
       return existing->second;
 
-    // A trace session treats the mapped binary as immutable. Procfs device
-    // and inode values can differ from stat() for OverlayFS mappings, so the
-    // mapped identity selects the session cache and ELF load offsets/ranges
-    // below validate each PC against the live mapping.
+    // A trace session treats the mapped binary as immutable. Path and VMA
+    // layout select the cache; ELF load offsets/ranges validate each PC.
     const int fd = ::open(m.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
       stop("cannot open native ELF");
@@ -426,15 +430,9 @@ struct Cache {
     } owner{fd};
     struct stat opened{};
     if (::fstat(fd, &opened) || !S_ISREG(opened.st_mode) ||
-        opened.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)) ||
-        opened.st_size > 256 * 1024 * 1024 || images.size() >= 64 ||
-        static_cast<std::uint64_t>(opened.st_size) >
-            512 * 1024 * 1024 - bytes)
-      stop("native ELF cache bound exceeded");
+        opened.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)))
+      stop("invalid native ELF file");
     auto result = std::make_shared<Image>();
-    // Never retain file-backed ELF mmaps in the target: an extra offset-zero
-    // mapping would make the admission resolver correctly reject ambiguous
-    // load biases. A private byte copy leaves the loaded-image topology alone.
     // LLVM uses a contiguous buffer. Copy the ELF so a file truncated after
     // attach cannot fault the target through a file mapping.
     auto buffer = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(
@@ -484,6 +482,23 @@ struct Cache {
       llvm::consumeError(object.takeError());
       stop("LLVM rejected native ELF");
     }
+    const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(object->get());
+    const auto bias = elf ? tracer::detail::mapped_elf_bias(*elf, m.begin, m.end, m.offset) : std::nullopt;
+    if (!bias || !tracer::detail::matches_mapped_elf(*elf, *bias, [](auto address, auto expected) {
+          std::array<char, 4096> bytes;
+          while (!expected.empty()) {
+            const auto size = std::min(expected.size(), bytes.size());
+            iovec local{bytes.data(), size}, remote{reinterpret_cast<void *>(address), size};
+            if (tracer::linux_api::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) !=
+                    static_cast<ssize_t>(size) ||
+                std::string_view(bytes.data(), size) != expected.substr(0, size))
+              return false;
+            address += size;
+            expected.remove_prefix(size);
+          }
+          return true;
+        }))
+      stop("native ELF content differs from the mapped image");
     result->object = std::move(*object);
     result->dwarf = llvm::DWARFContext::create(*result->object);
     // Retention is optional. Captures keep oversized or uncached images alive
@@ -937,6 +952,7 @@ void symbolize_stack(tracer::NativeStackStorage &storage,
         frame.function = metadata->function.c_str();
         frame.module = metadata->module.c_str();
         frame.file = metadata->file.c_str();
+        frame.line = metadata->line;
         frame.application_frame = metadata->application;
       } catch (...) {
         // Unknown names do not invalidate recovered native frames.
@@ -974,7 +990,7 @@ extern "C" void tracer_stack_leave(tracer::TraceContext *ctx) noexcept {
 
 namespace tracer {
 NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
-    std::span<std::uint64_t> pcs, std::span<std::uint64_t> stack_pointers) noexcept {
+    ::tracer::compat::span<std::uint64_t> pcs, ::tracer::compat::span<std::uint64_t> stack_pointers) noexcept {
   NativeCodeStack result;
   const auto depth = std::min(pcs.size(), stack_pointers.size());
   if (!depth || !registers[native_pc])
@@ -985,7 +1001,7 @@ NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
   try {
     const auto process = ::getpid();
     const auto maps = mappings(registers[native_sp], process);
-    const auto stack = std::ranges::find_if(maps, [&](const auto &mapping) {
+    const auto stack = std::find_if(std::begin(maps), std::end(maps), [&](const auto &mapping) {
       return mapping.readable && registers[native_sp] >= mapping.begin && registers[native_sp] < mapping.end;
     });
     if (stack == maps.end())
@@ -1031,6 +1047,7 @@ void release_native_stack(const TraceContext &ctx) noexcept {
   delete ctx.stack_storage;
   ctx.stack_storage = nullptr;
 }
+
 void capture_native_stack(const TraceContext &ctx, unsigned depth,
                           bool application_only) noexcept {
   const int saved_errno = errno;

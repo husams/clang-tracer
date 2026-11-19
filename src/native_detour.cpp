@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "native_detour.hpp"
 
 #include <algorithm>
@@ -113,14 +114,16 @@ bool allowed_instruction(const llvm::MCInst &inst,
       "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
       "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
       "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
+      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "MOVDQArm", "MOVDQUrm",
+      "LEA64r",
       "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
       "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
-      "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",   "AND64ri32", "XOR8i8", "XOR8ri", "NOP",
+      "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
+      "AND64ri32", "XOR8i8",    "XOR8ri",    "NOP",
       "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
   for (auto prefix : allowed) {
-    if (name.starts_with(prefix)) {
+    if (compat::starts_with(name, prefix)) {
       return true;
     }
   }
@@ -146,9 +149,9 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
       {"MOV32mr", 4},  {"MOV32mi", 4}, {"MOV16rm", 2},   {"MOV16mr", 2},
       {"MOV16mi", 2},  {"MOV8rm", 1},  {"MOV8mr", 1},    {"MOV8mi", 1},
       {"MOVSS", 4},    {"MOVSD", 8},   {"MOVAPS", 16},   {"MOVUPS", 16},
-      {"IMUL32rmi", 4}};
+      {"MOVDQArm", 16}, {"MOVDQUrm", 16}, {"IMUL32rmi", 4}};
   for (auto width : widths)
-    if (name.starts_with(width.prefix))
+    if (compat::starts_with(name, width.prefix))
       return width.bytes;
   if (const auto width = code_cache ? scalar_fp_load_width(name) : 0)
     return width;
@@ -158,7 +161,7 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
 // Use the encoder's fixup location, not a guessed "last four bytes": stores
 // with an immediate have additional bytes after the RIP displacement.
 bool record_relocation(Decoder &d, llvm::MCInst inst,
-                       std::span<const std::uint8_t> bytes, std::size_t offset,
+                       compat::span<const std::uint8_t> bytes, std::size_t offset,
                        std::size_t size, Patch &patch, std::string &error,
                        bool code_cache = false) {
   std::optional<unsigned> rip;
@@ -339,7 +342,7 @@ bool initialize_llvm(std::string &error) {
   return true;
 }
 
-bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
+bool decode(compat::span<const std::uint8_t> bytes, std::uintptr_t entry,
             Patch &patch, std::string &error, std::size_t jump_size) {
   bytes = bytes.first(std::min(bytes.size(), kMaxDecodedBytes));
   if (!valid_jump_size(jump_size) || bytes.size() < jump_size ||
@@ -392,7 +395,7 @@ bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
 }
 
 bool relocate(const Patch &patch, std::uintptr_t destination,
-              std::span<std::uint8_t> output, std::string &error) {
+              compat::span<std::uint8_t> output, std::string &error) {
   if (!valid_jump_size(patch.jump_size) || patch.size < patch.jump_size ||
       patch.size > kMaxDecodedBytes ||
       output.size() < patch.size ||
@@ -456,7 +459,7 @@ bool create_trampoline(const Patch &patch, void *&address,
 }
 bool prepare_entry_jump(const Patch &patch, void *trampoline,
                         std::size_t mapping_size, const void *destination,
-                        std::span<std::uint8_t> output, std::string &error) {
+                        compat::span<std::uint8_t> output, std::string &error) {
   if (!valid_jump_size(patch.jump_size) || patch.size < patch.jump_size ||
       output.size() < patch.size)
     return fail(error, "invalid entry jump bounds");
@@ -487,7 +490,7 @@ bool prepare_entry_jump(const Patch &patch, void *trampoline,
 }
 
 bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error) {
-  trap_offset = bytes.starts_with("\xf3\x0f\x1e\xfa") ? 4 : 0;
+  trap_offset = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? 4 : 0;
   bytes.remove_prefix(trap_offset);
   // MOV r/m32,EAX with RDI as the base, followed by a plain near RET.
   if ((bytes.size() == 3 || bytes.size() == 4 || bytes.size() == 7) &&
@@ -526,7 +529,7 @@ bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,
 }
 
 bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
-                        const void *wrapper, std::span<std::uint8_t> output,
+                        const void *wrapper, compat::span<std::uint8_t> output,
                         std::uintptr_t &relay, std::string &error) {
   Patch placement;
   placement.entry = caller;
@@ -540,7 +543,7 @@ bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
 
 bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
                          void *&address, std::size_t &size, std::string &error,
-                         std::span<const RipRelocation> relocations) {
+                         compat::span<const RipRelocation> relocations) {
   const auto page = ::sysconf(_SC_PAGESIZE);
   if (page <= 0 || !bytes || bytes > static_cast<std::size_t>(INT32_MAX))
     return fail(error, "invalid code-cache allocation bounds");
@@ -559,9 +562,9 @@ bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
 
 std::size_t scalar_fp_load_width(std::string_view opcode) {
   // LLVM distinguishes the intrinsic form of legacy scalar SSE operations.
-  if (opcode.ends_with("_Int"))
+  if (::tracer::compat::ends_with(opcode, "_Int"))
     opcode.remove_suffix(4);
-  if (opcode.size() != 7 || !opcode.ends_with("rm"))
+  if (opcode.size() != 7 || !::tracer::compat::ends_with(opcode, "rm"))
     return 0;
   const auto operation = opcode.substr(0, 3);
   if (operation != "ADD" && operation != "SUB" && operation != "MUL" &&
@@ -571,7 +574,7 @@ std::size_t scalar_fp_load_width(std::string_view opcode) {
   return precision == "SD" ? 8 : precision == "SS" ? 4 : 0;
 }
 
-bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
+bool code_cache_rip_relocation(compat::span<const std::uint8_t> bytes,
                                std::uintptr_t pc, RipRelocation &relocation,
                                std::string &error) {
   Decoder decoder;

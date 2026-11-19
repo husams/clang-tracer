@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <sys/types.h>
@@ -11,6 +14,17 @@
 #include "tracer/compat.hpp"
 
 namespace tracer::injector {
+
+struct RuntimeEntry {
+  std::uintptr_t address = 0;
+  std::array<unsigned char, 32> bytes{};
+};
+
+// Resolve only bootstrap and scheduler entry points in the target's glibc.
+// The caller must compare these file bytes to the stopped target before use.
+RuntimeEntry target_runtime_entry(pid_t pid, std::string_view name);
+std::vector<std::string> target_runtime_companions(
+    pid_t pid, const std::vector<std::string> &dependencies);
 
 namespace detail {
 struct ApprovedModuleIdentity;
@@ -36,6 +50,9 @@ private:
 // Snapshot canonical mapped application paths once per session. Returned
 // values retain the ELF path and load bias for later mapping validation.
 std::vector<ApplicationModule> discover_application_modules(pid_t pid);
+
+// Snapshot mapped application filenames for ELF inspection without requiring CFI.
+std::vector<std::string> mapped_application_files(pid_t pid);
 
 // Revalidate the session's module paths and ELF mappings after each target stop.
 void validate_application_modules(pid_t pid,

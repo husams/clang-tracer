@@ -11,10 +11,10 @@ set_target_properties(tracer_context_analysis PROPERTIES POSITION_INDEPENDENT_CO
 # The importer and memory-manager translation units derive from LLVM/Clang
 # classes. Keep state/runtime RTTI enabled for std::any/exception contracts.
 if(NOT LLVM_ENABLE_RTTI)
-  set_property(SOURCE src/context_binding.cpp src/agent.cpp src/callback_pch.cpp
+  set_property(SOURCE src/context_binding.cpp src/context_activation.cpp src/agent.cpp src/callback_pch.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 endif()
-target_compile_features(tracer_context_analysis PUBLIC cxx_std_23)
+target_compile_features(tracer_context_analysis PUBLIC cxx_std_20)
 target_include_directories(tracer_context_analysis SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_include_directories(tracer_context_analysis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tracer_context_analysis PUBLIC clang-cpp LLVM tracer_context_engine
@@ -23,7 +23,7 @@ target_compile_options(tracer_context_analysis PRIVATE -Wall -Wextra -Wpedantic
   -fvisibility=hidden -fvisibility-inlines-hidden)
 add_library(tracer_context_collector STATIC src/context_collector.cpp)
 set_target_properties(tracer_context_collector PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_features(tracer_context_collector PUBLIC cxx_std_23)
+target_compile_features(tracer_context_collector PUBLIC cxx_std_20)
 target_include_directories(tracer_context_collector PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tracer_context_collector PUBLIC tracer_context_analysis
   tracer_context_delivery)
@@ -106,6 +106,7 @@ if(BUILD_TESTING)
   target_link_libraries(context-delivery-tests PRIVATE tracer_context_analysis
     tracer_context_collector)
   add_test(NAME shared_context_declarations COMMAND context-analysis-tests)
-  set_tests_properties(shared_context_declarations PROPERTIES TIMEOUT 180)
+  # Repeated embedded-Clang parses can take almost 180 seconds on the GCC 8 SDK.
+  set_tests_properties(shared_context_declarations PROPERTIES TIMEOUT 360)
   include(${CMAKE_CURRENT_LIST_DIR}/TracerContextSchemaTests.cmake)
 endif()

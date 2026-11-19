@@ -1,4 +1,7 @@
 #pragma once
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -13,6 +16,7 @@ namespace tracer_repl {
 class BackgroundEvents {
   mutable std::mutex mutex_;
   std::mutex stop_mutex_;
+  std::condition_variable changed_;
   EventBuffer buffer_;
   bool running_ = true;
   std::string error_;
@@ -30,6 +34,10 @@ public:
   // Events and bytes charged to the shared collection storage: the whole
   // limit while receiving, and only what was retained once finished.
   std::pair<std::size_t, std::size_t> reserved() const;
+  // Blocks until an event at or after cursor is retained, then returns it and
+  // advances cursor past it. Positions already evicted are skipped. Returns
+  // null once the stream has ended, or on Ctrl+C, with nothing left to read.
+  std::shared_ptr<const EventData> next(std::uint64_t& cursor);
   bool running() const;
   std::string error() const;
   void stop();

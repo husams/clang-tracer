@@ -63,7 +63,7 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
                 '--exact "UnsupportedFixture::unsupported(long double)" '
                 '--exact "VirtualOnly::f(int)" --exact "Missing::run(int)" '
                 f'--save "{manifest}"',
-                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=32 fits=yes$",
+                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=unlimited fits=yes$",
             )
             assert [line.split()[0] for line in rows] == [
                 "UNSUPPORTED", "PREPARED_REQUIRED", "DWARF_SUPPORTED", "UNMATCHED"
@@ -73,7 +73,7 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
             assert 'include_globs: "X::*"' in manifest.read_text()
             assert preview(
                 f'%trace preview --manifest "{manifest}"',
-                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=32 fits=yes$",
+                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=unlimited fits=yes$",
             ) == rows
             assert os.pread(memory.fileno(), 16, address) == before
         assert "TracerPid:\t0" in Path(f"/proc/{names.pid}/status").read_text()
@@ -89,7 +89,7 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
         send(f"%attach {names.pid}")
         output.expect(r"^attached session=")
         preview('%trace preview --exact "X::f(int)"',
-                r"matched=1 dwarf_supported=1 limit=32 session_retained=0 agent_retained=1 available=31 fits=yes$")
+                r"matched=1 dwarf_supported=1 limit=unlimited session_retained=0 agent_retained=1 available=unlimited fits=yes$")
 
         templated, _ = start(concrete)
         send(f"%attach {templated.pid}")
@@ -97,7 +97,7 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
         rows = preview(
             '%trace preview --include "prepared_concrete::twice*" '
             '--exact "prepared_concrete::Handler::route(int) const"',
-            r"matched=3 dwarf_supported=2 .*available=32 fits=yes$",
+            r"matched=3 dwarf_supported=2 .*available=unlimited fits=yes$",
         )
         assert any("PREPARED_REQUIRED" in row and "Handler::route(int) const" in row for row in rows), rows
         assert any("DWARF_SUPPORTED" in row and "twice<int>(int)" in row for row in rows), rows
@@ -111,10 +111,10 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
         send(f"%attach {duplicate.pid}")
         output.expect(r"^attached session=")
         rows = preview('%trace preview --exact "stack_add(int, int)"',
-                       r"matched=2 dwarf_supported=0 .*available=32 fits=yes$")
+                       r"matched=2 dwarf_supported=0 .*available=unlimited fits=yes$")
         assert all(line.startswith("AMBIGUOUS ") for line in rows), rows
         rows = preview('%trace preview --module "libfirst.*" --exact "stack_add(int, int)"',
-                       r"matched=1 dwarf_supported=1 .*available=32 fits=yes$")
+                       r"matched=1 dwarf_supported=1 .*available=unlimited fits=yes$")
         assert len(rows) == 1 and rows[0].startswith("DWARF_SUPPORTED "), rows
         send("%quit")
         assert console.wait(timeout=15) == 0, "".join(output.seen)

@@ -525,11 +525,6 @@ ContextRegistryResult ContextRegistry::register_owner(
               [](const CandidateState &a, const CandidateState &b) {
                 return a.identity < b.identity;
               });
-    if (group.states.size() > context_engine::kMaxSlots) {
-      result.error = "incompatible_registration: scope state group exceeds "
-                     "engine slot capacity";
-      return result;
-    }
     for (std::size_t i = 1; i < group.states.size(); ++i) {
       if (group.states[i - 1].identity == group.states[i].identity) {
         result.error =

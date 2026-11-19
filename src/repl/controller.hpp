@@ -3,6 +3,7 @@
 #include <functional>
 #include <iosfwd>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -11,19 +12,28 @@
 #include "api.hpp"
 #include "commands.hpp"
 #include "events.hpp"
+#include "owned_target.hpp"
 #include "server_process.hpp"
 #include "tracer.grpc.pb.h"
 
 namespace tracer_repl {
 extern std::atomic<bool> interrupted;
 
+inline constexpr unsigned default_bulk_apply_timeout_seconds = 120;
+
 struct Settings {
   std::string endpoint, server, agent;
   std::vector<std::string> extra_compile_arguments;
   unsigned timeout_seconds = 30;
+  unsigned bulk_apply_timeout_seconds = default_bulk_apply_timeout_seconds;
   std::uint32_t context_event_bytes = 0;
   std::uint64_t context_transport_memory_bytes = 0;
   std::size_t max_events = 4096, max_bytes = 64 * 1024 * 1024;
+};
+
+struct PendingPreparedImport {
+  std::string source;
+  SessionHandle session;
 };
 
 class Controller {
@@ -33,22 +43,38 @@ class Controller {
   std::string endpoint_;
   std::uint64_t connection_ = 1;
   SessionHandle selected_;
+  std::function<void(const clangtracer::v1::Session&)> attachment_hook_;
   std::set<std::string> owned_sessions_;
+  std::map<std::string, std::map<std::string, std::filesystem::path>> agent_packages_;
   struct PendingAttach {
     std::set<std::string> previous_ids;
     std::set<std::string> candidate_ids;
   };
   std::map<std::uint32_t, PendingAttach> pending_attaches_;
+  struct OwnedLaunch {
+    std::unique_ptr<OwnedTarget> process;
+    SessionHandle session;
+  };
+  std::map<std::uint32_t, OwnedLaunch> owned_targets_;
   std::map<std::string, std::string> drafts_;
   struct PreparedPackage {
     std::string directory;
     clangtracer::v1::PreparedInjector artifact;
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
+  struct ObjectProbePreview {
+    std::string definition;
+    clangtracer::v1::ObjectProbeBinding binding;
+  };
+  std::optional<ObjectProbePreview> object_probe_preview_;
+  void object_probe_command(const Command &command);
   std::filesystem::path default_module_index_;
+  clangtracer::v1::ListModulesResponse module_snapshot(bool include_mappings);
+  clangtracer::v1::ListModulesResponse module_snapshot(const SessionHandle &session,
+                                                       bool include_mappings);
   void module_command(const Command &);
   std::filesystem::path module_index_path(const Command &) const;
-  std::vector<std::string> pending_imports_;
+  std::vector<PendingPreparedImport> pending_imports_;
   mutable std::vector<clangtracer::v1::PreparedInjector> pending_replay_types_;
   std::map<std::string, EventBuffer> batches_;
   std::vector<std::weak_ptr<BackgroundEvents>> background_;
@@ -59,6 +85,12 @@ class Controller {
   void start_server(const Command &command);
   void connect(const std::string &endpoint);
   void disconnect();
+  void prune_owned_targets();
+  void require_no_owned_targets();
+  void launch(const Command &command);
+  void control_target(const Command &command);
+  void call_target(const Command &command);
+  void require_idle_target(const SessionHandle &session) const;
   std::string reconcile_attaches(bool *snapshot_available = nullptr);
   clangtracer::v1::ProbeSpec resolve(const std::string &selector,
                                      const Command &command);
@@ -84,24 +116,34 @@ class Controller {
 public:
   explicit Controller(Settings settings, std::ostream &out);
   ~Controller();
-  bool execute(const Command &command);
+  using PrepareAgentPlugin = std::function<void(clangtracer::v1::AgentPluginRequest&,
+                                                const std::string&)>;
+  bool execute(const Command& command, const PrepareAgentPlugin& prepare_agent = {});
+  void on_attach(std::function<void(const clangtracer::v1::Session&)> hook);
+  void agent_plugin(const clangtracer::v1::AgentPluginRequest& request,
+                    const std::filesystem::path& manifest = {});
+  std::filesystem::path agent_plugin_manifest(const clangtracer::v1::AgentPluginRequest& request) const;
   void shutdown();
 
   const SessionHandle &selected_session() const { return selected_; }
 
   std::string prompt() const;
+  ModuleList modules(const std::string &filter);
+  ModuleInfo module_info(const std::string &name);
   PreparedPackage prepare_package(const std::string &selector, const Command &options);
   void prepare(const std::string &selector, const Command &options);
   void prepare_object_methods(const Command &command, clangtracer::v1::ObjectWatchRequest &request);
   ::tracer_module::ModuleIndex build_module_index(const ::tracer_module::ModuleSource &,
       const std::filesystem::path &, const ::tracer_module::ModuleIndexOptions &);
   ::tracer_module::ModuleIndex open_module_index(const std::filesystem::path &);
-  std::vector<std::string> take_pending_imports();
+  std::vector<PendingPreparedImport> take_pending_imports();
+  std::function<clangtracer::v1::ListModulesResponse()>
+  prepared_import_modules(const SessionHandle &session);
   std::vector<clangtracer::v1::PreparedInjector> take_pending_replay_types();
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
                        const std::string &expected_executable = {});
   void detach(const SessionHandle &session);
-  void require_session(const SessionHandle &session);
+  std::uint64_t require_session(const SessionHandle &session, bool scalar_overrides = false);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector, const std::string &source,
                        const Command &options);

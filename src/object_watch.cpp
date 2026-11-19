@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_watch.hpp"
 #include "ptrace_wait.hpp"
 
@@ -12,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -112,6 +112,7 @@ struct Lifetime {
   Address address = 0;
   std::uint64_t id = 0, generation = 0;
   Address owner = 0;
+  UnionActivation union_activation;
 };
 struct LogicalRange {
   RangeHeader header{};
@@ -137,6 +138,7 @@ struct Frame {
   LogicalRange range;
   Address active_inline_mutation = 0;
   bool provisional = false, value_partial = false;
+  UnionActivation union_activation;
 };
 struct Patch {
   std::string bytes;
@@ -328,7 +330,7 @@ struct Watch::Worker {
     }
     if (task.child)
       lifecycle_stop = true;
-    if (stop.event() == PTRACE_EVENT_STOP) {
+    if (stop.event() == tracer::injector::ptrace_event_stop) {
       task.listen = stop.signal() != SIGTRAP && !task.child;
       return;
     }
@@ -394,7 +396,7 @@ struct Watch::Worker {
       bool added = false;
       for (const auto &entry : std::filesystem::directory_iterator(directory)) {
         const auto tid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
-        if (tasks.contains(tid))
+        if (tasks.count(tid))
           continue;
         if (::ptrace(PTRACE_SEIZE, tid, nullptr, nullptr) == -1) {
           if (errno == ESRCH)
@@ -409,7 +411,7 @@ struct Watch::Worker {
         break;
       await_stops(deadline);
     }
-    if (!tasks.contains(pid) || proc::start_time(proc::directory(pid) / "stat") != process_start)
+    if (!tasks.count(pid) || proc::start_time(proc::directory(pid) / "stat") != process_start)
       throw std::runtime_error("object watch target identity changed");
     for (const auto &[tid, task] : tasks) {
       if (!std::filesystem::exists(directory / std::to_string(tid)))
@@ -434,7 +436,7 @@ struct Watch::Worker {
   void verify_bytes(Address pc, std::string_view expected, bool armed) const {
     auto actual = read_bytes(pid, pc, expected.size());
     const auto trap = object_target::trap;
-    if (actual.size() < trap.size() || (armed && !actual.starts_with(trap)))
+    if (actual.size() < trap.size() || (armed && !::tracer::compat::starts_with(actual, trap)))
       throw std::runtime_error("object watch breakpoint ownership changed");
     if (armed)
       actual.replace(0, trap.size(), expected.substr(0, trap.size()));
@@ -444,7 +446,7 @@ struct Watch::Worker {
 
   void install(Address pc, std::string_view expected) {
     const auto trap = object_target::trap;
-    if (expected.size() < trap.size() || expected.starts_with(trap) || pc % trap.size())
+    if (expected.size() < trap.size() || ::tracer::compat::starts_with(expected, trap) || pc % trap.size())
       throw std::runtime_error("cannot own an existing breakpoint or unmapped return address");
     const auto existing = patches.find(pc);
     if (existing != patches.end() && existing->second.armed) {
@@ -463,7 +465,7 @@ struct Watch::Worker {
     if (actual == patch.bytes)
       return;
     const auto trap = object_target::trap;
-    if (!actual.starts_with(trap) || actual.substr(trap.size()) != patch.bytes.substr(trap.size()))
+    if (!::tracer::compat::starts_with(actual, trap) || actual.substr(trap.size()) != patch.bytes.substr(trap.size()))
       throw std::runtime_error("object watch code changed while a breakpoint was owned");
     object_target::write_stopped_code(target, pc, std::string_view(patch.bytes).substr(0, trap.size()));
     if (read_bytes(target, pc, patch.bytes.size()) != patch.bytes)
@@ -799,7 +801,7 @@ struct Watch::Worker {
       }
       if (event.module().empty()) {
         try {
-          const auto mappings = client::list_debug_module_mappings(pid, true);
+          const auto mappings = client::list_debug_module_mappings(pid, {}, true);
           for (const auto &mapping : mappings.mappings())
             if (sample.pc >= mapping.begin_address() && sample.pc < mapping.end_address()) {
               event.set_module(mapping.path());
@@ -924,6 +926,7 @@ struct Watch::Worker {
       scope.range.header = header;
       scope.range.destination = destination;
       scope.range.valid = true;
+      scope.union_activation = {};
       std::uint64_t next = 0;
       const bool sampled = range_snapshot_enabled() &&
           read_memory(pid, destination, &next, plan->layout.field_width);
@@ -966,7 +969,7 @@ struct Watch::Worker {
             return pending.role == Boundary::construct && pending.receiver == receiver;
           });
       frame.uncertain_complete = plan->sites.at(pc).uncertain_complete &&
-          !plan->complete_constructor_returns.contains({pc, frame.return_pc});
+          !plan->complete_constructor_returns.count({pc, frame.return_pc});
       if (frame.outer_constructor && !frame.uncertain_complete && found != live.end()) {
         const auto prior = found->second;
         live.erase(found);
@@ -1013,7 +1016,7 @@ struct Watch::Worker {
       if (role == Boundary::add) {
         frame.incoming_view = read<Address>(pid, add(object_target::argument(regs, 1), plan->layout.pointee));
         const auto complete = complete_from_base(frame.incoming_view);
-        if (!complete || !live.contains(*complete))
+        if (!complete || !live.count(*complete))
           return;
         frame.incoming = *complete;
       } else {
@@ -1075,7 +1078,7 @@ struct Watch::Worker {
       Lifetime life{receiver, ++next_id, ++generations[receiver], 0};
       live.emplace(receiver, life);
       emit(tid, Observation::CREATED, life, pc, regs, [&](auto &out) {
-        out.set_field(plan->layout.union_tag_offset ? field_path() :
+        out.set_field(!plan->layout.union_path.empty() ? field_path() :
                       plan->layout.opaque_union ? "<storage>" : request.field());
         set_scalar_values(out, plan->layout, {}, {initial, union_tag(receiver)});
         if (plan->layout.union_tag_offset)
@@ -1194,6 +1197,8 @@ struct Watch::Worker {
     bool scoped = false;
     std::optional<std::uint32_t> old_tag = std::nullopt;
     ValueWrite storage;
+    Address storage_field = 0;
+    UnionWriteState union_before;
     ValueStoreBytes bytes{};
     bool before_read = false;
   };
@@ -1209,6 +1214,27 @@ struct Watch::Worker {
     Sample pending{{}, destination, s, std::nullopt};
     if (plan->layout.value_write.active()) {
       const auto &layout = plan->layout;
+      const auto read = [&](auto address, auto bytes, auto size) {
+        return read_memory(pid, address, bytes, size);
+      };
+      const auto sample_storage = [&](Address field, const ValueWrite &write) {
+        pending.storage = write;
+        pending.storage_field = field;
+        if (!request.no_values()) {
+          pending.before_read = read(write.address, pending.bytes.data(), write.size);
+          pending.union_before = sample_union_write(layout.value_write, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), field, write, read);
+        }
+      };
+      if (!request.first_seen()) {
+        const auto [owner, write] = match_live_union(layout.value_write, live, layout.scalar,
+            destination, s.width, [&] { gap(tid, pc, regs, "store intersects multiple live union objects"); });
+        if (!write.size)
+          return std::nullopt;
+        pending.life = owner->second;
+        sample_storage(add(owner->first, layout.scalar), write);
+        return pending;
+      }
       for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
         if (frame->role != Boundary::writer_scope ||
             (layout.logical_collection() && !frame->range.valid))
@@ -1227,8 +1253,7 @@ struct Watch::Worker {
           }
         }
         const auto match = match_value_store(layout.value_write, layout.value_alternatives.data(),
-            layout.value_alternatives.size(), request.max_string_bytes(), field, destination, s.width,
-            [&](auto address, auto bytes, auto size) { return read_memory(pid, address, bytes, size); });
+            layout.value_alternatives.size(), request.max_string_bytes(), field, destination, s.width, read);
         if (match.partial && !frame->value_partial) {
           frame->value_partial = true;
           gap(tid, pc, regs, "complex payload storage could not be verified within the read budget");
@@ -1238,9 +1263,7 @@ struct Watch::Worker {
         pending.life = frame->life;
         pending.scoped = true;
         pending.storage_generation = frame->range.generation;
-        pending.storage = match.write;
-        pending.before_read = !request.no_values() &&
-            read_memory(pid, pending.storage.address, pending.bytes.data(), pending.storage.size);
+        sample_storage(field, match.write);
         return pending;
       }
       return std::nullopt;
@@ -1288,7 +1311,7 @@ struct Watch::Worker {
     return pending;
   }
 
-  void complete(pid_t tid, const Sample &sample, Address pc,
+  void complete(pid_t tid, Task &task, const Sample &sample, Address pc,
                 const Registers &before, const Registers &after) {
     using Kind = native_entry::ScalarStore::Kind;
     const auto found = live.find(sample.life.address);
@@ -1308,7 +1331,35 @@ struct Watch::Worker {
       const bool after_read = !request.no_values() &&
           read_memory(pid, sample.storage.address, next.data(), sample.storage.size);
       const bool paired = sample.before_read && after_read;
-      if (paired && sample.bytes == next)
+      const auto &layout = plan->layout;
+      auto union_before = sample.union_before;
+      auto union_after = request.no_values() ? UnionWriteState{} :
+          sample_union_write(layout.value_write, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), sample.storage_field, sample.storage,
+              [&](auto address, auto bytes, auto size) { return read_memory(pid, address, bytes, size); });
+      if (!request.no_values() && layout.value_write.selector_width &&
+          layout.value_write.kind == ValueWriteKind::union_storage) {
+        auto *activation = !sample.scoped ? &found->second.union_activation : nullptr;
+        if (sample.scoped) {
+          for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
+            if (frame->role == Boundary::writer_scope && frame->life.id == sample.life.id &&
+                frame->range.generation == sample.storage_generation) {
+              activation = &frame->union_activation;
+              break;
+            }
+          }
+        }
+        if (activation)
+          confirm_union_payload(*activation, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), sample.storage_field, sample.storage, paired,
+              union_before, union_after);
+        else {
+          union_before.scalar.reset();
+          union_after.scalar.reset();
+        }
+      }
+      if (paired && sample.bytes == next && union_before.tag == union_after.tag &&
+          union_before.scalar == union_after.scalar)
         return;
       emit(tid, paired ? Observation::FIELD_CHANGED : Observation::FIELD_WRITTEN,
            sample.life, pc, before, [&](auto &out) {
@@ -1318,6 +1369,7 @@ struct Watch::Worker {
         out.set_synchronization(request.synchronization());
         set_storage_write(out, sample.storage, sample.before_read ? &sample.bytes : nullptr,
                           after_read ? &next : nullptr);
+        set_union_write(out, layout, union_before, union_after);
         if (!request.no_values() && !paired)
           out.set_diagnostic("complex store bytes could not be paired");
       });
@@ -1358,7 +1410,7 @@ struct Watch::Worker {
   }
 
   bool needs_breakpoint(Address pc) const {
-    return plan->sites.contains(pc) ||
+    return plan->sites.count(pc) ||
         std::any_of(tasks.begin(), tasks.end(), [&](const auto &item) {
       const auto &task = item.second;
       return task.breakpoint_pc == pc ||
@@ -1440,7 +1492,7 @@ struct Watch::Worker {
       await_stops(deadline);
       const auto current = tasks.find(tid);
       if (lifecycle_stop || current == tasks.end() ||
-          current->second.stop.event() != PTRACE_EVENT_STOP ||
+          current->second.stop.event() != tracer::injector::ptrace_event_stop ||
           current->second.stop.signal() != SIGTRAP || object_target::pc(registers(tid)) != pc)
         break;
       // An interrupt requested before a peer's breakpoint stop was reaped can
@@ -1464,7 +1516,7 @@ struct Watch::Worker {
       const auto after = trace_trap ? registers(tid) : Registers{};
       if (trace_trap && object_target::pc(after) == pc + expected.size()) {
         try {
-          complete(tid, *observation, pc, regs, after);
+          complete(tid, task, *observation, pc, regs, after);
         } catch (const std::runtime_error &error) {
           gap(tid, pc, regs, error.what());
         }
@@ -1562,10 +1614,10 @@ struct Watch::Worker {
         }
       }
     }
-    if (lifecycle_stop && !stopping && (image_replaced || tasks.contains(pid)))
+    if (lifecycle_stop && !stopping && (image_replaced || tasks.count(pid)))
       gap(pid, 0, {}, "object watch ended at a thread/process lifecycle event");
     const auto reason = image_replaced ? Observation::MAPPING_CHANGED :
-        !tasks.contains(pid) ? Observation::TARGET_EXITED :
+        !tasks.count(pid) ? Observation::TARGET_EXITED :
         stopping ? stop_reason.load() : Observation::SCOPE_CHANGED;
     for (const auto &[tid, task] : tasks)
       for (const auto &frame : task.frames)
@@ -1583,7 +1635,7 @@ struct Watch::Worker {
       trace();
     } catch (const std::exception &error) {
       failure = error.what();
-      if (!ready && !launch_argv.empty() && tasks.contains(pid)) {
+      if (!ready && !launch_argv.empty() && tasks.count(pid)) {
         ::kill(pid, SIGKILL);
         while (::waitpid(pid, nullptr, __WALL) == -1 && errno == EINTR) {}
         tasks.clear();

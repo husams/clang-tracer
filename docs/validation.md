@@ -39,10 +39,10 @@ boundaries, failed preparation without partial publication, and RX trampoline
 permissions. Unsupported control transfers and addressing forms remain rejected.
 
 `grpc_native_pie_integration` builds `tests/fixtures/target.cpp` with explicit
-`-fPIE -pie` and runs the complete native integration against it. The source of
-`traced_void` stays unchanged: its early global store must be relocated. The
-integration checks events for that probe, verifies the target's global value,
-and exercises detach, reattach and server-shutdown restoration.
+`-fPIE -pie` and runs the complete native integration against it. The early
+global store in `traced_void` must be relocated. The integration replaces the
+probe in the same session, checks events and the target's global value, and
+exercises detach, reattach and server-shutdown restoration.
 
 Verified on 2 November 2026 with Clang/LLVM 21.1.8 on Linux x86_64:
 **20/20 CTests passed in 390.88 seconds**. The exact PIE binary that previously

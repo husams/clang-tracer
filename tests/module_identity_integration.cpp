@@ -283,12 +283,13 @@ public:
         mapping_ = nullptr;
         throw std::runtime_error("could not reserve coalesced ELF mapping range");
       }
-      if (::mmap(mapping_, page_size_, PROT_READ | PROT_EXEC,
+      // Construct the single VMA directly: adjacent mmap calls need not merge
+      // on OverlayFS. The negative case remaps the second page at a bad offset.
+      if (::mmap(mapping_, mapping_size_, PROT_READ | PROT_EXEC,
                  MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED ||
-          ::mmap(static_cast<char *>(mapping_) + page_size_, page_size_,
+          (wrong_second_offset_ && ::mmap(static_cast<char *>(mapping_) + page_size_, page_size_,
                  PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd,
-                 static_cast<off_t>(wrong_second_offset_ ? 0 : page_size_)) ==
-              MAP_FAILED) {
+                 0) == MAP_FAILED)) {
         ::munmap(mapping_, mapping_size_);
         mapping_ = nullptr;
         throw std::runtime_error("could not map adjacent coalesced ELF segments");

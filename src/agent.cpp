@@ -1,22 +1,12 @@
-#include "callback_bridge.hpp"
-#include "context_activation.hpp"
-#include "context_agent_delivery.hpp"
-#include "context_analysis.hpp"
-#include "context_engine.hpp"
-#include "context_pthread_detour.hpp"
-#include "context_runtime.hpp"
-#include "context_stdlib.hpp"
-#include "debug_resolver.hpp"
-#include "event_transport.hpp"
-#include "native_stack.hpp"
+#include "object_code_cache_identity.hpp"
+#include "agent_plugin_observers.hpp"
 #include "native_detour.hpp"
 #include "native_entry.hpp"
-#include "runtime_paths.hpp"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <bits/cxxabi_forced.h>
 #include <chrono>
 #include <cctype>
 #include <cstdarg>
@@ -41,6 +31,7 @@
 #include <vector>
 #include "value_snapshot_codegen.hpp"
 #include "snapshot_encoder.hpp"
+#include "snapshot_runtime_limits.hpp"
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
@@ -55,6 +46,7 @@
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
+#include <clang/Basic/DiagnosticCategories.h>
 #include <clang/Basic/Version.h>
 #include <clang/CodeGen/CGFunctionInfo.h>
 #include <clang/CodeGen/CodeGenABITypes.h>
@@ -62,6 +54,7 @@
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
+#include <clang/Interpreter/Interpreter.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Parse/ParseAST.h>
@@ -81,16 +74,6 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <clang/Interpreter/Interpreter.h>
-#include <llvm/MC/MCAsmInfo.h>
-#include <llvm/MC/MCContext.h>
-#include <llvm/MC/MCDisassembler/MCDisassembler.h>
-#include <llvm/MC/MCInst.h>
-#include <llvm/MC/MCInstrInfo.h>
-#include <llvm/MC/MCRegisterInfo.h>
-#include <llvm/MC/MCSubtargetInfo.h>
-#include <llvm/MC/MCTargetOptions.h>
-#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SHA256.h>
@@ -128,6 +111,8 @@
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
+#include "scalar_overrides.hpp"
+#include "tracer/reclaim.h"
 #include "tracer/receiver_abi.hpp"
 
 #if !defined(__linux__) || !defined(__x86_64__)
@@ -142,8 +127,7 @@ thread_local unsigned callback_depth = 0;
 namespace agent_log = tracer::agent_log;
 using agent_log::Level;
 
-// Callback messages and the failure text of a prepare or stop record are
-// capped at this size.
+// Failure text of a prepare or stop record is capped at this size.
 constexpr std::size_t kLogMessageSize = 192;
 
 // Startup configuration, captured before the sender begins logging.
@@ -221,38 +205,34 @@ void write_agent_record(Level level, const char *operation, const char *stage,
                         std::uint64_t event_drops, std::uint64_t call_id,
                         const char *message) noexcept {
   const int fd = open_agent_log();
-  if (fd < 0)
-    return;
-  timespec now{};
-  ::clock_gettime(CLOCK_REALTIME, &now);
-  char line[1024];
-  int size = std::snprintf(
-      line, sizeof(line),
-      "clang-tracer agent time=%lld.%09ld pid=%ld level=%s probe_id=%llu "
-      "call_id=%llu operation=%s stage=%s outcome=%s errno=%d "
-      "callback_errors=%llu event_drops=%llu%s%s\n",
-      static_cast<long long>(now.tv_sec), now.tv_nsec,
-      static_cast<long>(::getpid()), agent_log::level_name(level),
-      static_cast<unsigned long long>(probe_id),
-      static_cast<unsigned long long>(call_id), operation, stage, outcome,
-      error_number, static_cast<unsigned long long>(callback_errors),
-      static_cast<unsigned long long>(event_drops), message ? " message=" : "",
-      message ? message : "");
-  if (size > 0) {
-    // A longer line is cut, but it is still written and ends in a newline.
-    if (static_cast<std::size_t>(size) >= sizeof(line)) {
-      size = static_cast<int>(sizeof(line)) - 1;
-      line[size - 1] = '\n';
+  if (fd >= 0) {
+    timespec now{};
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    try {
+      std::string line(512 + (message ? std::strlen(message) : 0), '\0');
+      const int size = std::snprintf(
+          line.data(), line.size(),
+          "clang-tracer agent time=%lld.%09ld pid=%ld level=%s probe_id=%llu call_id=%llu "
+          "operation=%s stage=%s outcome=%s errno=%d callback_errors=%llu "
+          "event_drops=%llu%s%s\n",
+          static_cast<long long>(now.tv_sec), now.tv_nsec, static_cast<long>(::getpid()), agent_log::level_name(level),
+          static_cast<unsigned long long>(probe_id), static_cast<unsigned long long>(call_id),
+          operation, stage, outcome, error_number, static_cast<unsigned long long>(callback_errors),
+          static_cast<unsigned long long>(event_drops), message ? " message=" : "",
+          message ? message : "");
+      // Linux appends pwrite on an O_APPEND descriptor. The positional write
+      // also avoids a SIGPIPE if the application replaces this descriptor.
+      if (size > 0 && static_cast<std::size_t>(size) < line.size()) {
+        (void)::syscall(SYS_pwrite64, fd, line.data(), static_cast<std::size_t>(size), 0LL);
+      }
+    } catch (...) {
     }
-    // Linux appends pwrite on an O_APPEND descriptor. The positional write
-    // also avoids a SIGPIPE if the application replaces this descriptor.
-    (void)::syscall(SYS_pwrite64, fd, line, static_cast<std::size_t>(size), 0LL);
+    (void)::syscall(SYS_close, fd);
   }
-  (void)::syscall(SYS_close, fd);
 }
 
 // Writes one record when the configured level admits it. This runs on borrowed
-// application threads: it must not throw, take a lock, or allocate.
+// application threads: preserve errno and suppress recursive callbacks.
 void log_agent(Level level, const char *operation, const char *stage,
                std::uint64_t probe_id, const char *outcome,
                int error_number = 0, std::uint64_t callback_errors = 0,
@@ -429,8 +409,6 @@ void report_agent_failures() noexcept;
 void write_agent_logs() noexcept;
 
 struct CallbackLog {
-  static constexpr std::size_t kCapacity = 16;
-  static constexpr std::size_t kMessageSize = kLogMessageSize;
   struct Entry {
     std::uint64_t call_id;
     tracer::TracePhase phase;
@@ -439,12 +417,11 @@ struct CallbackLog {
     // a callback message whose outcome is its callback log level.
     const char *operation;
     const char *outcome;
-    char message[kMessageSize + 1];
+    std::string message;
   };
   // Producers try once. The sender releases this before writing any records.
   std::atomic_flag busy = ATOMIC_FLAG_INIT;
-  std::size_t count = 0;
-  std::array<Entry, kCapacity> entries{};
+  std::vector<Entry> entries;
   // Set after queueing so the sender skips probes with nothing to write.
   std::atomic<bool> pending{false};
   std::atomic<std::uint64_t> dropped{0};
@@ -473,6 +450,7 @@ struct VerifiedDebugEntry {
 struct Probe {
   static constexpr std::uint64_t admission_closed = std::uint64_t{1} << 63;
   tracer::Request request{};
+  std::vector<tracer::ValueType> signature_arguments;
   std::shared_ptr<OrcErrorCapture> orc_errors;
   std::unique_ptr<clang::Interpreter> interpreter;
   std::unique_ptr<clang::ASTUnit> receiver_ast;
@@ -513,6 +491,7 @@ struct Probe {
   bool object_snapshot = false;
   bool transport_active = false;
   bool scheduler_counted = false;
+  bool reclaimable = false;
   void *wrapper = nullptr;
   std::vector<std::string> external_link_candidates;
   std::shared_ptr<const tracer::ContextActivationGeneration> shared_generation;
@@ -531,14 +510,22 @@ struct Probe {
   }
 };
 
+// Registry nodes outlive reclaimed probes so readers can traverse a stable chain.
+struct ProbeSlot {
+  ProbeSlot *next = nullptr; // Immutable after publication.
+  std::atomic<Probe *> probe{nullptr};
+  std::atomic<std::uint64_t> id{0};
+};
+
 struct Agent {
-  std::array<std::unique_ptr<Probe>, tracer::kMaxProbes> probes{};
-  std::array<std::atomic<Probe *>, tracer::kMaxProbes> probe_slots{};
+  std::vector<std::unique_ptr<Probe>> probes;
+  std::vector<std::unique_ptr<ProbeSlot>> probe_slots;
+  std::atomic<ProbeSlot *> published_slots{nullptr};
   std::size_t retained = 0;
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
   std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
-  unsigned next_context_hook = 0;
+  std::uint64_t next_context_hook = 0;
   const bool logging_enabled = agent_log_path()[0] != '\0';
   // Same cached value as agent_log_allows, reachable from the loaded agent.
   const int log_threshold = agent_log_config().threshold;
@@ -557,11 +544,7 @@ struct Agent {
   Agent()
       : transport([] { ++callback_depth; },
                   logging_enabled ? &report_agent_failures : nullptr,
-                  logging_enabled ? &write_agent_logs : nullptr) {
-    for (auto &slot : probe_slots) {
-      slot.store(nullptr, std::memory_order_relaxed);
-    }
-  }
+                  logging_enabled ? &write_agent_logs : nullptr) {}
 };
 
 struct CapturedDiagnostic {
@@ -592,14 +575,23 @@ public:
             : (level == clang::DiagnosticsEngine::Warning ? "warning"
                                                           : "note");
     diagnostic.message.assign(formatted.begin(), formatted.end());
-    const auto &source_manager = info.getSourceManager();
     const auto location = info.getLocation();
-    if (location.isValid()) {
-      const auto presumed = source_manager.getPresumedLoc(location);
+    if (location.isValid() && info.hasSourceManager()) {
+      const auto presumed = info.getSourceManager().getPresumedLoc(location);
       if (presumed.isValid()) {
         diagnostic.file = presumed.getFilename();
         diagnostic.line = presumed.getLine();
         diagnostic.column = presumed.getColumn();
+        // Recovered type aliases can fail to parse before the real receiver
+        // is imported. Only the callback body can prove malformed user input.
+        if (level >= clang::DiagnosticsEngine::Error &&
+            diagnostic.file == "callback_source") {
+          const auto category =
+              clang::DiagnosticIDs::getCategoryNumberForDiag(info.getID());
+          had_syntax_error_ |=
+              category == clang::diag::DiagCat_Parse_Issue ||
+              category == clang::diag::DiagCat_Lexical_or_Preprocessor_Issue;
+        }
       }
     }
     if (!diagnostic.message.empty())
@@ -618,6 +610,7 @@ public:
   const std::string &message() const { return message_; }
 
   bool had_error() const { return had_error_; }
+  bool had_syntax_error() const { return had_syntax_error_; }
   const std::vector<CapturedDiagnostic> &diagnostics() const {
     return diagnostics_;
   }
@@ -626,6 +619,7 @@ public:
     message_.clear();
     diagnostics_.clear();
     had_error_ = false;
+    had_syntax_error_ = false;
   }
 
 private:
@@ -633,6 +627,7 @@ private:
   std::string message_;
   std::vector<CapturedDiagnostic> diagnostics_;
   bool had_error_ = false;
+  bool had_syntax_error_ = false;
 };
 
 void append_diagnostics(clangtracer::v1::ValidationReport &report,
@@ -683,6 +678,14 @@ void append_diagnostic_text(std::string &error, const std::string &message) {
 
 extern "C" void tracer_probe_enter(unsigned long long) noexcept;
 extern "C" void tracer_probe_leave(unsigned long long) noexcept;
+extern "C" unsigned long long tracer_observer_clock() noexcept;
+extern "C" void tracer_observer_return(unsigned long long, unsigned long long,
+                                       unsigned long long, unsigned long long) noexcept;
+extern "C" bool tracer_object_identity_lookup(unsigned long long,
+                                               unsigned long long,
+                                               std::uint64_t *,
+                                               std::uint64_t *,
+                                               bool *) noexcept;
 extern "C" unsigned long long tracer_next_call_id(unsigned long long) noexcept;
 extern "C" void tracer_capture_stack(const tracer::TraceContext *, unsigned,
                                      bool) noexcept;
@@ -690,14 +693,19 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *,
                                            unsigned) noexcept;
 extern "C" long long tracer_callback_dispatch(unsigned long long,
                                               const tracer::TraceContext *,
-                                              void *) noexcept;
+                                              void *);
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
-extern "C" void tracer_callback_failure(unsigned long long) noexcept;
+extern "C" void tracer_callback_failure(unsigned long long,
+                                         const tracer::TraceContext *,
+                                         const char *) noexcept;
 extern "C" void tracer_event_dispatch(unsigned long long,
                                       const tracer::TraceContext *,
                                       long long) noexcept;
+static void tracer_event_dispatch_impl(unsigned long long,
+                                       const tracer::TraceContext *, long long,
+                                       bool, const char *) noexcept;
 extern "C" void tracer_context_check_entry();
 extern "C" void *tracer_shared_enter(unsigned long long,
                                      const tracer::TraceContext *, unsigned);
@@ -794,8 +802,9 @@ void report_probe_activity(Agent &owner, Probe &probe) noexcept {
     if (state == PatchState::Modified) {
       // A newer probe of the same entry owns these bytes after a reload. Their
       // request fields are immutable once the probe is published.
-      for (const auto &slot : owner.probe_slots) {
-        const auto *other = slot.load(std::memory_order_acquire);
+      for (auto *slot = owner.published_slots.load(std::memory_order_acquire);
+           slot; slot = slot->next) {
+        const auto *other = slot->probe.load(std::memory_order_acquire);
         if (other && other != &probe &&
             other->request.patch_address == probe.request.patch_address &&
             other->request.patch_size == probe.request.patch_size &&
@@ -853,8 +862,9 @@ void report_agent_failures() noexcept {
   if (!current)
     return;
   const bool activity = current->log_allows(Level::Debug);
-  for (const auto &slot : current->probe_slots) {
-    auto *probe = slot.load(std::memory_order_acquire);
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    auto *probe = slot->probe.load(std::memory_order_acquire);
     if (!probe)
       continue;
     const auto errors = probe->callback_errors.load(std::memory_order_relaxed);
@@ -878,8 +888,9 @@ void write_agent_logs() noexcept {
   auto *current = agent.load(std::memory_order_acquire);
   if (!current)
     return;
-  for (const auto &slot : current->probe_slots) {
-    auto *probe = slot.load(std::memory_order_acquire);
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    auto *probe = slot->probe.load(std::memory_order_acquire);
     if (!probe)
       continue;
     auto &log = probe->log;
@@ -889,10 +900,9 @@ void write_agent_logs() noexcept {
         log.pending.store(true, std::memory_order_release);
         continue;
       }
-      std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
-      const auto count = log.count;
-      std::copy_n(log.entries.begin(), count, pending.begin());
-      log.count = 0;
+      std::vector<CallbackLog::Entry> pending;
+      pending.swap(log.entries);
+      const auto count = pending.size();
       log.busy.clear(std::memory_order_release);
       for (std::size_t i = 0; i < count; ++i) {
         const auto &entry = pending[i];
@@ -900,7 +910,7 @@ void write_agent_logs() noexcept {
             entry.phase == tracer::TracePhase::Pre ? "pre" : "post";
         log_agent(entry.level, entry.operation, phase, probe->request.probe_id,
                   entry.outcome, 0, 0, 0, entry.call_id,
-                  entry.message[0] ? entry.message : nullptr);
+                  entry.message.empty() ? nullptr : entry.message.c_str());
       }
     }
     const auto dropped = log.dropped.load(std::memory_order_relaxed);
@@ -917,7 +927,7 @@ void write_agent_logs() noexcept {
 }
 
 // Queues one record for the sender. A record above the configured level is not
-// queued and does not use a slot. A full or contended queue drops the record.
+// queued and does not use a slot. Allocation failure or contention drops it.
 bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
                        Level level, const char *operation, const char *outcome,
                        const char *message, std::size_t size) noexcept {
@@ -926,15 +936,22 @@ bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
   auto &log = probe.log;
   bool queued = false;
   if (!log.busy.test_and_set(std::memory_order_acquire)) {
-    queued = log.count < log.entries.size();
-    if (queued) {
-      auto &entry = log.entries[log.count++];
+    try {
+      CallbackLog::Entry entry{};
       entry.call_id = context.call_id;
       entry.phase = context.phase;
       entry.level = level;
       entry.operation = operation;
       entry.outcome = outcome;
-      sanitize_log_message(entry.message, message, message ? size : 0);
+      entry.message.resize(message ? size : 0);
+      for (std::size_t i = 0; i < entry.message.size(); ++i) {
+        const auto byte = static_cast<unsigned char>(message[i]);
+        entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
+      }
+      log.entries.push_back(std::move(entry));
+      queued = true;
+    } catch (...) {
+      queued = false;
     }
     log.busy.clear(std::memory_order_release);
   }
@@ -969,16 +986,16 @@ Probe *find_probe(std::uint64_t id) noexcept {
   if (!current) {
     return nullptr;
   }
-  for (auto &slot : current->probe_slots) {
-    Probe *probe = slot.load(std::memory_order_acquire);
-    if (probe && probe->request.probe_id == id) {
-      return probe;
-    }
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    if (id && slot->id.load(std::memory_order_acquire) == id)
+      return slot->probe.load(std::memory_order_acquire);
   }
   return nullptr;
 }
 
 struct SharedInvocationToken {
+  tracer::detail::NamedValueStorage named;
   Probe *probe = nullptr;
   tracer::TraceContext raw{};
   tracer::TraceContext entry_context{};
@@ -994,9 +1011,18 @@ struct SharedInvocationToken {
   bool cancel_disabled = false, constructed = false, enabled = false,
        finished = false;
 };
-std::array<SharedInvocationToken, 256> shared_invocations;
-static_assert(sizeof(shared_invocations) <=
-              tracer::context_engine::kCaptureInvocationWorkspaceBytes);
+
+struct SharedInvocationStorage {
+  std::vector<std::unique_ptr<SharedInvocationToken>> tokens;
+
+  ~SharedInvocationStorage() {
+    ++callback_depth;
+    std::vector<std::unique_ptr<SharedInvocationToken>>().swap(tokens);
+    --callback_depth;
+  }
+};
+
+thread_local SharedInvocationStorage shared_invocation_storage;
 
 template <class T>
 void copy_shared_value(T &destination, const T &source) noexcept {
@@ -1016,7 +1042,8 @@ void copy_shared_value(T &destination, const T &source) noexcept {
 // from the immutable invocation-entry snapshot prepared before scope access.
 void shared_capture_stack(const tracer::TraceContext *context, unsigned depth,
                           bool application_only) noexcept {
-  for (auto &token : shared_invocations) {
+  for (auto& owned : shared_invocation_storage.tokens) {
+    auto& token = *owned;
     if (&token.raw != context ||
         !token.occupied.load(std::memory_order_acquire))
       continue;
@@ -1113,13 +1140,26 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
     return nullptr;
   }
   SharedInvocationToken *token = nullptr;
-  for (auto &candidate : shared_invocations) {
+  for (auto& owned : shared_invocation_storage.tokens) {
+    auto& candidate = *owned;
     bool free = false;
     if (candidate.occupied.compare_exchange_strong(free, true,
                                                    std::memory_order_acq_rel)) {
       token = &candidate;
       break;
     }
+  }
+  if (!token) {
+    ++callback_depth;
+    try {
+      auto owned = std::make_unique<SharedInvocationToken>();
+      token = owned.get();
+      shared_invocation_storage.tokens.push_back(std::move(owned));
+      token->occupied.store(true, std::memory_order_release);
+    } catch (...) {
+      token = nullptr;
+    }
+    --callback_depth;
   }
   if (!token) {
     tracer::context_execution::runtime_diagnostics().record(
@@ -1133,12 +1173,17 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
   token->finished = false;
   token->probe = probe;
   copy_shared_value(token->raw, *raw);
+  ++callback_depth;
+  token->named.clear();
+  --callback_depth;
+  token->raw.named_storage = &token->named;
+  token->raw.named_values = nullptr;
   token->raw.named_count = 0;
-  for (unsigned i = 0;
-       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
-    token->raw.argument_names[i] = i < probe->argument_names.size()
-                                       ? probe->argument_names[i].c_str()
-                                       : nullptr;
+  token->raw.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < token->raw.argument_count; ++i) {
+    token->raw.argument_names[i] =
+        i < probe->argument_names.size() ? probe->argument_names[i].c_str() : nullptr;
+  }
   ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
   token->cancel_disabled = true;
   ++callback_depth;
@@ -1185,6 +1230,9 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
         tracer::context_execution::Action::callback_skipped, raw->call_id);
   }
   --callback_depth;
+  if (!token->constructed)
+    tracer_event_dispatch_impl(id, &token->raw, 0, true,
+                               "shared interceptor construction failed");
   copy_shared_value(raw->stack, token->raw.stack);
   errno = saved_errno;
   return token;
@@ -1209,12 +1257,17 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   copy_shared_value(token->raw, *raw);
   log_dispatch(*token->probe, token->raw);
   token->raw.stack_capture = &shared_capture_stack;
+  ++callback_depth;
+  token->named.clear();
+  --callback_depth;
+  token->raw.named_storage = &token->named;
+  token->raw.named_values = nullptr;
   token->raw.named_count = 0;
-  for (unsigned i = 0;
-       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
-    token->raw.argument_names[i] = i < token->probe->argument_names.size()
-                                       ? token->probe->argument_names[i].c_str()
-                                       : nullptr;
+  token->raw.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < token->raw.argument_count; ++i) {
+    token->raw.argument_names[i] =
+        i < token->probe->argument_names.size() ? token->probe->argument_names[i].c_str() : nullptr;
+  }
   ++callback_depth;
   const auto entry = raw->phase == tracer::TracePhase::Pre
                          ? token->probe->shared_generation->pre_entry()
@@ -1234,6 +1287,10 @@ extern "C" void tracer_shared_dispatch(void *opaque,
         tracer::context_execution::Action::callback_skipped, raw->call_id);
   }
   --callback_depth;
+  if (!hook_succeeded)
+    tracer_event_dispatch_impl(token->probe->request.probe_id,
+                               &token->raw, 0, true,
+                               "shared interceptor callback failed");
   copy_shared_value(raw->stack, token->raw.stack);
   errno = saved_errno;
   tracer_shared_resume(token);
@@ -1300,12 +1357,13 @@ extern "C" void tracer_shared_release(void *opaque) noexcept {
   }
 }
 
-std::uint64_t address_value(auto address) {
-  if constexpr (requires { address.getValue(); }) {
-    return address.getValue();
-  } else {
-    return static_cast<std::uint64_t>(address);
-  }
+template <class Address>
+auto address_value(Address address) -> decltype(address.getValue()) {
+  return address.getValue();
+}
+
+std::uint64_t address_value(std::uint64_t address) {
+  return address;
 }
 
 void set_error(tracer::Request *request, const char *text) noexcept {
@@ -1314,74 +1372,45 @@ void set_error(tracer::Request *request, const char *text) noexcept {
   }
 }
 
-constexpr std::size_t kMaxSerializedProbeSpec = 256 * 1024;
-constexpr std::size_t kMaxCallbackSource = 64 * 1024;
-constexpr std::size_t kMaxReceiverFields = 128;
+bool valid_type(tracer::ValueType type, bool result);
 
-bool read_probe_spec(const tracer::Request &request,
-                     clangtracer::v1::ProbeSpec &spec, std::string &error) {
+bool read_probe_spec(tracer::Request& request, std::vector<tracer::ValueType>& arguments,
+                     clangtracer::v1::ProbeSpec& spec, std::string& error) {
   std::ifstream input(request.source_path, std::ios::binary);
-  if (!input) {
-    error = "cannot open serialized probe specification";
-    return false;
-  }
-  std::string bytes(kMaxSerializedProbeSpec + 1, '\0');
-  input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  const auto count = static_cast<std::size_t>(input.gcount());
-  if (count > kMaxSerializedProbeSpec) {
-    error = "serialized probe specification exceeds 256 KiB";
-    return false;
-  }
-  bytes.resize(count);
-  if (!spec.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
+  if (!input || !spec.ParseFromIstream(&input)) {
     error = "cannot parse serialized probe specification";
     return false;
   }
   if (spec.symbol() != request.symbol || !spec.has_signature() ||
-      static_cast<unsigned>(spec.signature().kind()) !=
-          static_cast<unsigned>(request.kind) ||
-      static_cast<unsigned>(spec.signature().result()) !=
-          static_cast<unsigned>(request.result) ||
-      spec.signature().arguments_size() !=
-          static_cast<int>(request.argument_count) ||
-      request.argument_count > tracer::kMaxArguments) {
-    error =
-        "serialized probe specification does not match the prepared request";
+      spec.object_watch_id() != request.object_watch_id ||
+      static_cast<unsigned>(spec.signature().kind()) != static_cast<unsigned>(request.kind) ||
+      static_cast<unsigned>(spec.signature().result()) != static_cast<unsigned>(request.result) ||
+      spec.signature().arguments_size() != static_cast<int>(request.argument_count)) {
+    error = "serialized probe specification does not match the prepared request";
     return false;
   }
-  for (unsigned i = 0; i < request.argument_count; ++i) {
-    if (static_cast<unsigned>(spec.signature().arguments(static_cast<int>(
-            i))) != static_cast<unsigned>(request.arguments[i])) {
-      error = "serialized probe signature does not match the prepared request";
+  if (request.object_watch_id &&
+      (request.kind != tracer::CallableKind::Method || !spec.has_debug_info() ||
+       spec.debug_info().record_name().empty() ||
+       !tracer::prepared::is_typed_version(spec.prepared().format_version()))) {
+    error = "object-watch method requires verified receiver type metadata";
+    return false;
+  }
+  arguments.clear();
+  for (const auto type : spec.signature().arguments()) {
+    if (!valid_type(static_cast<tracer::ValueType>(type), false)) {
+      error = "unsupported argument type";
       return false;
     }
+    arguments.push_back(static_cast<tracer::ValueType>(type));
   }
-  if (spec.callback_source().size() > kMaxCallbackSource) {
-    error = "callback source exceeds 64 KiB";
-    return false;
-  }
+  request.arguments = arguments.data();
   if (spec.has_receiver()) {
     const auto &receiver = spec.receiver();
-    if (receiver.ByteSizeLong() > kMaxCallbackSource) {
-      error = "receiver compilation context exceeds 64 KiB";
+    if (receiver.translation_unit().empty() || receiver.working_directory().empty() ||
+        receiver.compiler_arguments().empty() || receiver.record_name().empty()) {
+      error = "receiver compilation context is incomplete";
       return false;
-    }
-    if (receiver.translation_unit().empty() ||
-        receiver.working_directory().empty() ||
-        receiver.compiler_arguments().empty() ||
-        receiver.record_name().empty() ||
-        receiver.fields_size() > static_cast<int>(kMaxReceiverFields)) {
-      error =
-          "receiver compilation context is incomplete or exceeds its limits";
-      return false;
-    }
-    std::size_t arguments_size = 0;
-    for (const auto &argument : receiver.compiler_arguments()) {
-      arguments_size += argument.size();
-      if (arguments_size > kMaxCallbackSource) {
-        error = "receiver compiler arguments exceed 64 KiB";
-        return false;
-      }
     }
   }
   return true;
@@ -2028,9 +2057,9 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
     // modifiers. Match the base as a whole, including any nested template
     // arguments, so two specializations cannot be confused.
     const auto base = std::string_view(type);
-    const auto unqualified = base.starts_with("const ") ? base.substr(6) : base;
+    const auto unqualified = ::tracer::compat::starts_with(base, "const ") ? base.substr(6) : base;
     for (const auto &[original, recovered] : names) {
-      if (!unqualified.starts_with(original))
+      if (!::tracer::compat::starts_with(unqualified, original))
         continue;
       const auto suffix = unqualified.substr(original.size());
       if (!suffix.empty() && suffix.front() != ' ' &&
@@ -2206,9 +2235,12 @@ std::string missing_recovered_record_declarations(
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
+  if (const auto *error = tracer::scalar_override_error(spec))
+    throw std::invalid_argument(error);
   const auto &info = spec.debug_info();
   tracer::client::DebugLookupOptions lookup;
   lookup.module = info.module();
+  lookup.require_override_abi = tracer::has_scalar_overrides(spec);
   const auto live_patch = [](std::uint64_t address) -> tracer::client::PreparedCodePatch {
     const auto *current = agent.load(std::memory_order_acquire);
     if (current) {
@@ -2231,7 +2263,11 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   };
   const auto checked = spec.has_prepared()
       ? tracer::client::bind_prepared_callable(::getpid(), spec.prepared(), lookup, live_patch)
-      : tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
+      : tracer::client::resolve_debug_callable(
+            ::getpid(),
+            // Bind by linkage name when the entry has one: an alias shares the primary's
+            // selector but is installed under its own symbol.
+            spec.symbol().compare(0, 2, "_Z") == 0 ? spec.symbol() : info.selector(), lookup);
   if (!info.runtime_entry() || !info.entry_size() ||
       checked.spec.debug_info().SerializeAsString() !=
           info.SerializeAsString() ||
@@ -2296,8 +2332,6 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       return false;
     }
     std::string headers;
-    if (spec.include_headers_size() > 16)
-      throw std::runtime_error("at most 16 optional includes");
     for (const auto &header : spec.include_headers()) {
       if (header.empty() || header.size() > 4095 || header.front() != '/' ||
           header.find_first_of("\"\r\n") != std::string::npos ||
@@ -2310,7 +2344,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       headers += recovered_record_declarations(spec);
     if (!callback_includes.empty())
       headers = callback_includes + headers;
-    DiagnosticCapture capture(nullptr);
+    auto capture = std::make_unique<DiagnosticCapture>(nullptr);
     if (spec.has_header_context()) {
       const auto &header_context = spec.header_context();
       const auto &directory = header_context.working_directory();
@@ -2336,8 +2370,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       if (!resource_dir)
         arguments.push_back(std::string("-resource-dir=") +
                             tracer::runtime::clang_resource_dir());
-      arguments.insert(arguments.end(), {"-x", "c++", "-fsyntax-only"});
-      clang::tooling::FixedCompilationDatabase database(directory, arguments);
+      arguments.insert(arguments.end(), {"-x", "c++"});
       auto physical_fs = llvm::vfs::createPhysicalFileSystem();
       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
           physical_fs.release());
@@ -2349,24 +2382,15 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       const auto input =
           (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
               .string();
-      clang::tooling::ClangTool tool(
-          database, {input}, std::make_shared<clang::PCHContainerOperations>(),
-          private_fs);
-      tool.mapVirtualFile(input, headers);
-      tool.setDiagnosticConsumer(&capture);
-      tool.appendArgumentsAdjuster(
-          clang::tooling::getClangStripOutputAdjuster());
-      tool.appendArgumentsAdjuster(
-          clang::tooling::getClangStripDependencyFileAdjuster());
-      std::vector<std::unique_ptr<clang::ASTUnit>> units;
-      if (tool.buildASTs(units) != 0 || units.size() != 1)
-        throw std::runtime_error("cannot parse optional headers: " +
-                                 capture.message());
-      output = std::move(units.front());
+      output = clang::tooling::buildASTFromCodeWithArgs(
+          headers, arguments, input, "clang-tracer",
+          std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripDependencyFileAdjuster(), {},
+          capture.get(), std::move(private_fs));
     } else {
       auto arguments = tracer::runtime::jit_arguments();
       arguments.insert(arguments.end(),
-                       {"-std=c++23", "-x", "c++",
+                       {"-std=c++20", "-x", "c++",
                         std::string("-resource-dir=") +
                             tracer::runtime::clang_resource_dir()});
       arguments.insert(arguments.end(), spec.compile_options().begin(),
@@ -2376,11 +2400,16 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       output = clang::tooling::buildASTFromCodeWithArgs(
           headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+          clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
     }
-    if (!output || capture.had_error())
+    auto *diagnostics = capture.get();
+    // AST import can report diagnostics after this function returns. Clang's
+    // tooling APIs borrow the consumer, so give the retained AST ownership.
+    if (output)
+      output->getDiagnostics().setClient(capture.release(), true);
+    if (!output || diagnostics->had_error())
       throw std::runtime_error("cannot create debug type AST: " +
-                               capture.message());
+                               diagnostics->message());
     auto &context = output->getASTContext();
     const auto &triple = context.getTargetInfo().getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -2524,19 +2553,20 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
   clang::tooling::ClangTool tool(
       database, {receiver.translation_unit()},
       std::make_shared<clang::PCHContainerOperations>(), private_fs);
-  DiagnosticCapture diagnostics(nullptr);
-  tool.setDiagnosticConsumer(&diagnostics);
+  auto diagnostics = std::make_unique<DiagnosticCapture>(nullptr);
+  tool.setDiagnosticConsumer(diagnostics.get());
   tool.appendArgumentsAdjuster(clang::tooling::getClangStripOutputAdjuster());
   std::vector<std::unique_ptr<clang::ASTUnit>> units;
-  if (tool.buildASTs(units) != 0 || diagnostics.had_error() ||
+  if (tool.buildASTs(units) != 0 || diagnostics->had_error() ||
       units.size() != 1) {
-    error = diagnostics.message();
+    error = diagnostics->message();
     if (error.empty()) {
       error = "cannot parse receiver translation unit with its frozen compiler "
               "context";
     }
     return false;
   }
+  units.front()->getDiagnostics().setClient(diagnostics.release(), true);
   auto &context = units.front()->getASTContext();
   const auto triple = context.getTargetInfo().getTriple();
   if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -3060,7 +3090,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
   }
   struct stat module_status{};
   if (::stat(module.dli_fname, &module_status) != 0 ||
-      !S_ISREG(module_status.st_mode) || module_status.st_ino == 0) {
+      !S_ISREG(module_status.st_mode)) {
     error = "pthread_create ELF module identity could not be verified";
     return false;
   }
@@ -3092,7 +3122,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     error = "pthread_create patch overlaps the target probe";
     return false;
   }
-  for (std::size_t i = 0; i < owner.retained; ++i) {
+  for (std::size_t i = 0; i < owner.probes.size(); ++i) {
     const auto *existing = owner.probes[i].get();
     if (!existing || !existing->active.load(std::memory_order_acquire))
       continue;
@@ -3154,7 +3184,20 @@ std::string make_wrapper(const tracer::Request &r,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
   const bool typed = spec && tracer::prepared::is_typed_version(
                                   spec->prepared().format_version());
-  const bool refresh_receiver = spec && spec->snapshot_receiver_at_return();
+  const bool override_arguments = spec && spec->allow_argument_overrides();
+  const bool override_result = spec && spec->allow_result_override();
+  const bool replace = spec && spec->allow_replacement();
+  const bool callable_original = spec && spec->allow_call_original();
+  const bool trace_exceptions = spec && spec->trace_exceptions();
+  const bool overrides = override_arguments || override_result || replace || callable_original;
+  // At constructor entry the receiver is raw storage (no vptr, no members): reading it through
+  // its class layout can fault. Sample it when the constructor returns instead.
+  const bool constructor_entry = spec && tracer::client::is_constructor_symbol(spec->symbol());
+  const bool refresh_receiver =
+      (spec && spec->snapshot_receiver_at_return()) ||
+      (constructor_entry && typed && r.kind == tracer::CallableKind::Method && !shared_mode &&
+       has_pre && has_post && snapshots && !snapshots->receiver.empty());
+  const bool observe_returns = tracer::agent_has_observers(r.session_id);
   if (refresh_receiver && (!typed || r.kind != tracer::CallableKind::Method ||
                            shared_mode || !has_pre || !has_post || !snapshots ||
                            snapshots->receiver.empty()))
@@ -3188,12 +3231,17 @@ std::string make_wrapper(const tracer::Request &r,
   };
   std::string code = (snapshots ? snapshots->declarations : std::string()) +
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
-      "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
+      "long,const tracer::TraceContext*,void*);\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
       "tracer_probe_leave(unsigned long long) noexcept;\nextern \"C\" "
       "unsigned long long tracer_next_call_id(unsigned long long) noexcept;\n";
+  if (observe_returns)
+    code += "extern \"C\" unsigned long long tracer_observer_clock() noexcept;\n"
+            "extern \"C\" void tracer_observer_return(unsigned long long,unsigned long long,"
+            "unsigned long long,unsigned long long) noexcept;\n";
+  code += "extern \"C\" bool tracer_object_identity_lookup(unsigned long long,unsigned long long,std::uint64_t*,std::uint64_t*,bool*) noexcept;\n";
   code +=
       "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) "
       "noexcept;\n"
@@ -3203,9 +3251,15 @@ std::string make_wrapper(const tracer::Request &r,
       "extern \"C\" void tracer_capture_stack(const "
       "tracer::TraceContext*,unsigned,bool) noexcept;\n";
   code += "extern \"C\" void tracer_context_check_entry();\n";
+
+  if (shared_mode || trace_exceptions || callable_original)
+    code += "#include <bits/cxxabi_forced.h>\n";
+  if (callable_original)
+    code += "#include <exception>\n#include <cerrno>\n"
+            "extern \"C\" unsigned tracer_swap_callback_depth(unsigned) noexcept;\n"
+            "extern \"C\" unsigned long long tracer_original_entry_time() noexcept;\n";
   if (shared_mode)
-    code += "#include <bits/cxxabi_forced.h>\n"
-            "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
+    code += "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
             "tracer::TraceContext*,unsigned);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
@@ -3218,7 +3272,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (result_sret)
     code += result_type() + "* (*) (" + result_type() + "*";
   else
-    code += result_type() + " (*) (";
+    code += result_type() + (overrides ? " (__attribute__((sysv_abi)) *) (" : " (*) (");
   bool comma = false;
   if (result_sret)
     comma = true;
@@ -3241,6 +3295,8 @@ std::string make_wrapper(const tracer::Request &r,
   // A patched entry can have callers that relaxed stack alignment for the
   // original callee. Realign before entering the wrapper and calling helpers.
   code += ");\nextern \"C\" __attribute__((force_align_arg_pointer)) ";
+  if (overrides)
+    code += "__attribute__((sysv_abi)) ";
   code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
                             "* result_slot"
                       : result_type() + " clangtracer_wrapper(";
@@ -3273,9 +3329,25 @@ std::string make_wrapper(const tracer::Request &r,
           std::to_string(r.probe_id) +
           "ULL); ctx.argument_count=" + std::to_string(r.argument_count) +
           "; ctx.phase=tracer::TracePhase::Pre;\n";
+  code += "tracer::TraceValue arguments[" + std::to_string(std::max(1u, r.argument_count)) +
+          "]{}; const char *argument_names[" + std::to_string(std::max(1u, r.argument_count)) +
+          "]{}; ctx.arguments=arguments; ctx.argument_names=argument_names;\n";
+  if (overrides) {
+    code += "std::uint64_t override_values[" + std::to_string(std::max(1u, r.argument_count)) +
+            "]{}; unsigned char override_set[" + std::to_string(std::max(1u, r.argument_count)) +
+            "]{}; tracer::ScalarOverrides overrides{}; overrides.arguments=override_values; "
+            "overrides.argument_set=override_set; ctx.scalar_overrides=&overrides;\n";
+    if (override_arguments)
+      code += "overrides.allow_arguments=true;\n";
+    if (override_result)
+      code += "overrides.allow_result=true;\n";
+    if (replace)
+      code += "overrides.allow_replacement=true; ctx.result.type=static_cast<tracer::ValueType>(" +
+              std::to_string(static_cast<unsigned>(r.result)) + ");\n";
+  }
   code += "ctx.target_entry=" + std::to_string(r.original_entry) +
-          "ULL; ctx.bridge_begin=reinterpret_cast<uintptr_t>(&&original_begin);"
-          "ctx.bridge_end=reinterpret_cast<uintptr_t>(&&original_end);"
+          "ULL; ctx.bridge_begin=__extension__ reinterpret_cast<uintptr_t>(&&original_begin);"
+          "ctx.bridge_end=__extension__ reinterpret_cast<uintptr_t>(&&original_end);"
           "ctx.stack_capture=&tracer_capture_stack;"
           "tracer_stack_enter(&ctx,__builtin_frame_address(0));"
           "struct StackGuard { tracer::TraceContext *ctx;"
@@ -3290,32 +3362,36 @@ std::string make_wrapper(const tracer::Request &r,
   if (r.kind == tracer::CallableKind::Method) {
     code += "ctx.object_address=reinterpret_cast<uintptr_t>(self);\n";
   }
+  const bool grouped = r.object_watch_id != 0;
+  const std::string admit = grouped ? "if(object_identity_active) " : "";
+  if (grouped) {
+    code += "ctx.object_watch_id=" + std::to_string(r.object_watch_id) +
+            "ULL; const bool object_identity_active=tracer_object_identity_lookup(" +
+            std::to_string(r.object_watch_id) +
+            "ULL,ctx.object_address,&ctx.object_id,&ctx.object_generation,&ctx.object_identity_verified);\n";
+  }
+  if (snapshots) {
+    if (grouped) {
+      code += snapshots->storage;
+    } else {
+      code += snapshots->scope + snapshots->argument_storage +
+              snapshots->receiver_storage;
+    }
+  }
   for (unsigned i = 0; i < r.argument_count; ++i) {
     fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
-  if (snapshots) code += snapshots->arguments + snapshots->receiver;
+  if (snapshots) {
+    if (grouped)
+      code += "if(object_identity_active){\n" + snapshots->arguments +
+              (constructor_entry ? std::string() : snapshots->receiver) + "}\n";
+    else
+      code += snapshots->arguments + (constructor_entry ? std::string() : snapshots->receiver);
+  }
   if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
-  if (shared_mode) {
-    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
-            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
-            "shared_guard;\n"
-            "shared_guard.token=tracer_shared_enter(" +
-            std::to_string(r.probe_id) + "ULL,&ctx," +
-            std::to_string(spec ? spec->stack_depth() : 0) +
-            "U);\ntry { tracer_shared_resume(shared_guard.token);\n";
-  } else if (class_mode)
-    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
-  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
-  if (has_pre) {
-    if (shared_mode)
-      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
-    else
-      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
-              "ULL,&ctx," + instance + ");\n";
-  }
-  code += "auto original=reinterpret_cast<Original>(" +
+  const auto original_declaration = "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
   std::string call = result_sret ? "original(result_slot" : "original(";
   comma = result_sret;
@@ -3335,16 +3411,102 @@ std::string make_wrapper(const tracer::Request &r,
     comma = true;
   }
   call += ")";
+  if (callable_original) {
+    code += original_declaration;
+    code += "ctx.result.type=static_cast<tracer::ValueType>(" +
+            std::to_string(static_cast<unsigned>(r.result)) + ");\n"
+            "bool original_called=false; uint64_t original_bits=0; "
+            "std::exception_ptr original_failure; "
+            "const int entry_errno=errno; int original_errno=entry_errno; "
+            "ctx.original_entry_time_ns=tracer_original_entry_time();\n"
+            "auto early_original = [&]() -> uint64_t { "
+            "if (!original_called) { original_called=true; "
+            "struct OriginalScope { unsigned depth; int error; "
+            "~OriginalScope() { tracer_swap_callback_depth(depth); errno=error; } }; "
+            "OriginalScope scope{tracer_swap_callback_depth(0), errno}; errno=entry_errno; "
+            "try { ";
+    if (r.result == tracer::ValueType::Void)
+      code += call + "; ";
+    else
+      code += "original_bits=tracer::ScalarOverrides::pack(" + call + "); ";
+    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } "
+            "catch (...) { original_failure=std::current_exception(); } "
+            "original_errno=errno; } "
+            "if (original_failure) std::rethrow_exception(original_failure); "
+            "return original_bits; };\n"
+            "ctx.original_state=&early_original; "
+            "ctx.invoke_original=+[](void* state) -> uint64_t { "
+            "return (*static_cast<decltype(early_original)*>(state))(); };\n"
+            "auto run_original = [&]() -> " + result_type() + " { "
+            "if (!original_called) return " + call + "; "
+            "errno=original_errno; if (original_failure) std::rethrow_exception(original_failure); ";
+    if (r.result != tracer::ValueType::Void)
+      code += "return tracer::ScalarOverrides::unpack<" + result_type() + ">(original_bits); ";
+    code += "};\n";
+    call = "run_original()";
+  }
+  if (shared_mode) {
+    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
+            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
+            "shared_guard;\n" + admit + "shared_guard.token=tracer_shared_enter(" +
+            std::to_string(r.probe_id) + "ULL,&ctx," +
+            std::to_string(spec ? spec->stack_depth() : 0) + "U);\ntry { " +
+            (grouped ? "if(shared_guard.token) " : "") +
+            "tracer_shared_resume(shared_guard.token);\n";
+  } else if (class_mode) {
+    if (grouped)
+      code += "std::optional<tracer_invocation_instance> tracer_invocation;"
+              "if(object_identity_active) tracer_invocation.emplace(ctx);\n";
+    else
+      code += "tracer_invocation_instance tracer_invocation(ctx);\n";
+  }
+  const std::string instance =
+      class_mode ? (grouped
+                        ? "(tracer_invocation ? &*tracer_invocation : nullptr)"
+                        : "&tracer_invocation")
+                 : "nullptr";
+  if (has_pre) {
+    if (shared_mode)
+      code += admit + "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+    else
+      code += admit + "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
+              "ULL,&ctx," + instance + ");\n";
+  }
+  if (callable_original)
+    code += "ctx.invoke_original=nullptr; ctx.original_state=nullptr;\n";
+  if (override_arguments) {
+    for (unsigned i = 0; i < r.argument_count; ++i) {
+      const auto index = std::to_string(i);
+      const auto argument = "a" + index;
+      code += "if (overrides.argument_set[" + index + "]) { " + argument +
+              "=tracer::ScalarOverrides::unpack<decltype(" + argument + ")>(overrides.arguments[" +
+              index + "]);\n";
+      fill_value(code, i, r.arguments[i], false);
+      code += "}\n";
+    }
+  }
+  if (!callable_original)
+    code += original_declaration;
+  if (trace_exceptions) {
+    code += "auto report_original = [&]() -> decltype(auto) { try { return " + call +
+            "; } catch (const __cxxabiv1::__forced_unwind&) { throw; } catch (...) { "
+            "ctx.phase=tracer::TracePhase::Exception; tracer_event_dispatch(" +
+            std::to_string(r.probe_id) + "ULL,&ctx,0); throw; } };\n";
+    call = "report_original()";
+  }
   if (shared_mode && r.result != tracer::ValueType::Void)
     if (r.result != tracer::ValueType::Object)
       code += result_type() + " result;\n";
+  if (observe_returns)
+    code += "const auto observer_start=tracer_observer_clock();\n";
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "{ tracer_shared_original_enter(shared_guard.token); struct "
             "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
             "tracer_shared_original_leave(token); } } "
             "original_guard{shared_guard.token};\n";
   if (r.result == tracer::ValueType::Void) {
-    code += "original_begin: " + call +
+    code += std::string("original_begin: ") +
+            (replace ? "if (!overrides.replacement_set) " : "") + call +
             ";\noriginal_end: ctx.result.type=tracer::ValueType::Void;\n";
   } else if (result_sret) {
     if (shared_mode)
@@ -3371,7 +3533,9 @@ std::string make_wrapper(const tracer::Request &r,
     } else {
       code += (shared_mode ? std::string()
                            : result_type() + " result; ") +
-              "original_begin: result=" + call + ";\noriginal_end: ;\n";
+              "original_begin: result=" +
+              (replace ? "overrides.replacement_set ? tracer::ScalarOverrides::unpack<decltype(result)>"
+                         "(overrides.replacement) : " : "") + call + ";\noriginal_end: ;\n";
     }
     code += "ctx.result.type=static_cast<tracer::ValueType>(" +
             std::to_string(static_cast<unsigned>(r.result)) + ");\n";
@@ -3404,30 +3568,58 @@ std::string make_wrapper(const tracer::Request &r,
   }
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
+  if (observe_returns)
+    code += "const auto observer_end=observer_start?tracer_observer_clock():0;\n";
   if (has_post) {
-    if (refresh_receiver)
-      code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
-              "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" + snapshots->receiver;
-    if (snapshots) code += "ctx.phase=tracer::TracePhase::Post;\n" + snapshots->result;
+    if (refresh_receiver) {
+      if (grouped)
+        code += "if(object_identity_active){ auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
+                "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" +
+                snapshots->receiver_storage + snapshots->receiver;
+      else
+        code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
+                "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" +
+                snapshots->receiver_storage + snapshots->receiver;
+    }
+    if (snapshots) {
+      if (grouped)
+        code += "if(object_identity_active){ ctx.phase=tracer::TracePhase::Post;\n" +
+                snapshots->result + "}\n";
+      else
+        code += "ctx.phase=tracer::TracePhase::Post;\n" +
+                snapshots->result_storage + snapshots->result;
+    }
     if (shared_mode)
-      code += "ctx.phase=tracer::TracePhase::Post; "
+      code += "ctx.phase=tracer::TracePhase::Post; " + admit +
               "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
     else
-      code += "ctx.phase=tracer::TracePhase::Post; "
+      code += "ctx.phase=tracer::TracePhase::Post; " + admit +
               "(void)tracer_callback_dispatch(" +
               std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
-    if (refresh_receiver)
-      code += "} ctx.receiver_snapshot=entry_receiver_snapshot;\n";
+    if (refresh_receiver) {
+      if (grouped)
+        code += "} ctx.receiver_snapshot=entry_receiver_snapshot; }\n";
+      else
+        code += "} ctx.receiver_snapshot=entry_receiver_snapshot;\n";
+    }
   }
+  if (override_result)
+    code += "if (overrides.result_set) result="
+            "tracer::ScalarOverrides::unpack<decltype(result)>(overrides.result);\n";
   if (shared_mode)
     code += "tracer_shared_leave(shared_guard.token); "
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr;\n";
+  if (observe_returns)
+    code += "if(observer_end)tracer_observer_return(ctx.probe_id,ctx.call_id,"
+            "observer_start,observer_end);\n";
   if (result_sret) {
     if (class_mode)
-      code += "tracer_invocation.destroy();\n";
-    if (snapshots && !snapshots->arguments.empty())
+      code += grouped
+                  ? "if(tracer_invocation) tracer_invocation->destroy();\n"
+                  : "tracer_invocation.destroy();\n";
+    if (snapshots && !snapshots->scope.empty())
       code += "snapshot_scope.release();\n";
     code += "tracer_stack_leave(&ctx); stack_guard.ctx=nullptr; "
             "tracer_probe_leave(" + std::to_string(r.probe_id) +
@@ -3437,12 +3629,14 @@ std::string make_wrapper(const tracer::Request &r,
   } else {
     code += "return result;\n";
   }
-  if (shared_mode)
-    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } catch "
+  if (shared_mode) {
+    code += "}\n#if defined(__GLIBCXX__)\ncatch (const "
+            "__cxxabiv1::__forced_unwind&) { throw; }\n#endif\ncatch "
             "(...) { tracer_shared_leave(shared_guard.token); "
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr; throw; }\n";
+  }
   code += "}";
   return code;
 }
@@ -3882,6 +4076,8 @@ struct ReceiverCallbackShape {
   std::vector<std::pair<unsigned, std::string>> inferred_fields;
   std::vector<std::string> argument_names;
   tracer::ValueSnapshotCode snapshots;
+  // The same capture without followed members, for when that code does not compile.
+  tracer::ValueSnapshotCode snapshots_plain;
 };
 
 std::string make_class_bridge(const CallbackShape &shape);
@@ -3916,6 +4112,8 @@ public:
     result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
     if (!validate_snapshot_encoder(shape, result_.snapshots, result_.error))
       return;
+    if (result_.snapshots.has_followed_members)
+      result_.snapshots_plain = tracer::make_value_snapshot_code(context, spec_, false);
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -4079,6 +4277,29 @@ public:
   std::unordered_set<const clang::Decl *> declarations;
 };
 
+clang::CXXRecordDecl *find_callback_record(clang::ASTContext &context,
+                                           llvm::StringRef name) {
+  class Finder final : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    Finder(clang::ASTContext &context, llvm::StringRef name)
+        : context_(context), name_(name) {}
+    bool shouldVisitTemplateInstantiations() const { return true; }
+    bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
+      if (record->isCompleteDefinition() && !record->isDependentType() &&
+          debug_record_identity_matches(context_, record, name_))
+        found = record;
+      return true;
+    }
+    clang::CXXRecordDecl *found = nullptr;
+
+  private:
+    clang::ASTContext &context_;
+    llvm::StringRef name_;
+  } finder(context, name);
+  finder.TraverseDecl(context.getTranslationUnitDecl());
+  return finder.found;
+}
+
 class ReceiverImportAction final : public clang::ASTFrontendAction {
 public:
   ReceiverImportAction(clang::ASTContext &donor_context,
@@ -4089,11 +4310,13 @@ public:
                        clang::CXXRecordDecl *target_record,
                        std::string *validation_error,
                        const DebugRecords *records = nullptr,
-                       const clangtracer::v1::ProbeSpec *spec = nullptr)
+                       const clangtracer::v1::ProbeSpec *spec = nullptr,
+                       bool header_types = false)
       : records_(records), donor_context_(donor_context),
         donor_files_(donor_files), donor_record_(donor_record), shape_(shape),
         receiver_context_(receiver_context), target_record_(target_record),
-        validation_error_(validation_error), spec_(spec) {}
+        validation_error_(validation_error), spec_(spec),
+        header_types_(header_types) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance &compiler) override {
     if (!clang::ASTFrontendAction::BeginSourceFileAction(compiler)) {
@@ -4123,6 +4346,10 @@ public:
     clang::CXXRecordDecl *selected_imported_record = nullptr;
     if (records_)
       for (const auto &entry : *records_) {
+        // Real header definitions are parsed below. Import only synthesized
+        // DWARF records here, otherwise the later #include redefines them.
+        if (header_types_ && entry.decl->getLocation().isValid())
+          continue;
         if (auto err = importer.ImportDefinition(entry.decl)) {
           *validation_error_ = llvm::toString(std::move(err));
           return;
@@ -4139,7 +4366,8 @@ public:
           return;
         imported_targets.push_back(target);
       }
-    if (donor_record_) {
+    if (donor_record_ &&
+        !(header_types_ && donor_record_->getLocation().isValid())) {
       if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
         *validation_error_ = llvm::toString(std::move(import_error));
         return;
@@ -4173,15 +4401,51 @@ public:
         return;
       }
     }
+    clang::ParseAST(compiler.getSema());
+    if (diagnostic_capture_ && diagnostic_capture_->had_error()) {
+      *validation_error_ = diagnostic_capture_->message();
+      if (header_types_)
+        return;
+    }
+    if (header_types_ && records_)
+      for (const auto &entry : *records_) {
+        if (entry.decl->getLocation().isInvalid())
+          continue;
+        auto &context = compiler.getASTContext();
+        auto *record =
+            find_callback_record(context, entry.layout.record_name());
+        if (!record) {
+          *validation_error_ = "callback header record is unavailable: " +
+                               entry.layout.record_name();
+          return;
+        }
+        if (entry.opaque) {
+          const auto &layout = context.getASTRecordLayout(record);
+          if ((entry.layout.size() &&
+               static_cast<std::uint64_t>(layout.getSize().getQuantity()) !=
+                   entry.layout.size()) ||
+              (entry.layout.alignment() &&
+               static_cast<std::uint64_t>(
+                   layout.getAlignment().getQuantity()) !=
+                   entry.layout.alignment())) {
+            *validation_error_ =
+                "callback header record size or alignment changed";
+            return;
+          }
+        } else if (!validate_receiver_layout(context, record, entry.layout,
+                                             *validation_error_)) {
+          return;
+        }
+        imported_targets.push_back(record);
+        if (donor_record_ &&
+            entry.decl->getCanonicalDecl() == donor_record_->getCanonicalDecl())
+          selected_imported_record = record;
+      }
     if (target_record_ && donor_record_ && selected_imported_record) {
       // Skip imported receiver method bodies while checking callback and
       // included helper code for ODR uses of the selected target.
       visitor_ = std::make_unique<ForbiddenReceiverUseVisitor>(
           selected_imported_record, importer.declarations, imported_targets);
-    }
-    clang::ParseAST(compiler.getSema());
-    if (diagnostic_capture_ && diagnostic_capture_->had_error()) {
-      *validation_error_ = diagnostic_capture_->message();
     }
     if (validation_error_->empty() && !shape_.error.empty()) {
       *validation_error_ = shape_.error;
@@ -4357,6 +4621,7 @@ private:
   clang::CXXRecordDecl *target_record_;
   std::string *validation_error_;
   const clangtracer::v1::ProbeSpec *spec_;
+  bool header_types_;
   std::unique_ptr<ForbiddenReceiverUseVisitor> visitor_;
   std::unique_ptr<DiagnosticCaptureScope> diagnostic_capture_;
 };
@@ -4557,7 +4822,8 @@ split_callback_includes(const std::string &source) {
 }
 
 bool extract_forced_includes(std::vector<std::string> &arguments,
-                             std::string &source, std::string &error) {
+                             std::string &source, std::string &error,
+                             const std::filesystem::path &directory = {}) {
   std::vector<std::string> filtered;
   filtered.reserve(arguments.size());
   for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -4572,7 +4838,15 @@ bool extract_forced_includes(std::vector<std::string> &arguments,
         error = "-include requires a header path";
         return false;
       }
-      const auto &path = arguments[i];
+      auto path = arguments[i];
+      // Compilers search from the compile command's directory for -include.
+      // The JIT does not change the target process's working directory.
+      if (!directory.empty() && std::filesystem::path(path).is_relative()) {
+        const auto candidate = directory / path;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec))
+          path = candidate.string();
+      }
       if (path.empty() || path.find_first_of("\"\r\n") != std::string::npos ||
           path.find('\0') != std::string::npos) {
         error = "-include has an invalid header path";
@@ -4601,6 +4875,33 @@ bool extract_forced_includes(std::vector<std::string> &arguments,
   }
   arguments.swap(filtered);
   return true;
+}
+
+void resolve_callback_option_paths(std::vector<std::string> &arguments,
+                                   const std::filesystem::path &directory) {
+  // Called after preflight validation: -iprefix, -iwithprefix and -isysroot
+  // are rejected there. Keep this aligned with the accepted path options.
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
+    for (const llvm::StringRef option : {"-isystem-after", "-isystem", "-iquote",
+                                        "-idirafter", "--gcc-toolchain=", "--sysroot=",
+                                        "--gcc-toolchain", "--sysroot", "-I"}) {
+      auto value = llvm::StringRef(arguments[i]);
+      if (!value.consume_front(option))
+        continue;
+      auto *argument = &arguments[i];
+      if (value.empty()) {
+        if (i + 1 == arguments.size())
+          break;
+        argument = &arguments[++i];
+        value = *argument;
+      }
+      if (!value.empty() && !::tracer::compat::starts_with(value, "=") && !::tracer::compat::starts_with(value, "$SYSROOT") &&
+          !::tracer::compat::starts_with(value, "-") && std::filesystem::path(value.str()).is_relative())
+        argument->replace(argument->size() - value.size(), value.size(),
+                          (directory / value.str()).string());
+      break;
+    }
+  }
 }
 
 bool parse_and_materialize(Probe &probe, clang::Interpreter &interpreter,
@@ -4749,7 +5050,8 @@ bool compile_shared_probe(Probe &p,
                           std::string &error, bool run_initializers,
                           clangtracer::v1::ValidationReport *report,
                           bool result_sret, bool syntax_only,
-                          const tracer::ValueSnapshotCode &snapshots) {
+                          const tracer::ValueSnapshotCode &snapshots,
+                          const tracer::ValueSnapshotCode *plain_snapshots = nullptr) {
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
@@ -4785,6 +5087,52 @@ bool compile_shared_probe(Probe &p,
       callback_includes + requested_header_source +
       (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
       receiver_alias + argument_aliases(specification);
+  // Followed members must never turn a probe that worked into one that does not
+  // compile: when the wrapper fails to compile with them, it is built without.
+  const bool can_fall_back = snapshots.has_followed_members && plain_snapshots;
+  const auto fall_back_note = [&] {
+    if (!report)
+      return;
+    auto *note = report->add_diagnostics();
+    note->set_stage("snapshot");
+    note->set_severity("note");
+    note->set_message("followed pointer and reference members were disabled because the "
+                      "generated capture code did not compile");
+  };
+  const auto plain_wrapper = [&] {
+    return wrapper_prelude + wrapper_types +
+           make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline), true, true,
+                        &specification, false, true, result_sret,
+                        plain_snapshots->arguments.empty() ? nullptr : plain_snapshots);
+  };
+  const auto syntax_ok = [&](const std::string &source, DiagnosticCapture &capture) {
+    auto syntax_arguments = arguments;
+    syntax_arguments.push_back("-fsyntax-only");
+    auto ast = clang::tooling::buildASTFromCodeWithArgs(
+        source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
+        "clang-tracer-shared-wrapper.cc",
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    return ast && !capture.had_error();
+  };
+  // A failed parse leaves partial declarations in the interpreter, so a retry
+  // there fails on conflicts. Installing therefore checks the wrapper on a
+  // throwaway AST first; only probes that follow members pay for it.
+  bool use_plain = false;
+  if (can_fall_back && !syntax_only) {
+    DiagnosticCapture capture(nullptr);
+    if (!syntax_ok(wrapper_prelude + wrapper_types +
+                       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+                                    true, true, &specification, false, true, result_sret,
+                                    wrapper_snapshots),
+                   capture)) {
+      use_plain = true;
+      fall_back_note();
+    }
+  }
+  const auto *effective_snapshots =
+      use_plain ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
+                : wrapper_snapshots;
   activation.compiler_arguments = arguments;
   activation.callback_log = &tracer::detail::tracer_enqueue_log;
   if (!specification.callback_package_path().empty())
@@ -4803,20 +5151,21 @@ bool compile_shared_probe(Probe &p,
     const auto generated_wrapper =
         make_wrapper(p.request,
                      reinterpret_cast<std::uintptr_t>(p.trampoline), true,
-                     true, &specification, false, true, result_sret, wrapper_snapshots);
+                     true, &specification, false, true, result_sret, effective_snapshots);
     const auto complete_source = wrapper_prelude + wrapper_types + generated_wrapper;
     if (syntax_only) {
-      auto syntax_arguments = arguments;
-      syntax_arguments.push_back("-fsyntax-only");
       DiagnosticCapture capture(nullptr);
-      auto ast = clang::tooling::buildASTFromCodeWithArgs(
-          complete_source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
-          "clang-tracer-shared-wrapper.cc",
-          "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+      const bool ok = syntax_ok(complete_source, capture);
+      if (!ok && can_fall_back) {
+        DiagnosticCapture retry(nullptr);
+        if (syntax_ok(plain_wrapper(), retry)) {
+          fall_back_note();
+          return true;
+        }
+      }
       if (report)
         append_diagnostics(*report, capture, "syntax");
-      if (!ast || capture.had_error()) {
+      if (!ok) {
         error = capture.message().empty()
                     ? "shared callback wrapper failed syntax validation"
                     : capture.message();
@@ -4836,9 +5185,12 @@ bool compile_shared_probe(Probe &p,
     return true;
   }
   auto *owner = agent.load(std::memory_order_acquire);
-  if (!owner ||
-      owner->next_context_hook >= tracer::context_engine::kCaptureHooks) {
-    error = "shared-context generation capacity exceeded";
+  if (!owner) {
+    error = "shared-context agent is unavailable";
+    return false;
+  }
+  if (owner->next_context_hook == std::numeric_limits<std::uint64_t>::max()) {
+    error = "shared-context hook identity space exhausted";
     return false;
   }
   if (std::all_of(activation.source_lineage_id.begin(),
@@ -4898,7 +5250,7 @@ bool compile_shared_probe(Probe &p,
   p.request.context_required = true;
   const auto generated_wrapper =
       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                   true, true, &specification, false, true, result_sret, wrapper_snapshots);
+                   true, true, &specification, false, true, result_sret, effective_snapshots);
   if (!parse_and_materialize(p, *p.interpreter,
                              wrapper_prelude + wrapper_types + generated_wrapper, error)) {
     return false;
@@ -4942,6 +5294,15 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
         llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
   };
   bind("tracer_callback_dispatch", &tracer_callback_dispatch);
+  bind("tracer_swap_callback_depth", +[](unsigned depth) noexcept {
+    return std::exchange(callback_depth, depth);
+  });
+  bind("tracer_original_entry_time", +[]() noexcept -> unsigned long long {
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+      return 0;
+    return static_cast<unsigned long long>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+  });
   bind("tracer_context_check_entry", &tracer_context_check_entry);
   bind("tracer_shared_enter", &tracer_shared_enter);
   bind("tracer_shared_leave", &tracer_shared_leave);
@@ -4958,6 +5319,9 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_event_dispatch", &tracer_event_dispatch);
   bind("tracer_probe_enter", &tracer_probe_enter);
   bind("tracer_probe_leave", &tracer_probe_leave);
+  bind("tracer_observer_clock", &tracer_observer_clock);
+  bind("tracer_observer_return", &tracer_observer_return);
+  bind("tracer_object_identity_lookup", &tracer_object_identity_lookup);
   bind("tracer_next_call_id", &tracer_next_call_id);
   bind("tracer_stack_enter", &tracer_stack_enter);
   bind("tracer_stack_leave", &tracer_stack_leave);
@@ -4967,13 +5331,23 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_snapshot_read_rtti_provider", &tracer_snapshot_read_rtti_provider);
   bind("tracer_snapshot_readable", &tracer_snapshot_readable);
   bind("tracer_snapshot_rtti_matches", &tracer_snapshot_rtti_matches);
+  bind("tracer_snapshot_readable", &tracer_snapshot_readable);
+  bind("tracer_snapshot_configure", &tracer_snapshot_configure);
+  bind("tracer_snapshot_read_cstring", &tracer_snapshot_read_cstring);
+  bind("tracer_snapshot_copy_bytes", &tracer_snapshot_copy_bytes);
+  bind("tracer_snapshot_is_scratch", &tracer_snapshot_is_scratch);
+  bind("tracer_snapshot_storage_limited", &tracer_snapshot_storage_limited);
   bind("tracer_snapshot_reset", &tracer_snapshot_reset);
   bind("tracer_snapshot_storage", &tracer_snapshot_storage);
   bind("tracer_snapshot_commit", &tracer_snapshot_commit);
   bind("tracer_capture_entry_stack", &tracer_capture_entry_stack);
   auto bind_debug_methods = [&](const clangtracer::v1::DebugInfo &info) {
     for (const auto &method : info.methods()) {
-      if (method.is_virtual() || method.is_variadic() ||
+      // A virtual member of the receiver class is not bound as a direct symbol (a call to it
+      // dispatches through the vtable), so it must not block probes on the class's other entries.
+      if (method.is_virtual())
+        continue;
+      if (method.is_variadic() ||
           method.calling_convention() != llvm::dwarf::DW_CC_normal) {
         error = "debug method uses an unsupported virtual, variadic, or "
                 "nondefault calling convention: " + method.name();
@@ -5087,7 +5461,13 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                    const VerifiedDebugEntry *verified_entry = nullptr) {
   const bool typed_prepared = tracer::prepared::is_typed_version(
       target_specification.prepared().format_version());
-  const bool prepared_callback_context = typed_prepared && target_specification.has_header_context();
+  const bool has_header_context = target_specification.has_header_context();
+  const bool prepared_callback_context = typed_prepared && has_header_context;
+  if (const auto *invalid = tracer::scalar_override_error(target_specification)) {
+    error = invalid;
+    return false;
+  }
+  const bool overrides = tracer::has_scalar_overrides(target_specification);
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -5165,9 +5545,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   const auto [callback_includes, callback_body] =
       split_callback_includes(source);
   std::vector<std::string> user_options;
-  if (prepared_callback_context) {
+  if (has_header_context) {
     const auto &options = target_specification.header_context().compiler_arguments();
     user_options.assign(options.begin(), options.end());
+  }
+  if (prepared_callback_context) {
     const auto &explicit_options = target_specification.compile_options();
     for (auto it = explicit_options.begin(); it != explicit_options.end(); ++it) {
       const std::string_view option(*it);
@@ -5181,11 +5563,22 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       }
     }
   }
-  user_options.insert(user_options.end(), target_specification.compile_options().begin(),
-                      target_specification.compile_options().end());
+  // resolve_header_context() appends compile_options verbatim as the suffix
+  // of a legacy context's compiler_arguments. Check that suffix before adding
+  // them again; prepared contexts use a different builder and need the append.
+  // Keep this check before path normalization, which can change those strings.
+  const auto &explicit_options = target_specification.compile_options();
+  if (typed_prepared || user_options.size() < static_cast<std::size_t>(explicit_options.size()) ||
+      !std::equal(explicit_options.rbegin(), explicit_options.rend(), user_options.rbegin()))
+    user_options.insert(user_options.end(), explicit_options.begin(), explicit_options.end());
+  std::filesystem::path callback_directory;
+  if (!typed_prepared && has_header_context) {
+    callback_directory = target_specification.header_context().working_directory();
+    resolve_callback_option_paths(user_options, callback_directory);
+  }
   user_options.insert(user_options.end(), extra.begin(), extra.end());
   std::string forced_include_source;
-  if (!extract_forced_includes(user_options, forced_include_source, error))
+  if (!extract_forced_includes(user_options, forced_include_source, error, callback_directory))
     return false;
   const std::string type_header_prefix =
       forced_include_source + callback_includes;
@@ -5246,24 +5639,34 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return false;
     }
   }
-  if (!typed_prepared && !validate_object_abi_evidence(specification, callback_includes,
-                                    forced_include_source, error))
-    return false;
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
   clang::CXXRecordDecl *receiver_record = nullptr;
-  if (!typed_prepared &&
+  // Header-backed callbacks need the real declaration for their receiver
+  // alias. Headerless callbacks can reject syntax before recovering types.
+  const bool callback_header_types = !typed_prepared &&
+                                     specification.has_debug_info() &&
+                                     callback_headers_available;
+  if (callback_header_types &&
       !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
                                        receiver_record, error,
-                                       p.debug_records, type_header_prefix,
+                                       p.debug_records,
+                                       has_header_context ? callback_includes : type_header_prefix,
                                        verified_entry)) {
     return false;
   }
-  bool result_sret = false;
-  if (!typed_prepared &&
-      !determine_object_result_sret(specification, p.debug_records,
-                                    result_sret, error))
-    return false;
+  // Header-backed records must be compiled from those headers in every
+  // callback TU. Only records synthesized from DWARF need AST import.
+  const bool callback_header_receiver =
+      callback_header_types && receiver_record &&
+      receiver_record->getLocation().isValid();
+  const std::string header_receiver_alias =
+      callback_header_receiver
+          ? "namespace tracer { using ResolvedTarget = const " +
+                std::string(specification.receiver().is_volatile() ? "volatile "
+                                                                   : "") +
+                "::" + specification.receiver().record_name() + "; }\n"
+          : std::string();
   if (!initialize_llvm(error)) {
     return false;
   }
@@ -5281,7 +5684,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
   compiler_arguments.insert(
       compiler_arguments.end(),
-      {"-std=c++23", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+      {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
   // The generated wrapper uses C++ exceptions, which CL mode disables by default.
   if (tracer::clang_cl_driver(compiler_arguments))
     compiler_arguments.push_back("-fcxx-exceptions");
@@ -5357,7 +5760,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
   std::optional<tracer::callback_pch::Artifact> interpreter_pch;
   std::optional<tracer::callback_pch::Artifact> syntax_pch;
-  // The C++ frontend extracts user -include options into source text. Keep the PCH out of
+  // C++17 extracts user -include options into source text. Keep the PCH out of
   // both frontends in that case so macro and include order stay unchanged.
   if (forced_include_source.empty()) {
     interpreter_pch = tracer::callback_pch::prepare(
@@ -5385,7 +5788,18 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
               "creation";
       return false;
     }
-    auto created = clang::Interpreter::create(std::move(*compiler));
+    const auto create_interpreter = [](std::unique_ptr<clang::CompilerInstance> ci) {
+      // Clang parses its own runtime here (including a signed/unsigned loop).
+      // A donor's -Werror must apply to callbacks, not this generated runtime.
+      const bool ignore_warnings = ci->getDiagnostics().getIgnoreAllWarnings();
+      ci->getDiagnostics().setIgnoreAllWarnings(true);
+      auto result = clang::Interpreter::create(std::move(ci));
+      if (result)
+        (*result)->getCompilerInstance()->getDiagnostics().setIgnoreAllWarnings(
+            ignore_warnings);
+      return result;
+    };
+    auto created = create_interpreter(std::move(*compiler));
     if (!created && interpreter_pch) {
       llvm::consumeError(created.takeError());
       tracer::callback_pch::disable(*interpreter_pch);
@@ -5397,7 +5811,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         error = llvm::toString(fallback_compiler.takeError());
         return false;
       }
-      created = clang::Interpreter::create(std::move(*fallback_compiler));
+      created = create_interpreter(std::move(*fallback_compiler));
     }
     if (!created) {
       error = llvm::toString(created.takeError());
@@ -5407,9 +5821,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
   if (!capture_orc_errors(p, error))
     return false;
-  if (!bind_probe_symbols(*p.interpreter, specification, error)) {
-    return false;
-  }
   const std::string prelude =
       std::string(tracer::kEmbeddedProtocolHeader) +
       "\nusing int32_t=std::int32_t; using int64_t=std::int64_t; "
@@ -5497,6 +5908,34 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // Receiver/field inference can repair semantic errors in this plain parse,
+  // but cannot repair malformed C++. Keep its diagnostics ahead of ABI checks
+  // and AST import, which can otherwise mask the callback's syntax failure.
+  if (user_capture.had_syntax_error()) {
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+    return false;
+  }
+  if (!typed_prepared &&
+      !validate_object_abi_evidence(specification, callback_includes,
+                                    forced_include_source, error))
+    return false;
+  if (!typed_prepared && !callback_header_types &&
+      !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
+                                      receiver_record, error, p.debug_records,
+                                      has_header_context ? callback_includes
+                                                         : type_header_prefix,
+                                      verified_entry)) {
+    return false;
+  }
+  bool result_sret = false;
+  if (!typed_prepared &&
+      !determine_object_result_sret(specification, p.debug_records,
+                                   result_sret, error))
+    return false;
+  if (!bind_probe_symbols(*p.interpreter, specification, error))
+    return false;
   // A callback that failed to parse explains the later generic rejections.
   const auto prefer_parse_errors = [&] {
     if (!user_capture.had_error())
@@ -5532,6 +5971,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         error = "tracer_snapshot::encode requires an invocation-scoped callback";
         return false;
       }
+      if (overrides) {
+        error = "scalar overrides require an invocation-scoped Interceptor";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -5548,13 +5991,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         signature_assert = specialized_signature_assert(
             user_ast->getASTContext(), shape);
       }
+      const auto plain_snapshots =
+          tracer::make_value_snapshot_code(user_ast->getASTContext(), specification, false);
       return compile_shared_probe(
           p, specification, compiler_arguments,
           forced_include_source + prelude + context_prelude +
               tracer::kEmbeddedCallbackHeader,
           forced_include_source, receiver_alias,
           signature_assert, error, run_initializers, report, result_sret,
-          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification));
+          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification),
+          &plain_snapshots);
     }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
@@ -5567,8 +6013,21 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
 
   bool baseline_preflight_succeeded = false;
+  bool followed_members_disabled = false;
   DiagnosticCapture complete_capture(nullptr);
-  if (shape_valid) {
+  // Clang can recover a legacy function declaration even when its body has
+  // errors. Re-parsing that body with the wrapper only repeats its diagnostics.
+  // Class callbacks still need the wrapper/receiver-inference recovery path.
+  if (shape_valid && (shape.class_mode || !user_capture.had_error())) {
+    if (overrides &&
+        (!shape.class_mode ||
+         ((specification.allow_argument_overrides() || specification.allow_replacement() ||
+           specification.allow_call_original()) &&
+          !shape.has_pre) ||
+         (specification.allow_result_override() && !shape.has_post))) {
+      error = "scalar control requires an Interceptor with pre() for arguments, replacement or calling the original and post() for result overrides";
+      return false;
+    }
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
                                         specification, error))
       return false;
@@ -5576,18 +6035,45 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     if (!validate_snapshot_encoder(shape, snapshots, error))
       return false;
     bridge = make_invocation_bridge(shape);
-    const std::string generated = make_wrapper(
-        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode,
-        false, result_sret, &snapshots);
-    complete_source = user_source + "\n" +
-                      specialized_signature_assert(user_ast->getASTContext(),
-                                                   shape) +
-                      bridge + "\n" + generated;
-    auto complete_ast = build_callback_ast(
-        complete_source, "clang-tracer-callback.cc", complete_capture);
-    baseline_preflight_succeeded =
-        complete_ast && !complete_capture.had_error();
+    const auto build_complete = [&](const tracer::ValueSnapshotCode &code,
+                                    DiagnosticCapture &capture) {
+      const std::string generated = make_wrapper(
+          p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+          shape.has_pre, shape.has_post, &specification, shape.class_mode,
+          false, result_sret, &code);
+      complete_source = user_source + "\n" +
+                        specialized_signature_assert(user_ast->getASTContext(),
+                                                     shape) +
+                        bridge + "\n" + generated;
+      auto ast = build_callback_ast(complete_source, "clang-tracer-callback.cc", capture);
+      return ast && !capture.had_error();
+    };
+    baseline_preflight_succeeded = build_complete(snapshots, complete_capture);
+    if (!baseline_preflight_succeeded && snapshots.has_followed_members) {
+      // Followed pointer and reference members must never turn a probe that
+      // worked into one that does not compile: capture without them instead.
+      const auto fallback = tracer::make_value_snapshot_code(
+          user_ast->getASTContext(), specification, false);
+      DiagnosticCapture retry_capture(nullptr);
+      std::string ignored;
+      if (validate_snapshot_encoder(shape, fallback, ignored) &&
+          build_complete(fallback, retry_capture)) {
+        if (report) {
+          // The failed attempt's errors are kept as notes: the probe was built.
+          const int first = report->diagnostics_size();
+          append_diagnostics(*report, complete_capture, "snapshot");
+          for (int i = first; i < report->diagnostics_size(); ++i)
+            report->mutable_diagnostics(i)->set_severity("note");
+          auto *note = report->add_diagnostics();
+          note->set_stage("snapshot");
+          note->set_severity("note");
+          note->set_message("followed pointer and reference members were disabled because the "
+                            "generated capture code did not compile");
+        }
+        followed_members_disabled = true;
+        baseline_preflight_succeeded = true;
+      }
+    }
     if (!baseline_preflight_succeeded) {
       baseline_error = complete_capture.message();
       if (baseline_error.empty()) {
@@ -5596,12 +6082,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
   }
 
-  if (baseline_preflight_succeeded && report) {
+  if (baseline_preflight_succeeded && report && !followed_members_disabled) {
     append_diagnostics(*report, complete_capture, "wrapper");
   }
 
   if (!baseline_preflight_succeeded) {
-    if (!p.receiver_ast) {
+    // Legacy callbacks do not need receiver-field inference. Re-importing a
+    // header AST after a syntax error duplicates standard-library declarations
+    // and can crash Clang instead of returning the original diagnostic.
+    if (!p.receiver_ast || (has_header_context && !shape.class_mode)) {
       if (report) {
         append_diagnostics(*report, user_capture, "syntax");
         append_diagnostics(*report, complete_capture, "wrapper");
@@ -5627,8 +6116,12 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       // again creates duplicate specializations and builtin declarations.
       if (standard_library_record_name(entry.layout.record_name()))
         continue;
+      if (callback_header_types && entry.decl->getLocation().isValid())
+        continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
+        if (has_header_context)
+          prefer_parse_errors();
         return false;
       }
       auto imported = importer.Import(entry.decl);
@@ -5643,7 +6136,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
               error))
         return false;
     }
-    if (receiver_record) {
+    if (receiver_record && !callback_header_receiver) {
       if (llvm::Error import_error = importer.ImportDefinition(receiver_record)) {
         error = "cannot import selected receiver declaration: " +
                 llvm::toString(std::move(import_error));
@@ -5672,12 +6165,12 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
 
     std::string typed_user_source =
-        prelude + context_prelude +
+        forced_include_source + prelude + context_prelude +
         (receiver_record && p.request.kind == tracer::CallableKind::Method
              ? "#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
              : "") +
         "#define CLANG_TRACER_FIELD_INFERENCE 1\n" +
-        callback_header_source +
+        callback_header_source + header_receiver_alias +
         (callback_headers_available
              ? std::string()
              : missing_recovered_record_declarations(
@@ -5696,7 +6189,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return std::make_unique<ReceiverImportAction>(
           p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
           receiver_record, receiver_shape, &specification.receiver(),
-          receiver_record, &import_error, &p.debug_records, &specification);
+          receiver_record, &import_error, &p.debug_records, &specification,
+          callback_header_types);
     };
     const bool user_syntax_ok =
         run_callback_tool(make_user_action, typed_user_source, [&] {
@@ -5707,6 +6201,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       if (error.empty()) {
         error = "typed receiver callback failed Clang syntax validation";
       }
+      if (has_header_context)
+        prefer_parse_errors();
       return false;
     }
     std::sort(receiver_shape.inferred_fields.rbegin(),
@@ -5731,14 +6227,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     shape.has_pre = receiver_shape.has_pre;
     shape.has_post = receiver_shape.has_post;
     bridge = receiver_shape.bridge;
-    const std::string generated = make_wrapper(
-        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode,
-        false, result_sret, &receiver_shape.snapshots);
-    complete_source = typed_user_source + "\n" +
-                      specialized_signature_assert(user_ast->getASTContext(),
-                                                   shape) +
-                      bridge + "\n" + generated;
+    const auto assemble = [&](const tracer::ValueSnapshotCode &code) {
+      const std::string generated = make_wrapper(
+          p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+          shape.has_pre, shape.has_post, &specification, shape.class_mode,
+          false, result_sret, &code);
+      complete_source = typed_user_source + "\n" +
+                        specialized_signature_assert(user_ast->getASTContext(),
+                                                     shape) +
+                        bridge + "\n" + generated;
+    };
+    assemble(receiver_shape.snapshots);
     import_error.clear();
     ReceiverCallbackShape final_shape;
     const auto make_final_action =
@@ -5749,12 +6248,29 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return std::make_unique<ReceiverImportAction>(
           p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
           receiver_record, final_shape, &specification.receiver(),
-          receiver_record, &import_error, &p.debug_records, &specification);
+          receiver_record, &import_error, &p.debug_records, &specification,
+          callback_header_types);
     };
-    const bool complete_syntax_ok =
+    bool complete_syntax_ok =
         run_callback_tool(make_final_action, complete_source, [&] {
           return final_shape.valid && import_error.empty();
         });
+    if ((!complete_syntax_ok || !final_shape.valid || !import_error.empty()) &&
+        receiver_shape.snapshots.has_followed_members) {
+      // Followed members must never turn a probe that worked into one that
+      // does not compile: capture without them instead.
+      assemble(receiver_shape.snapshots_plain);
+      complete_syntax_ok = run_callback_tool(make_final_action, complete_source, [&] {
+        return final_shape.valid && import_error.empty();
+      });
+      if (complete_syntax_ok && final_shape.valid && import_error.empty() && report) {
+        auto *note = report->add_diagnostics();
+        note->set_stage("snapshot");
+        note->set_severity("note");
+        note->set_message("followed pointer and reference members were disabled because the "
+                          "generated capture code did not compile");
+      }
+    }
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;
       if (error.empty()) {
@@ -5817,7 +6333,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
 
 void copy_value_snapshot(const tracer::ValueSnapshot &in,
                          clangtracer::context::v1::ValueSnapshot &out,
-                         bool include_members) {
+                         unsigned member_depth) {
   using Snapshot = clangtracer::context::v1::ValueSnapshot;
   out.set_status(static_cast<Snapshot::Status>(in.status));
   if (in.cpp_type) out.set_cpp_type(in.cpp_type);
@@ -5825,10 +6341,11 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
   if (in.status != tracer::ValueSnapshot::Complete)
     return;
   if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
-      in.payload_size > tracer::max_snapshot_bytes || (!in.payload && in.payload_size != 0) ||
+      in.payload_size > tracer::snapshot_slice_request().load() ||
+      (!in.payload && in.payload_size != 0) ||
       in.container_role_count > 128 || in.record_type_count > 128 ||
-      (in.member_count && (!include_members || !in.members ||
-                           in.member_count > tracer::kMaxSnapshotMembers))) {
+      (in.member_count && (!member_depth || !in.members ||
+                           in.member_count > tracer::snapshot_member_request().load()))) {
     out.set_status(Snapshot::FAILED);
     out.set_detail("invalid snapshot storage or capture bounds");
     return;
@@ -5847,7 +6364,7 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
       continue;
     auto &encoded = *out.add_members();
     encoded.set_name(member.name);
-    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), false);
+    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), member_depth - 1);
   }
 }
 
@@ -5855,7 +6372,7 @@ clangtracer::v1::Value to_proto_value(const tracer::TraceValue &v) {
   clangtracer::v1::Value out;
   out.set_type(static_cast<clangtracer::v1::ValueType>(v.type));
   if (v.snapshot)
-    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), true);
+    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), tracer::snapshot_depth_request().load());
   switch (v.type) {
   case tracer::ValueType::Int32:
   case tracer::ValueType::Bool:
@@ -5889,6 +6406,77 @@ extern "C" void tracer_probe_leave(unsigned long long id) noexcept {
   }
 }
 
+extern "C" unsigned long long tracer_observer_clock() noexcept {
+  if (callback_depth || !tracer::agent_has_observers())
+    return 0;
+  const int saved_errno = errno;
+  timespec now{};
+  const bool valid = ::clock_gettime(CLOCK_MONOTONIC, &now) == 0;
+  errno = saved_errno;
+  return valid ? static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec : 0;
+}
+
+struct ObservedReturn {
+  Probe& probe;
+  std::uint64_t call;
+  std::uint64_t timestamp;
+};
+
+bool publish_plugin_latency(void* context, const std::string& plugin,
+                            tracer::agent::LatencyEvent latency) noexcept {
+  const auto& call = *static_cast<const ObservedReturn*>(context);
+  auto& p = call.probe;
+  if (latency.probe_id != p.request.probe_id)
+    return false;
+  const auto sequence = p.sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto& transport = agent.load(std::memory_order_acquire)->transport;
+  auto* packet = transport.try_acquire(p.delivery);
+  if (!packet)
+    return false;
+  bool valid = false;
+  try {
+    clangtracer::v1::TraceEvent event;
+    event.set_protocol_version(tracer::kProtocolVersion);
+    event.set_session_id(p.session_id);
+    event.set_probe_id(latency.probe_id);
+    event.set_call_id(call.call);
+    event.set_pid(static_cast<std::uint32_t>(::getpid()));
+    event.set_tid(static_cast<std::uint32_t>(::syscall(SYS_gettid)));
+    event.set_phase(clangtracer::v1::AGENT_OBSERVER);
+    event.set_probe_sequence(sequence);
+    event.set_monotonic_time_ns(call.timestamp);
+    event.set_agent_dropped_events(p.delivery.dropped.load(std::memory_order_relaxed));
+    auto& payload = *event.mutable_agent_latency();
+    payload.set_plugin_id(plugin);
+    payload.set_elapsed_ns(latency.elapsed_ns);
+    const auto size = event.ByteSizeLong();
+    packet->bytes.resize(size);
+    valid = event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));
+  } catch (...) {
+    // Unblock subsequent packets if serialization fails.
+  }
+  if (!valid)
+    p.delivery.dropped.fetch_add(1, std::memory_order_relaxed);
+  transport.publish(*packet, valid);
+  return valid;
+}
+
+extern "C" void tracer_observer_return(unsigned long long id, unsigned long long call,
+                                       unsigned long long start, unsigned long long end) noexcept {
+  if (callback_depth || end < start || !tracer::agent_has_observers())
+    return;
+  auto* p = find_probe(id);
+  if (!p || !p->callbacks_active() || p->delivery.socket_fd < 0)
+    return;
+  const int saved_errno = errno;
+  ++callback_depth;
+  ObservedReturn invocation{*p, call, end};
+  tracer::agent_notify_return(p->session_id, {id, end - start}, &invocation,
+                              publish_plugin_latency);
+  --callback_depth;
+  errno = saved_errno;
+}
+
 extern "C" unsigned long long
 tracer_next_call_id(unsigned long long id) noexcept {
   if (auto *p = find_probe(id)) {
@@ -5897,32 +6485,89 @@ tracer_next_call_id(unsigned long long id) noexcept {
   return 0;
 }
 
+extern "C" bool tracer_object_identity_lookup(
+    unsigned long long watch_id, unsigned long long receiver,
+    std::uint64_t *object_id, std::uint64_t *generation,
+    bool *identity_verified) noexcept {
+  if (!object_id || !generation || !identity_verified)
+    return false;
+  const int saved_errno = errno;
+  const auto identity = tracer::object_cache::identity::lookup(watch_id, receiver);
+  *object_id = identity ? identity->object_id : 0;
+  *generation = identity ? identity->generation : 0;
+  *identity_verified = *object_id != 0;
+  errno = saved_errno;
+  return identity.has_value();
+}
+
 extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
-                                              void *instance) noexcept {
+                                              void *instance) {
   auto *p = find_probe(id);
   if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
     return 0;
   }
   const int saved_errno = errno;
-  ++callback_depth;
   long long value = 0;
   bool succeeded = false;
+  bool callback_failed = false;
   tracer::TraceContext invocation = *ctx;
   invocation.stack_storage = nullptr;
+  std::optional<tracer::ScalarOverrides> staged;
+  if (ctx->scalar_overrides) {
+    staged.emplace();
+    staged->allow_arguments = ctx->scalar_overrides->allow_arguments;
+    staged->allow_result = ctx->scalar_overrides->allow_result;
+    staged->allow_replacement = ctx->scalar_overrides->allow_replacement;
+    invocation.scalar_overrides = &*staged;
+  }
+  tracer::detail::NamedValueStorage named;
+  invocation.named_storage = &named;
+  invocation.named_values = nullptr;
   invocation.named_count = 0;
-  for (unsigned i = 0;
-       i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
+  invocation.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < invocation.argument_count; ++i) {
     invocation.argument_names[i] =
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
+  }
+  ++callback_depth;
+  struct DispatchGuard {
+    tracer::TraceContext &context;
+    tracer::detail::NamedValueStorage& named;
+    int saved_errno;
+    bool depth_active = true;
+    ~DispatchGuard() {
+      if (!depth_active) {
+        ++callback_depth;
+      }
+      named.clear();
+      tracer::release_native_stack(context);
+      --callback_depth;
+      errno = saved_errno;
+    }
+  } dispatch_guard{invocation, named, saved_errno};
+
+  std::vector<std::uint64_t> staged_arguments;
+  std::vector<unsigned char> staged_set;
   log_dispatch(*p, invocation);
   try {
+    if (staged) {
+      staged_arguments.resize(ctx->argument_count);
+      staged_set.resize(ctx->argument_count);
+      staged->arguments = staged_arguments.data();
+      staged->argument_set = staged_set.data();
+    }
     value = p->callback(&invocation, instance, &succeeded);
     // The bridge reports whether a hook exists for this phase and ran.
     if (succeeded)
       log_hook(*p, invocation, true);
-  } catch (...) {
+  }
+#if defined(__GLIBCXX__)
+  catch (const __cxxabiv1::__forced_unwind &) { throw; }
+#endif
+  catch (...) {
+    callback_failed = true;
     succeeded = false;
     log_hook(*p, invocation, false);
     // Class adapters disable only their failed invocation. Legacy callbacks
@@ -5931,12 +6576,28 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
       p->callback_enabled.store(false, std::memory_order_relaxed);
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
   }
+  if (succeeded) {
+    if (staged) {
+      auto* values = ctx->scalar_overrides->arguments;
+      auto* set = ctx->scalar_overrides->argument_set;
+      std::copy(staged_arguments.begin(), staged_arguments.end(), values);
+      std::copy(staged_set.begin(), staged_set.end(), set);
+      *ctx->scalar_overrides = *staged;
+      ctx->scalar_overrides->arguments = values;
+      ctx->scalar_overrides->argument_set = set;
+    }
+  }
+  std::vector<std::uint64_t>().swap(staged_arguments);
+  std::vector<unsigned char>().swap(staged_set);
   --callback_depth;
+  dispatch_guard.depth_active = false;
   if (succeeded) {
     tracer_event_dispatch(id, &invocation, value);
+  } else if (callback_failed) {
+    // Publish a bounded diagnostic after leaving callback admission so the
+    // target's original invocation can continue unchanged.
+    tracer_event_dispatch_impl(id, &invocation, 0, true, "callback threw");
   }
-  tracer::release_native_stack(invocation);
-  errno = saved_errno;
   return value;
 }
 
@@ -5951,9 +6612,13 @@ tracer_callback_lifecycle_enter(unsigned long long id) noexcept {
 }
 extern "C" void tracer_callback_cleanup_enter() noexcept { ++callback_depth; }
 extern "C" void tracer_callback_lifecycle_leave() noexcept { --callback_depth; }
-extern "C" void tracer_callback_failure(unsigned long long id) noexcept {
-  if (auto *p = find_probe(id))
+extern "C" void tracer_callback_failure(
+    unsigned long long id, const tracer::TraceContext *ctx,
+    const char *message) noexcept {
+  if (auto *p = find_probe(id)) {
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
+    tracer_event_dispatch_impl(id, ctx, 0, true, message);
+  }
 }
 
 extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,
@@ -5978,9 +6643,10 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *ctx,
 }
 
 
-extern "C" void tracer_event_dispatch(unsigned long long id,
-                                      const tracer::TraceContext *ctx,
-                                      long long cb) noexcept {
+static void tracer_event_dispatch_impl(unsigned long long id,
+                                       const tracer::TraceContext *ctx,
+                                       long long cb, bool callback_error,
+                                       const char *callback_error_message) noexcept {
   const int saved_errno = errno;
   auto *p = find_probe(id);
   if (callback_depth || !p || !ctx ||
@@ -6003,15 +6669,15 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
     event.set_protocol_version(tracer::kProtocolVersion);
     event.set_session_id(p->session_id);
     event.set_probe_id(id);
-    event.set_phase(ctx->phase == tracer::TracePhase::Pre
-                        ? clangtracer::v1::PRE
-                        : clangtracer::v1::POST);
+    event.set_phase(static_cast<clangtracer::v1::TracePhase>(ctx->phase));
     event.set_call_id(ctx->call_id);
     event.set_pid(static_cast<std::uint32_t>(::getpid()));
     event.set_tid(static_cast<std::uint32_t>(::syscall(SYS_gettid)));
     event.set_probe_sequence(sequence);
     timespec now{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (ctx->phase == tracer::TracePhase::Pre && ctx->original_entry_time_ns) {
+      event.set_monotonic_time_ns(ctx->original_entry_time_ns);
+    } else if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
       event.set_monotonic_time_ns(
           static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec);
     }
@@ -6023,18 +6689,16 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
       event.set_receiver_sampled_at_return(
           ctx->phase == tracer::TracePhase::Post && p->receiver_sampled_at_return);
     }
-    for (std::uint32_t i = 0;
-         i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
+    for (std::uint32_t i = 0; i < ctx->argument_count; ++i) {
       *event.add_arguments() = to_proto_value(ctx->arguments[i]);
     }
-    if (ctx->named_count > 16) {
+    if (ctx->named_count && !ctx->named_values) {
       throw std::invalid_argument("invalid named value count");
     }
     for (std::uint32_t i = 0; i < ctx->named_count; ++i) {
-      const auto &value = ctx->named_values[i];
-      const auto length = ::strnlen(value.name, sizeof(value.name));
-      if (length == 0 || length == sizeof(value.name) ||
-          (value.kind != 1 && value.kind != 2)) {
+      const auto& value = ctx->named_values[i];
+      const auto length = value.name_size;
+      if (length == 0 || (value.kind != 1 && value.kind != 2)) {
         throw std::invalid_argument("invalid named value");
       }
       auto *named = value.kind == 1 ? event.add_named_arguments()
@@ -6056,69 +6720,24 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
         *named->mutable_value() = to_proto_value(ctx->arguments[i]);
       }
     }
-    event.set_callback_value(cb);
+    if (!callback_error)
+      event.set_callback_value(cb);
+    event.set_callback_error(callback_error);
+    if (callback_error && callback_error_message)
+      event.set_callback_error_message(callback_error_message);
     if (ctx->phase == tracer::TracePhase::Post) {
       *event.mutable_result() = to_proto_value(ctx->result);
     }
     event.set_agent_dropped_events(
         p->delivery.dropped.load(std::memory_order_relaxed));
-    // Preserve the event when positional/named snapshot duplication exceeds
-    // the native packet budget; the typed getter reports explicit truncation.
+    // Large events use the transport's sealed-file path; snapshot budgets
+    // are enforced at capture, not by an unrelated inline datagram ceiling.
     auto size = event.ByteSizeLong();
-    const auto exceeds_packet = [&] {
-      return size > (p->object_snapshot ? tracer::max_snapshot_wire_bytes :
-                                          tracer::EventTransport::kInlineEventBytes);
-    };
-    const auto sync_named_argument = [&](int index) {
-      for (auto &named : *event.mutable_named_arguments())
-        if (named.argument_index() == static_cast<unsigned>(index))
-          *named.mutable_value() = event.arguments(index);
-    };
-    // Dropping followed members first keeps the original record fields and
-    // the pointer addresses available within the existing event budget.
-    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
-      auto &value = *event.mutable_arguments(i);
-      if (value.has_snapshot() && !value.snapshot().members().empty()) {
-        value.mutable_snapshot()->clear_members();
-        sync_named_argument(i);
-        size = event.ByteSizeLong();
-      }
-    }
-    if (exceeds_packet() && event.has_result() &&
-        !event.result().snapshot().members().empty()) {
-      event.mutable_result()->mutable_snapshot()->clear_members();
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && !event.receiver_snapshot().members().empty()) {
-      event.mutable_receiver_snapshot()->clear_members();
-      size = event.ByteSizeLong();
-    }
-    const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
-      snapshot->Clear();
-      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
-      snapshot->set_detail("snapshot exceeds native event packet budget");
-    };
-    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
-      auto &value = *event.mutable_arguments(i);
-      if (!value.has_snapshot()) continue;
-      discard_snapshot(value.mutable_snapshot());
-      sync_named_argument(i);
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && event.has_result() && event.result().has_snapshot()) {
-      discard_snapshot(event.mutable_result()->mutable_snapshot());
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && event.has_receiver_snapshot()) {
-      discard_snapshot(event.mutable_receiver_snapshot());
-      size = event.ByteSizeLong();
-    }
-    const bool base_fits = !exceeds_packet();
     if (ctx->stack.status != tracer::StackStatus::Disabled) {
       tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
       size = event.ByteSizeLong();
     }
-    if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    if (size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =
           event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));
@@ -6132,6 +6751,12 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
   transport.publish(*packet, valid);
   --callback_depth;
   errno = saved_errno;
+}
+
+extern "C" void tracer_event_dispatch(unsigned long long id,
+                                      const tracer::TraceContext *ctx,
+                                      long long cb) noexcept {
+  tracer_event_dispatch_impl(id, ctx, cb, false, nullptr);
 }
 
 bool validate_request(const tracer::Request &r, std::string &error) {
@@ -6148,19 +6773,13 @@ bool validate_request(const tracer::Request &r, std::string &error) {
     error = "unsupported callable kind";
     return false;
   }
-  if (r.argument_count > tracer::kMaxArguments) {
-    error = "at most eight explicit arguments are supported";
+  if (r.object_watch_id && r.kind != tracer::CallableKind::Method) {
+    error = "object-watch identity requires a non-static method";
     return false;
   }
   if (!valid_type(r.result, true)) {
     error = "unsupported result type";
     return false;
-  }
-  for (unsigned i = 0; i < r.argument_count; ++i) {
-    if (!valid_type(r.arguments[i], false)) {
-      error = "unsupported argument type";
-      return false;
-    }
   }
   if (!std::memchr(r.session_id, '\0', sizeof(r.session_id)) ||
       !r.session_id[0] || !std::memchr(r.symbol, '\0', sizeof(r.symbol)) ||
@@ -6179,7 +6798,7 @@ bool validate_request(const tracer::Request &r, std::string &error) {
 bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
                                        const char *message, std::size_t size,
                                        LogLevel level) noexcept {
-  auto *owner = agent.load(std::memory_order_acquire);
+  auto *owner = ::agent.load(std::memory_order_acquire);
   if (!owner || !owner->logging_enabled || !context || !message || size == 0)
     return false;
   // Messages above the configured level are filtered before they use a slot.
@@ -6232,15 +6851,18 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "probe_id has already been used in this process");
       return operation.finish(-1);
     }
-    if (a.retained >= tracer::kMaxProbes) {
-      set_error(request, "the process has reached its 32 retained-probe limit");
-      return operation.finish(-1);
-    }
+    // Allocate ownership storage before enabling transport or scheduler state.
+    // Readers traverse stable registry nodes, never the ownership vectors.
+    if (a.probes.size() == a.probes.capacity())
+      a.probes.reserve(a.probes.empty() ? 1 : a.probes.size() * 2);
+    if (a.probe_slots.size() == a.probe_slots.capacity())
+      a.probe_slots.reserve(a.probe_slots.empty() ? 1 : a.probe_slots.size() * 2);
+    auto slot = std::make_unique<ProbeSlot>();
     // A durable collector can reconnect while old probes are still active.
     // Keep their shared metadata alive; refresh a new session only after the
     // previous callback cohort has drained.
     bool native_cache_quiescent = true;
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       const auto *prior = a.probes[i].get();
       if (prior &&
           (prior->active.load(std::memory_order_seq_cst) ||
@@ -6257,11 +6879,19 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;
     operation.enter("read_probe_spec");
-    if (!read_probe_spec(p->request, specification, error)) {
+    if (!read_probe_spec(p->request, p->signature_arguments, specification, error)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
-    p->receiver_sampled_at_return = specification.snapshot_receiver_at_return();
+    if (const auto *invalid = tracer::scalar_override_error(specification)) {
+      set_error(request, invalid);
+      return operation.finish(-1);
+    }
+    // A prepared constructor probe samples its receiver when the constructor returns.
+    p->receiver_sampled_at_return =
+        specification.snapshot_receiver_at_return() ||
+        (tracer::client::is_constructor_symbol(specification.symbol()) &&
+         tracer::prepared::is_typed_version(specification.prepared().format_version()));
     p->object_snapshot = specification.snapshot_report_unavailable();
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
@@ -6298,7 +6928,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     Probe *replaced = nullptr;
     bool entry_matches_original = true;
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
@@ -6383,7 +7013,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       error.clear();
       getter_fallback = true;
     }
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
       if (!other || !other->active.load()) {
         continue;
@@ -6454,6 +7084,11 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request.jit_compile_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - compile_started).count();
+    if (specification.reclaimable() && p->request.context_required) {
+      set_error(request, "reclaimable observers cannot schedule shared-context work");
+      return operation.finish(-1);
+    }
+    p->reclaimable = specification.reclaimable();
     operation.detail("wrapper=0x%llx relay=0x%llx jit_compile_ns=%llu",
                      static_cast<unsigned long long>(
                          reinterpret_cast<std::uintptr_t>(p->wrapper)),
@@ -6501,17 +7136,22 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     operation.enter("publish_probe");
     p->session_id = request->session_id;
     a.pid = ::getpid();
-    const auto slot = a.retained;
     a.transport.activate();
     p->transport_active = true;
     p->active.store(true, std::memory_order_seq_cst);
-    a.probes[slot] = std::move(p);
-    Probe *installed_probe = a.probes[slot].get();
-    a.probe_slots[slot].store(installed_probe, std::memory_order_release);
+    Probe *installed_probe = p.get();
+    slot->next = a.published_slots.load(std::memory_order_relaxed);
+    slot->probe.store(installed_probe, std::memory_order_relaxed);
+    slot->id.store(installed_probe->request.probe_id, std::memory_order_relaxed);
+    auto *published = slot.get();
+    a.probes.push_back(std::move(p));
+    a.probe_slots.push_back(std::move(slot));
+    a.published_slots.store(published, std::memory_order_release);
     ++a.retained;
-    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
+    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag |
+                                      std::min<std::size_t>(a.retained, UINT32_MAX),
                                   std::memory_order_relaxed);
-    operation.detail("slot=%zu retained=%zu session=%s", slot, a.retained,
+    operation.detail("slot=%zu retained=%zu session=%s", a.retained - 1, a.retained,
                      installed_probe->session_id.c_str());
     if (agent_log_allows(Level::Trace)) {
       const auto &published = installed_probe->request;
@@ -6545,6 +7185,48 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
   }
 }
 
+extern "C" int tracer_agent_reclaim_v1(std::uint64_t id, TracerRetiredCode *code,
+                                        unsigned release) {
+  try {
+    std::lock_guard<std::mutex> lock(agent_mutex);
+    auto *owner = agent.load(std::memory_order_acquire);
+    if (!owner || !code)
+      return -1;
+    for (std::size_t i = 0; i < owner->probes.size(); ++i) {
+      auto *probe = owner->probes[i].get();
+      if (!probe || probe->request.probe_id != id)
+        continue;
+      if (!probe->reclaimable || probe->active.load() || probe->transport_active ||
+          probe->in_flight.load() != Probe::admission_closed ||
+          probe->delivery.pending.load())
+        return -1;
+      if (!release) {
+        const void *entries[] = {probe->wrapper,
+            reinterpret_cast<const void *>(probe->callback), probe->trampoline};
+        for (std::size_t j = 0; j < 3; ++j) {
+          std::uintptr_t begin = 0, end = 0;
+          int protection = 0;
+          if (!entries[j] || !mapping(entries[j], begin, end, protection) ||
+              !(protection & PROT_EXEC))
+            return -1;
+          code->ranges[j] = {begin, end};
+        }
+      } else {
+        owner->probe_slots[i]->id.store(0, std::memory_order_release);
+        owner->probe_slots[i]->probe.store(nullptr, std::memory_order_release);
+        owner->probes[i].reset();
+        --owner->retained;
+        tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag |
+                                          std::min<std::size_t>(owner->retained, UINT32_MAX),
+                                       std::memory_order_relaxed);
+      }
+      return 0;
+    }
+  } catch (...) {
+  }
+  return -1;
+}
+
 extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
   tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
   const auto set_error = [&](const std::string &message) {
@@ -6574,18 +7256,8 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
       set_error("cannot open serialized validation ProbeSpec");
       return -1;
     }
-    std::string serialized(kMaxSerializedProbeSpec + 1, '\0');
-    input.read(serialized.data(), static_cast<std::streamsize>(serialized.size()));
-    const auto serialized_size = static_cast<std::size_t>(input.gcount());
-    if (serialized_size > kMaxSerializedProbeSpec) {
-      set_error("serialized validation ProbeSpec exceeds 256 KiB");
-      return -1;
-    }
-    serialized.resize(serialized_size);
     clangtracer::v1::ProbeSpec spec;
-    if (!spec.ParseFromArray(serialized.data(),
-                             static_cast<int>(serialized.size())) ||
-        !spec.has_signature() || spec.callback_source().empty() ||
+    if (!spec.ParseFromIstream(&input) || !spec.has_signature() || spec.callback_source().empty() ||
         spec.symbol().empty() || !spec.has_debug_info()) {
       set_error("validation ProbeSpec is incomplete or malformed");
       return -1;
@@ -6612,9 +7284,11 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
                  sizeof(native_request.source_path) - 1);
     std::strncpy(native_request.event_socket, "/tmp/clang-tracer-validation",
                  sizeof(native_request.event_socket) - 1);
-    for (int i = 0; i < spec.signature().arguments_size(); ++i)
-      native_request.arguments[i] = static_cast<tracer::ValueType>(
-          spec.signature().arguments(i));
+    std::vector<tracer::ValueType> signature_arguments;
+    for (const auto type : spec.signature().arguments()) {
+      signature_arguments.push_back(static_cast<tracer::ValueType>(type));
+    }
+    native_request.arguments = signature_arguments.data();
     if (tracer::prepared::is_typed_version(spec.prepared().format_version())) {
       for (const auto &option : spec.prepared().adapter_toolchain_options())
         if (::tracer::compat::starts_with(option, "--driver-mode="))

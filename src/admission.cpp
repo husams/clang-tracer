@@ -1,4 +1,5 @@
 #include "admission.hpp"
+#include "mapped_elf.hpp"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,7 @@
 #include <llvm/Support/Error.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -132,6 +134,9 @@ struct Mapping {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
   std::uint64_t offset = 0;
+  std::uint64_t inode = 0;
+  unsigned device_major = 0;
+  unsigned device_minor = 0;
   bool readable = false;
   bool executable = false;
   std::string path;
@@ -148,21 +153,24 @@ std::vector<Mapping> read_mappings(pid_t pid) {
   std::unordered_map<std::string, std::string> canonical_paths;
   while (std::getline(input, line)) {
     std::istringstream row(line);
-    std::string addresses, permissions, device, inode;
+    std::string addresses, permissions, device;
     Mapping m;
     if (!(row >> addresses >> permissions >> std::hex >> m.offset >> device >>
-          std::dec >> inode)) {
+          std::dec >> m.inode)) {
       continue;
     }
     m.readable = permissions.size() >= 1 && permissions[0] == 'r';
     m.executable = permissions.size() >= 3 && permissions[2] == 'x';
     const auto dash = addresses.find('-');
-    if (dash == std::string::npos) {
+    const auto colon = device.find(':');
+    if (dash == std::string::npos || colon == std::string::npos) {
       continue;
     }
     try {
       m.begin = std::stoull(addresses.substr(0, dash), nullptr, 16);
       m.end = std::stoull(addresses.substr(dash + 1), nullptr, 16);
+      m.device_major = std::stoul(device.substr(0, colon), nullptr, 16);
+      m.device_minor = std::stoul(device.substr(colon + 1), nullptr, 16);
     } catch (...) {
       continue;
     }
@@ -197,6 +205,7 @@ struct FileImage {
     std::string name;
     std::uint64_t start;
     std::uint64_t size;
+    RuntimeEntry entry{};
   };
 
   std::vector<Function> functions;
@@ -264,6 +273,7 @@ enum class StartupSymbolSet {
   libc,
   executable,
   pthread,
+  runtime,
 };
 
 bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
@@ -275,6 +285,11 @@ bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
     return name == "main";
   case StartupSymbolSet::pthread:
     return name == "start_thread";
+  case StartupSymbolSet::runtime:
+    return name == "dlopen" || name == "dlsym" || name == "dlclose" ||
+           name == "__libc_dlopen_mode" || name == "__libc_dlsym" ||
+           name == "__libc_dlclose" || name == "__errno_location" ||
+           name == "pthread_create" || name == "getenv";
   case StartupSymbolSet::none:
     return false;
   }
@@ -283,7 +298,8 @@ bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
 
 FileImage
 load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
-              StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
+              StartupSymbolSet startup_symbols = StartupSymbolSet::none,
+              pid_t runtime_pid = -1) {
   FileImage image;
   image.path = path;
   struct stat st{};
@@ -347,7 +363,7 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
   }
   const auto page = static_cast<std::uint64_t>(page_size);
   const auto same_file = [&](const Mapping &m) {
-    return !m.canonical_path.empty() && m.canonical_path == path;
+    return m.canonical_path == path;
   };
   const auto file_page_range = [&](const Elf64_Phdr &segment,
                                    std::uint64_t &file_begin,
@@ -484,6 +500,39 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
   const auto section_names = read_file_bytes(
       fd, file_size, names.sh_offset, names.sh_size, "ELF section names");
   const char *strtab = reinterpret_cast<const char *>(section_names.data());
+  const bool runtime = startup_symbols == StartupSymbolSet::runtime;
+  bool runtime_identity = !runtime;
+  if (runtime && runtime_pid > 0) {
+    const auto bytes = read_file_bytes(fd, file_size, 0, file_size, "runtime ELF content");
+    const llvm::StringRef contents(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    auto binary = llvm::object::createBinary(llvm::MemoryBufferRef(contents, path));
+    if (!binary)
+      unavailable(llvm::toString(binary.takeError()));
+    const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->get());
+    runtime_identity = object && ::tracer::detail::matches_mapped_elf(*object, image.bias,
+        [&](auto address, auto expected) {
+          const auto offset = static_cast<std::uint64_t>(expected.data() - contents.data());
+          const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const Mapping &m) {
+            return same_file(m) && m.readable && address >= m.begin && address < m.end &&
+                expected.size() <= m.end - address && offset >= m.offset &&
+                offset - m.offset == address - m.begin;
+          });
+          if (mapping == maps.end())
+            return false;
+          std::array<char, 4096> live{};
+          while (!expected.empty()) {
+            const auto size = std::min(expected.size(), live.size());
+            iovec local{live.data(), size}, remote{reinterpret_cast<void *>(address), size};
+            if (::tracer::linux_api::process_vm_readv(runtime_pid, &local, 1, &remote, 1, 0) !=
+                    static_cast<ssize_t>(size) ||
+                std::string_view(live.data(), size) != expected.substr(0, size))
+              return false;
+            address += size;
+            expected.remove_prefix(size);
+          }
+          return true;
+        });
+  }
   for (unsigned i = 0; i < eh.e_shnum; ++i) {
     if (sh[i].sh_name < names.sh_size) {
       const char *name = strtab + sh[i].sh_name;
@@ -533,9 +582,13 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
       }
     }
   }
+  if (!runtime_identity) {
+    unavailable("target glibc mapping does not match the ELF file identity");
+  }
   if (startup_symbols != StartupSymbolSet::none) {
     for (unsigned i = 0; i < eh.e_shnum; ++i) {
-      if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
+      if (sh[i].sh_type != SHT_DYNSYM &&
+          (runtime || sh[i].sh_type != SHT_SYMTAB)) {
         continue;
       }
       if (sh[i].sh_link >= eh.e_shnum ||
@@ -556,6 +609,20 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
           fd, file_size, sh[i].sh_offset, sh[i].sh_size / sizeof(Elf64_Sym),
           "ELF symbols");
       const auto count = sh[i].sh_size / sizeof(Elf64_Sym);
+      std::vector<Elf64_Half> versions;
+      if (runtime) {
+        for (const auto &section : sh) {
+          if (section.sh_type != SHT_GNU_versym || section.sh_link != i) {
+            continue;
+          }
+          if (section.sh_size / sizeof(Elf64_Half) < count) {
+            unavailable("mapped runtime symbol versions are incomplete");
+          }
+          versions = read_file_objects<Elf64_Half>(
+              fd, file_size, section.sh_offset, count, "runtime symbol versions");
+          break;
+        }
+      }
       for (std::uint64_t j = 0; j < count; ++j) {
         const auto &sym = symbols[j];
         if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
@@ -572,8 +639,38 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
         const std::string_view function_name(
             name, static_cast<std::size_t>(terminator - name));
         if (is_startup_symbol(startup_symbols, function_name)) {
-          image.functions.push_back(
-              {std::string(function_name), sym.st_value, sym.st_size});
+          FileImage::Function function{std::string(function_name), sym.st_value,
+                                       sym.st_size};
+          if (runtime) {
+            const auto binding = ELF64_ST_BIND(sym.st_info);
+            const auto visibility = ELF64_ST_VISIBILITY(sym.st_other);
+            if (sym.st_shndx >= sh.size() || sym.st_shndx == SHN_UNDEF ||
+                (binding != STB_GLOBAL && binding != STB_WEAK) ||
+                (visibility != STV_DEFAULT && visibility != STV_PROTECTED) ||
+                (!versions.empty() && (versions[j] & 0x8000) != 0)) {
+              continue;
+            }
+            auto &entry = function.entry;
+            entry.address = image.runtime(function);
+            const auto segment = std::find_if(
+                image.loads.begin(), image.loads.end(), [&](const auto &p) {
+                  return (p.p_flags & PF_X) && sym.st_value >= p.p_vaddr &&
+                         sym.st_value - p.p_vaddr <= p.p_filesz &&
+                         entry.bytes.size() <= p.p_filesz - (sym.st_value - p.p_vaddr);
+                });
+            if (segment == image.loads.end() ||
+                std::none_of(maps.begin(), maps.end(), [&](const Mapping &m) {
+                  return same_file(m) && m.readable && m.executable &&
+                         entry.address >= m.begin && entry.address < m.end &&
+                         entry.bytes.size() <= m.end - entry.address;
+                }) ||
+                !image.executable_pc(entry.address, maps)) {
+              unavailable("runtime entry is outside its verified executable mapping");
+            }
+            pread_exact(fd, file_size, segment->p_offset + (sym.st_value - segment->p_vaddr),
+                        entry.bytes.data(), entry.bytes.size(), "runtime entry bytes");
+          }
+          image.functions.push_back(std::move(function));
         }
       }
     }
@@ -586,14 +683,15 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
 
 FileImage
 load_image(const std::string &path, const std::vector<Mapping> &maps,
-           StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
+           StartupSymbolSet startup_symbols = StartupSymbolSet::none,
+           pid_t runtime_pid = -1) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     unavailable("cannot open mapped ELF image");
   }
   FileImage image;
   try {
-    image = load_image_fd(path, fd, maps, startup_symbols);
+    image = load_image_fd(path, fd, maps, startup_symbols, runtime_pid);
   } catch (...) {
     ::close(fd);
     throw;
@@ -614,41 +712,53 @@ FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps,
                                  : StartupSymbolSet::none);
 }
 
-FileImage load_libc(const std::vector<Mapping> &maps) {
-  for (const auto &m : maps) {
-    const auto basename = m.path.substr(m.path.find_last_of('/') + 1);
-    const bool candidate =
-        basename == "libc.so.6" || (::tracer::compat::starts_with(basename, "libc-") &&
-                                    ::tracer::compat::ends_with(basename, ".so"));
-    if (m.canonical_path.empty() || !candidate) {
+bool glibc_library_name(std::string_view path, std::string_view soname) {
+  const auto basename = path.substr(path.find_last_of('/') + 1);
+  const auto stem = soname.substr(0, soname.find('.'));
+  return basename == soname ||
+         (basename.size() > stem.size() && basename[stem.size()] == '-' &&
+          ::tracer::compat::starts_with(basename, stem) &&
+          ::tracer::compat::ends_with(basename, ".so"));
+}
+
+std::optional<FileImage> load_glibc_library(const std::vector<Mapping> &maps,
+                                            std::string_view soname,
+                                            StartupSymbolSet symbols,
+                                            pid_t runtime_pid = -1) {
+  std::optional<FileImage> found;
+  for (const auto &mapping : maps) {
+    const auto &path = mapping.canonical_path;
+    if (path.empty() || (found && path == found->path) ||
+        !glibc_library_name(mapping.path, soname)) {
       continue;
     }
-    const auto &path = m.canonical_path;
-    auto image = load_image(path, maps, StartupSymbolSet::libc);
-    if (image.soname == "libc.so.6") {
+    auto image = load_image(path, maps, symbols, runtime_pid);
+    if (image.soname != soname) {
+      continue;
+    }
+    if (symbols != StartupSymbolSet::runtime) {
       return image;
     }
+    if (found) {
+      unavailable("multiple glibc runtime images share a SONAME");
+    }
+    found = std::move(image);
   }
-  unavailable("cannot identify the mapped libc ELF image");
+  return found;
+}
+
+FileImage load_libc(const std::vector<Mapping> &maps,
+                    StartupSymbolSet symbols = StartupSymbolSet::libc,
+                    pid_t runtime_pid = -1) {
+  auto image = load_glibc_library(maps, "libc.so.6", symbols, runtime_pid);
+  if (!image) {
+    unavailable("cannot identify the mapped libc ELF image");
+  }
+  return std::move(*image);
 }
 
 std::optional<FileImage> load_libpthread(const std::vector<Mapping> &maps) {
-  for (const auto &mapping : maps) {
-    const auto basename =
-        mapping.path.substr(mapping.path.find_last_of('/') + 1);
-    const bool candidate =
-        basename == "libpthread.so.0" ||
-        ::tracer::compat::starts_with(basename, "libpthread-");
-    if (!candidate || mapping.canonical_path.empty()) {
-      continue;
-    }
-    auto image =
-        load_image(mapping.canonical_path, maps, StartupSymbolSet::pthread);
-    if (image.soname == "libpthread.so.0") {
-      return image;
-    }
-  }
-  return std::nullopt;
+  return load_glibc_library(maps, "libpthread.so.0", StartupSymbolSet::pthread);
 }
 
 using ExecutableMapRecord =
@@ -1141,6 +1251,115 @@ user_regs_struct unwind_one(pid_t pid, const FileImage &image, std::uint64_t pc,
 }
 
 } // namespace
+
+RuntimeEntry target_runtime_entry(pid_t pid, std::string_view name) {
+  const auto maps = read_mappings(pid);
+  const auto libc = load_libc(maps, StartupSymbolSet::runtime, pid);
+  if (name == "getenv") {
+    if (const auto *function = libc.named(name)) {
+      return function->entry;
+    }
+  } else if (name == "__errno_location" || name == "pthread_create") {
+    // Merged glibc keeps the active implementations in libc. On legacy
+    // glibc the pthread image can override libc's errno accessor.
+    if (libc.named("dlopen")) {
+      if (const auto *function = libc.named(name)) {
+        return function->entry;
+      }
+    }
+    const auto pthread = load_glibc_library(maps, "libpthread.so.0",
+                                           StartupSymbolSet::runtime, pid);
+    if (const auto *function = pthread ? pthread->named(name) : nullptr) {
+      return function->entry;
+    }
+    if (const auto *function = libc.named(name)) {
+      return function->entry;
+    }
+  } else if (name == "dlopen" || name == "dlsym" || name == "dlclose") {
+    if (const auto *function = libc.named(name)) {
+      return function->entry;
+    }
+    const auto libdl = load_glibc_library(maps, "libdl.so.2",
+                                         StartupSymbolSet::runtime, pid);
+    if (const auto *function = libdl ? libdl->named(name) : nullptr) {
+      return function->entry;
+    }
+    // Legacy glibc may start without libdl. Its libc bootstrap entries
+    // have the same argument layout for these operations.
+    const auto *legacy = name == "dlopen" ? "__libc_dlopen_mode"
+                        : name == "dlsym" ? "__libc_dlsym"
+                                         : "__libc_dlclose";
+    if (const auto *function = libc.named(legacy)) {
+      return function->entry;
+    }
+  }
+  throw std::runtime_error("cannot resolve target glibc entry for " +
+                           std::string(name));
+}
+
+std::vector<std::string> target_runtime_companions(
+    pid_t pid, const std::vector<std::string> &dependencies) {
+  if (dependencies.empty()) {
+    return {};
+  }
+  const auto maps = read_mappings(pid);
+  const auto libc = load_libc(maps, StartupSymbolSet::runtime, pid);
+  const auto directory = libc.path.substr(0, libc.path.find_last_of('/') + 1);
+  std::vector<std::string> paths;
+  // Bind these SONAMEs to the target's libc distribution before the loader
+  // consults a module's RUNPATH or the host's default search directories.
+  for (const auto *soname : {"libdl.so.2", "libpthread.so.0", "librt.so.1",
+                             "libm.so.6", "libresolv.so.2"}) {
+    if (std::find(dependencies.begin(), dependencies.end(), soname) ==
+        dependencies.end()) {
+      continue;
+    }
+    const auto path = directory + soname;
+    const auto canonical = ::tracer::detail::canonical_mapped_path(path);
+    struct stat file {};
+    if (canonical.empty() ||
+        canonical.substr(0, canonical.find_last_of('/') + 1) != directory ||
+        ::stat(canonical.c_str(), &file) != 0 || !S_ISREG(file.st_mode)) {
+      throw std::runtime_error("cannot identify " + path + " beside target libc");
+    }
+    bool mapped = false;
+    for (const auto &mapping : maps) {
+      if (!glibc_library_name(mapping.path, soname)) {
+        continue;
+      }
+      if (mapping.canonical_path != canonical) {
+        throw std::runtime_error("target already maps a different " +
+                                 std::string(soname));
+      }
+      if (!mapped &&
+          load_image(canonical, maps, StartupSymbolSet::runtime, pid).soname != soname) {
+        throw std::runtime_error("cannot verify mapped glibc companion " + path);
+      }
+      mapped = true;
+    }
+    if (!mapped) {
+      paths.push_back(path);
+    }
+  }
+  return paths;
+}
+
+std::vector<std::string> mapped_application_files(pid_t pid) {
+  const auto maps = read_mappings(pid);
+  const auto executable = load_executable(pid, maps);
+  const auto libc = load_libc(maps);
+  const auto protected_files = protected_runtime_identities(maps, libc, loader_identity(executable, maps));
+  std::set<std::string> paths;
+  for (const auto &mapping : maps) {
+    if (!mapping.executable || mapping.path.empty() || mapping.path.front() != '/')
+      continue;
+    const auto &path = mapping.canonical_path.empty() ? mapping.path : mapping.canonical_path;
+    if (path != executable.path &&
+        std::find(protected_files.begin(), protected_files.end(), path) == protected_files.end())
+      paths.insert(path);
+  }
+  return {paths.begin(), paths.end()};
+}
 
 std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
   if (pid <= 0) {

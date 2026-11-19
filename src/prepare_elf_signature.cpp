@@ -2,6 +2,7 @@
 
 #include "prepared_contract.hpp"
 #include "prepared_types.hpp"
+#include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
 #include "tracer_runtime_config.hpp"
@@ -47,7 +48,7 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
                           const std::string &selector, bool member,
                           const IndexedElfSignature *indexed) {
   auto wanted = compact(selector);
-  if (wanted.starts_with("::")) wanted.erase(0, 2);
+  if (::tracer::compat::starts_with(wanted, "::")) wanted.erase(0, 2);
   std::optional<ElfCallable> match;
   bool ambiguous_indexed_linkage = false;
   const auto visit = [&](const llvm::object::SymbolRef &symbol) {
@@ -88,12 +89,14 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
         match = ElfCallable{linkage, "", "", "", *address, elf.getSize()};
       return;
     }
-    if (!demangler.isFunction() || demangler.isSpecialName() || demangler.isCtorOrDtor())
+    // Constructors and destructors are ordinary callables here. Their entry points (C1/C2,
+    // D0/D1/D2) are told apart by linkage name (--id); aliases share one address.
+    if (!demangler.isFunction() || demangler.isSpecialName())
       return;
     using Text = std::unique_ptr<char, decltype(&std::free)>;
     std::size_t capacity = 0;
     const Text qualified(demangler.getFunctionName(nullptr, &capacity), &std::free);
-    if (!qualified || (!indexed && !wanted.starts_with(compact(qualified.get()) + "(")))
+    if (!qualified || (!indexed && !::tracer::compat::starts_with(wanted, compact(qualified.get()) + "(")))
       return;
     const Text params(demangler.getFunctionParameters(nullptr, &capacity), &std::free);
     const Text full(demangler.finishDemangle(nullptr, &capacity), &std::free);
@@ -105,8 +108,9 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     if (start == display.npos || (!indexed && compact(display.substr(start)) != wanted))
       return;
     if (match) {
-      if (match->symbol != linkage || match->address != *address ||
-          match->size != elf.getSize())
+      // Two names for the same code (C1/C2 or D1/D2 aliases) are one callable; different code
+      // is ambiguous and is selected by linkage name.
+      if (match->address != *address || match->size != elf.getSize())
         throw std::invalid_argument("selector matches multiple ELF function symbols");
       return;
     }
@@ -172,7 +176,7 @@ ResolvedCallable resolve_elf_signature(
   if (indexed) package.add_adapter_toolchain_options("--target=x86_64-unknown-linux-gnu");
   auto arguments = tracer::prepared::toolchain_arguments(
       package, {runtime::jit_flags.begin(), runtime::jit_flags.end()});
-  arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+  arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
                                      "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
   const auto parse = [&](const std::string &source) {
     auto unit = clang::tooling::buildASTFromCodeWithArgs(
@@ -222,8 +226,6 @@ ResolvedCallable resolve_elf_signature(
     parameters += argument + " arg" + std::to_string(i);
   }
   declarations += "Result target(" + parameters + ") __asm__(\"" + target.symbol + "\");\n}\n";
-  if (supplied->getNumParams() + !target.receiver.empty() > kMaxArguments)
-    throw std::invalid_argument("ELF signature has too many ABI arguments");
 
   auto adapter = parse(declarations);
   auto &adapter_ast = adapter->getASTContext();

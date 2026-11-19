@@ -1,0 +1,14 @@
+%probe prepare "HFW::HfwManager::getItem(int)" --include item.hpp --include item-impl.hpp --output prepared
+%probe inject "HFW::HfwManager::getItem(int)" --prepared prepared --prepared-mode require
+%collect --name "HFW::HfwManager::getItem(int)" --count 1 --timeout 20 --phase POST --as returned_items
+auto events = tracer.batch("returned_items");
+if (events.size() != 1) throw std::runtime_error("expected one POST event");
+auto root = events.at(0).result_snapshot();
+std::cout << "ROOT type=" << root.cpp_type() << " fields=" << root.fields().size() << std::endl;
+const auto &implementation = root.field("_impl_snapshot");
+std::cout << "IMPL type=" << implementation.cpp_type() << " revision=" << implementation.field("revision").as<int>() << " label=" << implementation.field("label").as<std::string>() << std::endl;
+auto typed = root.field("_impl_snapshot").as<HFW::HfwItemImpl>();
+std::cout << "TYPED revision=" << typed.revision << " label=" << typed.label << std::endl;
+auto item = events.at(0).result_as<HFW::HfwItem>();
+std::cout << "HANDLE revision=" << item->_impl->revision << " label=" << item->_impl->label << std::endl;
+%quit

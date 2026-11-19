@@ -12,6 +12,9 @@
 
 namespace tracer::injector {
 
+// Linux PTRACE_EVENT_STOP is absent from older SDK headers.
+inline constexpr unsigned ptrace_event_stop = 128;
+
 // Ptrace stops send SIGCHLD to the tracer process. A shared sequence lets
 // each worker wait for its own waitpid results without consuming another
 // worker's notification. Only the tracer's executables use this helper.

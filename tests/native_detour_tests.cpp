@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "native_detour.hpp"
+#include "native_entry.hpp"
 
 namespace nd = tracer::native_detour;
 
@@ -279,7 +280,7 @@ void short_entry_relay() {
   std::string error;
   require(!nd::decode(code, address, patch, error),
           "long jump admitted a return instruction");
-  require(!nd::decode(std::span(code).first(4), address, patch, error,
+  require(!nd::decode({code.data(), 4}, address, patch, error,
                       nd::kRelativeJumpBytes),
           "short jump admitted a range shorter than the jump");
   require(nd::decode(code, address, patch, error, nd::kRelativeJumpBytes) &&
@@ -370,6 +371,18 @@ void overlap_boundaries() {
               patch.relocations.front().target == entry,
           "address-only LEA into the patch window was rejected");
 }
+void saved_return_at_function_end() {
+  constexpr std::uintptr_t entry = 0x401407;
+  namespace ne = tracer::native_entry;
+  require(!ne::may_return_at_end(entry, "\x5d\xc3"),
+          "a return instruction cannot leave a saved PC at the next entry");
+  require(ne::may_return_at_end(entry, std::string_view("\xe8\0\0\0\0", 5)),
+          "a direct call ending at the boundary must preserve its saved PC");
+  require(ne::may_return_at_end(entry, "\xff\xd0"),
+          "an indirect call ending at the boundary must preserve its saved PC");
+  require(!ne::may_return_at_end(entry, std::string_view("\xe8\0\0\0\0\xc3", 6)),
+          "a call followed by ret returns inside the function");
+}
 } // namespace
 
 int main() {
@@ -381,6 +394,7 @@ int main() {
     short_entry_relay();
     displacement_limits();
     overlap_boundaries();
+    saved_return_at_function_end();
     std::cout << "native detour relocation checks passed\n";
     return 0;
   } catch (const std::exception &error) {

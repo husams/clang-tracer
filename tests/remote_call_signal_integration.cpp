@@ -1,17 +1,21 @@
 #include "injector.hpp"
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,15 +49,46 @@ void require(bool condition, const std::string &message) {
     throw std::runtime_error(message);
 }
 
+#if defined(__x86_64__)
+[[noreturn]] void sleep_at_page_edge() {
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    ::_exit(122);
+  auto *code = static_cast<unsigned char *>(::mmap(
+      nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (code == MAP_FAILED)
+    ::_exit(122);
+  // xor esi, esi; mov eax, SYS_nanosleep; syscall; ret
+  constexpr unsigned char sleeper[]{0x31, 0xf6, 0xb8, SYS_nanosleep, 0, 0, 0,
+                                    0x0f, 0x05, 0xc3};
+  auto *entry = code + page_size - sizeof(sleeper);
+  std::memcpy(entry, sleeper, sizeof(sleeper));
+  // The return instruction occupies the last byte before the non-executable page.
+  if (::mprotect(code, page_size, PROT_READ | PROT_EXEC) != 0)
+    ::_exit(122);
+  const auto sleep = reinterpret_cast<long (*)(const timespec *)>(entry);
+  const timespec delay{60, 0};
+  for (;;)
+    sleep(&delay);
+}
+#endif
+
 class Sleeper {
 public:
-  Sleeper() : pid_(::fork()) {
+  explicit Sleeper(bool page_edge = false) : pid_(::fork()) {
     require(pid_ >= 0, "fork failed");
     if (pid_ == 0) {
       const rlimit no_core{0, 0};
       if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
           ::setrlimit(RLIMIT_CORE, &no_core) != 0)
         ::_exit(120);
+#if defined(__x86_64__)
+      if (page_edge)
+        sleep_at_page_edge();
+#else
+      (void)page_edge;
+#endif
       for (;;) {
         const timespec delay{0, 50 * 1000 * 1000};
         ::nanosleep(&delay, nullptr);
@@ -121,6 +156,40 @@ void attach(Process &process, pid_t pid) {
   }
 }
 
+#if defined(__x86_64__)
+void run_page_edge_case() {
+  Sleeper child(true);
+  Process process;
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  require(page_size > 0, "cannot determine target page size");
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  std::uintptr_t ip = 0;
+  for (;;) {
+    attach(process, child.pid());
+    ip = process.instruction_pointer();
+    if (ip % page_size == static_cast<std::uintptr_t>(page_size - 1))
+      break;
+    process.detach();
+    require(std::chrono::steady_clock::now() < deadline,
+            "target did not reach the page-edge sleep");
+    std::this_thread::sleep_for(10ms);
+  }
+  const auto word = ip + 1 - sizeof(long);
+  std::array<unsigned char, sizeof(long)> before{}, after{};
+  process.remote_read(word, before.data(), before.size());
+  require(process.remote_call(reinterpret_cast<std::uintptr_t>(&::getpid)) ==
+              static_cast<std::uintptr_t>(child.pid()),
+          "remote call from the page-edge stop returned the wrong PID");
+  process.remote_read(word, after.data(), after.size());
+  require(before == after && process.instruction_pointer() == ip,
+          "the page-edge code or instruction pointer was not restored");
+  process.detach();
+  require(::kill(child.pid(), SIGTERM) == 0, "SIGTERM failed");
+  child.wait_for_signal(SIGTERM);
+  std::cout << "remote syscall at the executable page boundary: restored" << std::endl;
+}
+#endif
+
 std::uintptr_t send_process_signal(int signal) {
   sigset_t mask;
   ::sigemptyset(&mask);
@@ -164,6 +233,9 @@ void run_case(const char *name, int signal, bool suppress, Call call) {
 
 int main() {
   try {
+#if defined(__x86_64__)
+    run_page_edge_case();
+#endif
     const auto fault = [](Process &process) { (void)process.remote_call(1); };
     run_case("confirmed synchronous SIGSEGV", SIGSEGV, true, fault);
     fail_fault_attribution = true;

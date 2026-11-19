@@ -1,4 +1,4 @@
-# Native C++ REPL
+# Native C++17 REPL
 
 For runnable examples of structs/classes, strings, optionals, sequence
 containers, maps, sets and nested containers, see
@@ -11,8 +11,10 @@ Interpreter. Python is not required to run the console.
 
 ## Build
 
-The console, controller, generated RPC bindings and command parser are built
-with the project C++23 toolchain. Build the client alone on Linux or macOS:
+The new console, its controller, generated RPC bindings and command parser are
+compiled as C++17. The `c++17` base branch still selects C++20 for the existing
+backend; the REPL does not inherit that requirement. Build the client alone on
+Linux or macOS:
 
 ```sh
 cmake -S . -B build-repl -G Ninja -DTRACER_REPL_ONLY=ON \
@@ -56,6 +58,145 @@ standard-library include roots. Installing the client alone does not install a
 Linux server or agent.
 
 
+## Live code replacement on Linux x86-64
+
+Use `%live preview FILE...` to inspect the exact native entries. `%live update FILE...`
+previews the same saved snapshot and automatically applies an admitted group.
+`%live status` lists active entries. `%live revert` restores the parent revision,
+and `%live revert 0` restores the build's original entries. Run
+`%live watch source/checkout.cpp source/pricer.cpp` to preview and apply saved
+edits as you test. Press Ctrl-C to return to the prompt.
+
+At build time preserve the original project files under a separate snapshot root.
+Record their relative paths and SHA-256 hashes alongside the executable and exact
+compilation database hashes in `clang-tracer-live.textproto`. Example shape:
+
+```textproto
+source_root: "/project/src"
+snapshot_root: "/project/live-build-snapshot"
+module: "/project/build/app"
+module_sha256: "<SHA-256 of app>"
+compilation_database_sha256: "<SHA-256 of compile_commands.json>"
+inputs { path: "app.cpp" sha256: "<SHA-256 of original app.cpp>" }
+inputs { path: "pricing.hpp" sha256: "<SHA-256 of original pricing.hpp>" }
+```
+
+Build affected units with debug information, `-O0 -fno-inline`,
+`-fpatchable-function-entry=16,0` and a GNU ELF build ID. The manifest must
+cover project dependencies. A new translation unit uses its recorded compile
+profile or inherits the common profile when the original units share one.
+The REPL can select the database and manifest using `--compdb FILE` and
+`--build FILE`.
+
+The initial profile admits exact symbols in the main executable and checks
+the original entry padding, source signature and lowered ABI before changing
+text. Related entries need a drained stack or the managed registry gate.
+Each submission publishes as a single group. When preview reports a blocker,
+submit independent edits separately. Optimized targets and automatic
+partitioning into independently publishable groups require further coverage
+verification.
+The ABI check covers SysV variadic bodies, fixed-argument Win64 bodies,
+non-trivial returns, and compiler-emitted lifecycle variants. An unresolved
+thunk, unproven alias, or missing call coverage requires a rebuild. Revisions
+keep JIT code mapped for escaped pointers and active calls.
+`--retention-limit N` sets the maximum number of retained JIT generations,
+including reverted generations. Reconnect to the same server to inspect
+the active revision.
+
+Empty string literals and function-local literal arrays can change with
+their code. A replacement that would expose a different address for a
+compiler-generated constant requires a rebuild. Changes to existing static
+storage or record ABI require a rebuild or a managed migration. The ABI check
+includes changes to copy, move, and destruction triviality.
+Translation-unit-local functions and data require an unambiguous ELF file
+marker and exact symbol. Live replacements use a patchable native entry.
+A body-only edit to an existing
+lambda can update already-registered callbacks when its source identity and
+capture ABI match the native entry, including which variables it captures
+and their order. A live update can replace a lambda and its private template
+instantiations together when every call stays within the enclosing function.
+If adding or removing a lambda shifts an existing capture layout to a
+different compiler symbol, the update must identify the closure at both positions.
+Changes to an escaping lambda with unverified identity or captures require
+a rebuild. The lifetime check can be inconclusive for calls through
+`std::function`, `std::ref`, range adaptors, and C callbacks.
+When a recorded unit initialized the
+standard streams, replacement units can reuse them. Existing native storage
+keeps its verified initialization and destruction code. Changes to module
+initialization or destruction require a rebuild. Native updates can use
+symbols exported by standard Linux runtime libraries in the target, including
+definitions interposed in its dynamic lookup scope.
+
+`--payload-limit BYTES` sets the maximum serialized source and dependency
+snapshot sent to the target for a live operation. The default is 16 MiB.
+The REPL does not impose an additional outgoing RPC size ceiling. Apply can reuse
+the preview's plan for the same input and revision after rechecking the
+saved files and executable mappings. Set `CLANG_TRACER_LIVE_COMPILE_JOBS`
+in the server environment to choose how many translation units it compiles
+concurrently. The default is half the reported hardware threads, rounded
+down with a minimum of one. Large submissions and a busy host may need a
+longer REPL `--timeout`.
+
+```text
+%live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
+%live update-data shared.cpp --discover-file discover.cpp --discover-function discover
+%live scan-heap --type example::Cache --type example::Account
+%live update update.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Live mocks use exact signatures, with source-style or demangled qualifiers.
+`--bind "ALIAS=SIGNATURE"` binds a verified
+application callable. `ctx.original(...)` calls the unmocked implementation,
+including any active live update. Replacing a mock preserves that underlying
+implementation. A direct source edit to a mocked callable replaces the mock
+and reports this in the candidate row. Restoring an omitted callable to its
+built body restores that body behind an installed mock. Use `--recursion original`
+to route recursive calls through it. `%live revert` restores the previous dispatch.
+
+Object callbacks use a discovery function with `clang_tracer::ObjectSink`
+from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed
+pointers, or per-type reference overloads. Discovery supplies each object's
+existing owner or guarded borrow. Heap scans report candidates and their
+evidence. With libstdc++ and matching DWARF, the scanner also discovers static
+`std::atomic<std::shared_ptr<T>>` roots and atomically loads their owners.
+Automatic discovery admits recognized `make_shared` storage for the exact
+pointee. Other owners can use an explicit discovery callback. For a write
+using `--from-scan ID ...`, the updater reacquires each candidate's original
+owner. Heap addresses with unknown ownership remain read-only.
+For `%live update-data`, `--module MODULE` filters against the build
+manifest's verified ELF. A different mapped module is rejected before
+the callback runs.
+
+Managed migration requires application storage using
+`<tracer/live_migration.hpp>` and an exported
+`extern "C" tracer::live::managed::Registry* clang_tracer_managed_registry_v1() noexcept`.
+Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
+after hook in its own file if needed. Use `%live update update.hpp --managed true`
+for a recipe with no hook. Include ABI-compatible application source changes
+and any new layout headers with the recipe to publish them together.
+Recipe and hook files can live outside the recorded source root. An
+application dependency outside that root requires a rebuild to update it.
+The hook may return `void` or `bool` and supports C++17.
+
+```text
+%live update update.hpp cache_code.cpp state_v2.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Acquire the registry gate in a stable caller before entering a function that
+will be replaced alongside the managed state. Pass the caller's
+`Registry::Access` into the replaceable function. The tool drains managed access,
+installs the verified native entries, and runs the hook against the migrated
+instances before releasing access.
+If the hook fails, the tool restores the prior entries and state under the
+same gate.
+
+If a managed publication reports `RESTORATION_REQUIRED`, run
+`%live recover` in the same server session. Recovery reconciles any pending
+result and restores verified entry bytes when necessary. The registry stays
+gated if any overwrite window contains bytes outside the two verified
+versions. A target stopped after an unverified native rollback, or a target
+whose server session was lost, requires external recovery.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.
@@ -86,7 +227,10 @@ When `--module` is omitted, it uses the ELF path recorded in the index.
 
 List commands accept glob filters, `--format json`, and optional
 `--limit N` and `--page TOKEN`. Use the full C++ signature to select an
-overload, or `--id ID` when a name is ambiguous. The index preserves missing
+overload, or `--id ID` when a name is ambiguous. Symbols that share one address
+and kind (the `C1` and `C2` constructors of a class, folded or aliased
+functions) are one callable, so a lookup by name returns the one with debug
+information instead of reporting `ambiguous_symbol`. The index preserves missing
 type and layout information. Symbols with incomplete signatures can still be
 looked up. Supported indexed signatures use scalar, pointer and borrowed
 reference parameters and results. The generated `views.hpp` contains read-only
@@ -164,6 +308,55 @@ to attach only when the PID still has the displayed start time.
 Remote process enumeration is not in the service API, so remote attach uses an
 explicit PID.
 
+### Launch a local application
+
+Build the application with the installed C++17 `<tracer/launch.hpp>` header and add
+a checkpoint at the start of `main`, before starting threads or calling the
+code you want to trace. It returns immediately on an ordinary run. Treat a
+failed checkpoint as a startup failure.
+
+```cpp
+#include <tracer/launch.hpp>
+
+int main() {
+  if (!tracer::launch::wait_for_resume())
+    return 125;
+  return run_application();
+}
+```
+
+Use these commands in the native REPL on Linux x86-64. With the REPL's private
+server, only that server may attach to the launched application. With any other
+endpoint, including `CLANG_TRACER_ENDPOINT`, the server must run on the same
+host as the REPL, and the launched application accepts any tracer the host's
+tracing policy allows.
+`%launch` selects the attached session and holds the application at the
+checkpoint while you install probes.
+
+```text
+%launch ./app --arg "example input" --env MODE=test --cwd ./work --stdin ./input.txt --timeout 5
+%probe inject "app::start()" --callback observer.cpp
+%resume
+%terminate
+```
+
+The earliest traceable work is the first eligible call after the checkpoint.
+The loader, global constructors, and any earlier application code have already
+run. Repeat `--arg` for arguments and `--env NAME=VALUE` for overrides to the
+inherited environment. Relative paths are resolved from the REPL's working
+directory. Standard input defaults to `/dev/null`. Use `--stdout NEW_FILE`
+and `--stderr NEW_FILE` to choose output files. The REPL reports the paths and
+otherwise creates private log files. Existing files are protected from overwrite.
+
+`--timeout` bounds the wait for the checkpoint in seconds. It defaults to
+the REPL timeout, which also applies separately to attach. Setup or attach
+failure and readiness timeout terminate and reap the child. `%resume [PID]`
+and `%terminate [PID]` use the selected target when PID is omitted.
+`%terminate` kills and reaps the launched child whether paused or resumed.
+The REPL retains ownership after detach and terminates any remaining owned
+children on exit. Use `%status` to list owned targets and reap any that have
+already exited. Only the launched process is managed.
+
 If an attach reply fails or times out, the operation may still finish on the
 server. The console reports the endpoint, PID and newly observed candidate
 session IDs, blocks automatic retries for that PID, and reconciles again on
@@ -171,19 +364,84 @@ session IDs, blocks automatic retries for that PID, and reconciles again on
 appropriate. Candidates are never assumed to belong to this console on an
 external server; recovery information is retained until explicitly resolved.
 
+### Call a registered function in the paused target
+
+Register each callable at the startup checkpoint. The application compiler
+checks the function pointer's argument and result types. The name is an exact
+match to the name you register and can distinguish overloads.
+
+```cpp
+#include <tracer/launch.hpp>
+
+double scale(int value, double factor) { return value * factor; }
+
+int main() {
+  using tracer::launch::named_call;
+  if (!tracer::launch::wait_for_resume(named_call("app::scale", &scale)))
+    return 125;
+  // Continue normal application startup.
+}
+```
+
+```text
+%launch ./app
+%call app::scale --arg 6 --arg 1.5
+%resume
+```
+
+The result line shows the type and value, such as `type=double value=9`.
+Registered functions accept up to eight arguments drawn from `bool`,
+32-bit and 64-bit signed and unsigned integers, `float`, and `double`.
+The same types and `void` are available for results. Enter decimal integers,
+finite decimal floating-point values, and `true` or `false`. Wrong argument
+counts and invalid values are rejected before execution. Pointers, references,
+objects, variadic functions, and functions with an implicit receiver are
+outside this interface.
+
+Calls run one at a time on the thread that entered the checkpoint, before
+`%resume`. Choose functions that are ready to run at that point in startup.
+Their side effects remain in the target, and an escaping C++ exception is
+reported as a failed call. Returned scalars are copied into the REPL's reply.
+Calls require a target launched by this REPL with a registered checkpoint.
+
+Use `--timeout SECONDS` to bound how long the REPL waits. Timeout or
+interruption leaves the call pending and it may continue running. Use
+`%call-result [--timeout SECONDS]` to collect its reply. A pending call
+blocks another call, resume, or probe changes on that target.
+`%terminate` still kills the owned target if it cannot finish.
+
 ## Browse a local C++ target
 
 ```text
 %threads
-%modules --details
+%modules --filter libdemo.so --details
 %symbols --filter Calculator --addresses
 %symbols --address 0xADDRESS --mapping TOKEN
 ```
 
 `%threads` shows thread IDs, names and start times for the selected process.
-`%modules` lists application module paths. Add `--details` for file-backed
-executable address ranges, file offsets, device and inode, and the ELF build
-ID when the backing file can be verified.
+`%modules` lists application module paths from the selected attached process.
+`--filter TEXT` matches a case-sensitive substring of the full path. Add
+`--details` for file-backed executable address ranges, file offsets, device
+and inode, and the ELF build ID when the backing file can be verified. The
+mapping token describes the session's full snapshot, including when the
+display is filtered.
+
+Use the C++ API at the prompt or in a REPL script.
+
+```cpp
+auto paths = tracer.modules("libdemo.so");
+auto module = tracer.module_info(paths.at(0));
+for (const auto& entry : module.mappings) { std::cout << entry.begin_address << ' ' << entry.build_id << '\n'; }
+```
+
+Call `tracer.modules()` to list all application module paths. Its `ModuleList`
+result supports iteration, `size()`, `empty()`, and `at()`. The paths are
+also available as a vector in `.paths`. Pass an exact path from the list or a
+unique exact filename to `tracer.module_info()`.
+Missing or ambiguous names throw `std::invalid_argument`. The result includes
+`path`, `mapping_token`, and `mappings`. Each mapping has `begin_address`,
+exclusive `end_address`, `file_offset`, `device`, `inode`, and `build_id`.
 
 `%symbols --addresses` shows runtime and ELF entries for supported C++ callables
 when there is a unique verified mapping. For reverse lookup, copy a runtime
@@ -192,6 +450,59 @@ supported callable also work. If the mappings or backing files change, take a
 new snapshot before using an address. The token checks observed mapping
 identity. An unload and reload of the same image at the same address between
 snapshots can produce identical observations.
+
+## Capture local syscalls or CPU samples
+
+Attach to a running Linux x86-64 target using the REPL's own local server,
+then choose a capture:
+
+```text
+%syscalls --timeout 2 --count 256
+%sample cpu --timeout 2 --count 256
+```
+
+`%syscalls` reports separate entry and exit records with the syscall number
+and the raw kernel return value on exit. `%sample cpu` reports user-space
+instruction addresses at roughly one sample per 10 ms of scheduled CPU time.
+Each record carries the process ID, thread ID, and a monotonic nanosecond
+timestamp on the same clock as probe events. Use a current mapping snapshot
+and `%symbols --address` to look up a sample address.
+
+Each capture snapshots and verifies up to 64 existing target threads.
+Threads created after that snapshot and child processes are outside the
+capture. The command releases its kernel resources before printing records
+in timestamp order. It stops on timeout, the record limit, Ctrl+C, or the
+exit of all monitored threads. The defaults are two seconds and 256 records,
+with ceilings of 60 seconds and 8192 records.
+
+The summary reports kernel loss, throttle notifications, and samples
+discarded at the requested limit separately. Kernels with a perf loss counter
+include loss still pending at shutdown. On older kernels, `loss_accounting=records`
+counts loss notifications the kernel wrote to the ring. Collection boundaries,
+loss, and the record limit can leave individual syscall entries or exits
+without a partner. These pilot records are printed by their capture command.
+
+Syscall capture reads the raw syscall tracepoint IDs and formats from tracefs
+and opens the events through perf for each target thread. It needs tracefs
+read access and permission to open those events. CPU sampling uses a user-space
+perf task-clock event and can work under a policy that denies syscall tracing.
+Both modes report permission failures directly. Perf events allow the target
+threads to continue running. A syscall-stop backend based on ptrace would stop
+them at each syscall boundary and compete with the injector for ptrace ownership.
+[Linux event tracing](https://docs.kernel.org/trace/events.html) ·
+[Perf permissions](https://docs.kernel.org/admin-guide/perf-security.html) ·
+[perf_event_open](https://man7.org/linux/man-pages/man2/perf_event_open.2.html) ·
+[ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
+
+The syscall integration test accepts an optional CMake
+`TRACER_SYSCALL_TEST_LAUNCHER` path. `tests/perf_test_launcher.c` provides a Linux
+launcher that keeps the calling user's UID and carries only `CAP_PERFMON` into
+the test and its children. Install it root-owned, executable only by the intended
+user/group, with `cap_perfmon=ep`. That group also needs traversal of tracefs and
+read access to `events/raw_syscalls/{sys_enter,sys_exit}/{id,format}`; no trace
+control write access is needed. This allows ordinary CTest execution without
+sudo or lowering `kernel.perf_event_paranoid`. The default test command is
+unchanged when no launcher is configured.
 
 ## Preview a bulk trace
 
@@ -216,9 +527,51 @@ concrete virtual implementation that needs a compatible prepared package.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with `--module`.
 
-The capacity line shows retained slots and whether the DWARF-supported
-selection fits. It is a snapshot and reserves no slots. The preview runs
-without installing probes, stopping target threads or executing code inside
+Several symbols can name the same code: an explicit alias, functions that the
+linker folded (identical code folding), or the identical `C1` and `C2`
+constructor bodies. When selected symbols share one runtime entry, the preview
+picks the first `DWARF_SUPPORTED` one (in selector order) as the primary and
+reports each other name as `ALIAS` with `reason="alias of <primary symbol>"`.
+Rows show `symbol=` so the names can be told apart. One probe on the entry
+observes every name, so aliases are not ambiguous and get no probe of their own. Select
+the primary together with its aliases; an alias alone has no DWARF description
+of its own and stays `UNSUPPORTED` in a bulk selection. Symbols at one entry
+without a `DWARF_SUPPORTED` primary stay `AMBIGUOUS`. `%probe inject` accepts
+an alias by its demangled signature or by its mangled linkage name (for example
+`_ZNK4demo4Twin7aliasedEi`) and binds it to the DWARF subprogram at the same
+address, so the probe sits on the shared entry and sees calls through every
+name. A symbol that owns a subprogram of its own, as linker-folded functions do,
+keeps that description.
+
+Sharing code does not prove that two names have compatible typed contracts.
+The preview checks every concrete DWARF description at a selected entry,
+including names outside the selection. Different argument or result types,
+receiver or object layouts, or unsupported peer descriptions make the entry
+`AMBIGUOUS` with an incompatible-ABI diagnostic. Bulk apply and single-probe
+injection refuse the entry before modifying code. Prepared injection performs
+the same check when matching DWARF is available; packages remain usable without
+DWARF. This check conservatively requires matching complete typed descriptions,
+not merely identical instructions or register assignments.
+
+The capacity line reports retained probes and `limit=unlimited`. Probe storage
+grows as needed; allocation can still fail when process resources are exhausted.
+
+Sessions, snapshot-watch method lists, shared-context hook registrations,
+invocation bookkeeping, probe arguments, and named callback values use growing
+storage. Callback source, compiler metadata, plugins, and prepared packages have
+no separate application size ceiling; transport representation and allocation
+failures still apply. Native event and callback-log queues grow with pending
+work. Large native events use sealed file descriptors instead of truncating to
+the inline datagram threshold. Log messages are not shortened to 192 bytes.
+
+Existing configurable budgets and their defaults are unchanged: snapshot
+sizes/depths, history and REPL retention, shared-context transport memory,
+operation timeouts, and memory read/scan requests retain their settings.
+Growing queues may use more memory when consumers are slow. Allocation,
+transport, and callback failures still report through existing diagnostics.
+The native bootstrap is version 33; update the server and agent together.
+
+The preview runs without installing probes, stopping target threads or executing code inside
 the target. `--save` creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.
 
@@ -233,17 +586,80 @@ rules. Reusing it resolves against the current session and mappings.
 Apply re-resolves the manifest against the selected session. The default
 Clang JIT observer records typed PRE and POST events. With `--callback`, the
 same C++ source is compiled for each matched function. Every match must be
-DWARF-supported and fit in the available retained slots. Ambiguous or
+DWARF-supported. There is no fixed probe-count limit. Ambiguous or
 unmatched selections, entries requiring prepared packages, and entries with
-active probes block installation.
+active probes block installation. An `ALIAS` row gets no probe of its own: apply installs
+one probe on the primary and reports the alias as `ALIASED` with that probe, so
+calls through any of the names produce events. The events carry the primary's
+selector, because the entry cannot tell which name the caller used.
 
 The REPL prints the batch ID before applying and reports the status of each
-entry. If an install fails, the server restores this batch's probes in
-reverse order. Use the same batch ID with `%trace remove` to retry entries
-reported as `RESTORE_PENDING` or to check a batch after an interrupted
-command. Removal is repeatable for a retained batch in its original session.
+entry. Apply has a 120-second default deadline. Starting the REPL with
+`--timeout SECONDS` overrides it. If installation fails or is cancelled, the
+server restores this batch's probes in reverse order. If apply loses its reply
+after a timeout or interruption, the REPL uses a separate deadline to confirm
+restoration or retry it. Use the same batch ID with `%trace remove` to retry
+any pending restoration. Removal is repeatable for a retained batch in its
+original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.
+
+## Observe constructors and destructors
+
+Constructors and destructors are ordinary callables with several entry points.
+The Itanium ABI gives one source constructor a complete-object entry (`C1`) and
+a base-object entry (`C2`), and one destructor a complete-object (`D1`),
+base-object (`D2`) and deleting (`D0`) entry. A compiler often emits one body
+for both names (aliases at one address). A class with virtual bases needs
+distinct code: its base-object entries receive a hidden second argument, the
+VTT pointer, and `delete` through a base pointer reaches `D0` through a virtual
+thunk.
+
+```text
+%probe inject "app::Account::Account(int)"
+%probe inject _ZN3app4LeafC1Ei
+%probe inject _ZN3app4LeafD0Ev
+%trace preview --include 'app::Leaf::*'
+```
+
+On the DWARF path a selector that names one entry point installs like any
+other callable. When one declaration has several entry points at different
+addresses the selector is ambiguous and the error lists each entry point with
+its linkage symbol (`void app::Leaf::Leaf(int) [_ZN3app4LeafC1Ei]`). Pass that
+symbol as the selector to probe exactly that entry point. Naming the other
+variant of an aliased pair (for example `C1` when DWARF describes the shared
+body as `C2`) selects the same code. Every variant can be probed this way,
+including `D0` for a destructor reached through a base pointer.
+
+The hidden VTT pointer is a real register argument. Events show it ahead of the
+declared arguments (`__vtt_parm=0x401810, x=35` with GCC, `vtt` with Clang) so
+`Call::argument<N>()` keeps the machine argument order, but it is not part of
+the selector. Nested construction fires one PRE/POST pair per level for one
+object: `Leaf::Leaf` (`C1`) calls `Mid::Mid` (`C2`), which calls
+`VBase::VBase` (`C2`).
+
+`%trace preview` reports a selector with several entry points as one
+`DWARF_SUPPORTED` row each (`reason="constructor/destructor variant SYMBOL"`),
+and one row for names that share a body. `%trace apply` installs one probe per
+row and tells the rows apart with `reason="constructor/destructor entry SYMBOL"`.
+A virtual destructor is concrete here, so it is not `PREPARED_REQUIRED`.
+
+A prepared package binds the complete-object entry point (`C1` or `D1`) of the
+C++ selector, the one called for a most-derived object, and spells constructors
+without a return type. A constructor or destructor of a class template is
+selected from an explicit instantiation, for example
+`%probe prepare "app::Box<int>::Box(int)" --include box.hpp`. The receiver of a
+constructor is raw storage on entry, so the built-in receiver snapshot is taken
+when the constructor returns (`receiver_sampled_at_return`) and there is none in
+the PRE event. The deleting destructor (`D0`) and the base-object entries
+(`C2`/`D2`) cannot be called from source; preparing a linkage symbol for one is
+refused with a message that points to `%probe inject SYMBOL` on the DWARF path.
+`%probe prepare ... --signature ... --member` accepts a constructor or
+destructor from ELF symbols; two names for the same code are one callable and
+entry points at different addresses stay ambiguous.
+
+Constructors and destructors that the compiler inlined have no symbol and
+cannot be observed.
 
 ## Read and scan mapped memory
 
@@ -272,7 +688,7 @@ The target keeps running during inspection, so bytes can change while
 they are copied. An unmap and remap with identical visible metadata between
 checks can produce the same snapshot.
 
-Scans accept 1 to 1048576 bytes and patterns of 1 to 256 bytes. Separate hex
+Scans accept 1 to 1048576 bytes and nonempty patterns. Separate hex
 bytes with spaces. Use `??` for an entire wildcard byte, or `8?` or `?f`
 for a wildcard nibble. To choose individual bits, append a colon and a
 same-length hex mask, as in `"13 37 : 1f ff"`. A bit participates only
@@ -335,9 +751,103 @@ stays in place and selects the trap path. The trap owns execution control for it
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.
 
+## Register a C++ type for object probing
+
+`%object-probe` prepares a package, binds it to a Linux x86-64 process,
+and controls its admitted lifetime hooks and typed method observers under one
+registration ID. The target's ELF remains on disk and the tracer verifies live
+patch windows before activation.
+
+Prepare without an executable or an attachment. Pass the original header,
+compilation database and translation unit and select each exact method with
+`--method`. The package embeds the callback source and prepared method
+adapters. For example, an interceptor for a `Counter` method can use the
+registered lifetime ID alongside its ordinary call ID.
+
+```cpp
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  long long pre(const Call& call) {
+    return static_cast<long long>(call.object_id());
+  }
+  long long post(const Call& call) {
+    return static_cast<long long>(call.object_generation());
+  }
+};
+```
+
+```text
+%object-probe prepare demo::Counter --include ./counter.hpp --compdb ./compile_commands.json --translation-unit ./counter.cpp --method "demo::Counter::add(int)" --callbacks ./callbacks.cpp --output ./counter.object
+%attach PID
+%object-probe preview --package ./counter.object
+%object-probe start --package ./counter.object
+%object-probe status REGISTRATION_ID
+%object-probe stop REGISTRATION_ID
+```
+
+The preview shows verified lifecycle and method patch windows. A method-only
+package can use the attached process's uniquely mapped method image. Use
+`--method-module` to disambiguate. Start revalidates the binding, stages the
+patches, and admits callbacks only after publication. Record lifetime and write events with `%record --probe
+REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
+PRE and POST events. Callback failures record the call ID and phase.
+Use `--callback-errors only` or `--callback-errors exclude` with `%collect`,
+`%record`, or `%events open`. C++ analysis can read
+`Event::callback_error()` and `Event::callback_error_message()`.
+Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.
+
+For individual writes, prepare a field and its writer. Omit `--code` to use
+writer discovery from the original compilation database. When the writer is
+already known, select it explicitly and use `--dwarf-writers` for a write-only
+package prepared without a compilation database.
+
+```text
+%object-probe prepare demo::Counter --field value --code "demo::Counter::set(int)" --dwarf-writers --output ./writes.object
+%object-probe preview --package ./writes.object
+%object-probe start --package ./writes.object
+```
+
+For a writer in an attached shared library, pass its mapped name with
+`--module`. `--follow-calls` is available for write-only packages.
+Use `--first-seen` with a write-only package and a standalone executable writer. Follow the
+coverage counts in status when the writer reaches native callees. A combined
+registration requires disjoint method and writer patch windows. A verified
+identity requires evidence that the constructor built a complete object and
+that the watch covers its destruction. Evidence can come from a distinct
+complete-constructor entry, a verified caller outside constructors and destructors,
+or a call through a verified PLT entry for the complete-constructor symbol.
+Caller proof for a shared constructor entry relies on debug information that
+describes inlined construction. `__attribute__((nodebug))`,
+`-gno-inline-line-tables`, or link-time inlining from a unit without debug
+information can hide an initializer and make base-subobject construction
+appear complete.
+An incomplete application type in the caller's debug information can leave
+identity provisional, including when a pointer could refer to a derived heap
+object. For application classes, caller proof ignores standard C++ library
+records whose DWARF shows only built-in or standard-library template arguments.
+It also ignores pointers and references to the glibc records for `FILE`, `tm`
+and `DIR`. Incomplete template argument information keeps identity provisional.
+A receiver can have provisional identity when construction predates attach
+or bypasses a watched constructor, as with a trivial copy. Ambiguous
+construction, duplicate lifetime symbols and incomplete destructor coverage
+can also leave identity provisional. Its callback reports
+`identity_verified() == false` with zero object ID and generation. An observed
+destructor in a registration with methods can report zero-ID teardown for a
+receiver already observed with provisional identity at the same address.
+Duplicate lifetime checks use the application mappings present at binding.
+An unreadable mapped application file leaves coverage incomplete. A fresh
+binding evaluates libraries the target loaded later.
+Live method and code-cache events arrive independently. JSON export orders
+each grouped registration's retained events by monotonic observation time.
+The event sequence remains the server's arrival cursor. Correlate verified
+observations by registration, object ID and generation.
+Choose a fresh output path for each preparation.
+
 ## Trace object lifetimes and state in a prebuilt binary
 
 Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.
+
+On `c++17`, use that branch's preparation tools to generate typed adapters and object watch plans from the existing binary and its original compile commands. Regenerate typed adapters created on `main` before preparing a watch on `c++17`.
 
 The plan records the capture mode you select during preparation.
 
@@ -383,6 +893,23 @@ Replace `WATCH_ID` with the ID printed by start. While `%record` is waiting, ent
 
 Stop restores the verified instruction bytes. Check `active=no` and `restoration_pending=no` before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter `q` in the first terminal to exit the fixture. To repeat with `--no-values`, restart the fixture, reuse the write plan, add the flag to `%object start`, and use a fresh recording path. The two events are still creation and a store, with the store shown as `FIELD_WRITTEN`.
 
+For a writer in a shared library, prepare against both the main executable and
+the library that contains the writer. A lone `--module` path that names a shared
+object is not an executable and is rejected. For example:
+
+```text
+%object prepare demo::Record --executable ./build/app --module ./build/libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output ./record-watch
+```
+
+Use the same `--module` when starting or previewing the plan if the mapped
+library has a different path. Without `--module`, writer lookup first checks
+the main executable; if the writer is found in exactly one mapped shared ELF,
+the error names that module and the option to use. Shared writers with calls
+need `--follow-calls`; the diagnostic names the selected module and the flag.
+Call following is available only for standalone writes: it cannot be combined
+with owner or collection scopes, `--caller`, `--writer-entry`, or `--first-seen`
+unless first-seen has a supported structured value layout.
+
 ### Read coverage and cleanup status
 
 - Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
@@ -392,7 +919,7 @@ Stop restores the verified instruction bytes. Check `active=no` and `restoration
 - Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.
 - When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.
 - On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.
-- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.
+- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding uses a verified integral or enum discriminator and declared cases. Untagged union stores retain the overlapping bytes.
 - Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.
 - Use `%object status` to check drops, unsupported sites, coverage gaps, and capture limits. Use `%object stop` or `%detach` to retire the watch and restore patches. See the [verification record](../object-watch-progress.md) for the exercised cases and limits.
 
@@ -593,22 +1120,17 @@ The diagnostic backend steps the complete instruction, including LOCK.
 At detach it restores the full original bytes and rewinds any owned trap
 that has yet to execute.
 
-## Decode a tagged union write
+## Trace individual writes to a nested union
 
-Pass `--union-tag FIELD` and a `--union-case TAG=MEMBER` for each admitted
-alternative. Use a direct member path such as `--field payload.integer`
-to identify the four-byte storage, and declare `--synchronization thread-confined`
-or `caller-lock` to protect the tag and storage during both samples.
+Select the union itself with a path such as `--field envelope.state.payload`. A path through one of its alternatives resolves to the enclosing union storage. The plan verifies the full extent from DWARF. An untagged watch records only the affected bytes at each original store instruction and leaves the active member unknown.
+
+For a tagged union, supply `--union-tag FIELD`, a `--union-case TAG=MEMBER` for each known alternative, and `--synchronization thread-confined` or `caller-lock`. Use a verified nonoverlapping 8-, 16-, 32- or 64-bit integral or enum tag. Within a vector entry, map value or pointee, specify the tag relative to that entry, value or pointee.
 
 ```text
-%object prepare tagged_test::State --module ./fixture --field payload.integer --code _ZN11tagged_test10write_bitsERNS_5StateEj --union-tag kind --union-case 1=integer --union-case 2=real --synchronization thread-confined --backend code-cache --output watch
+%object prepare union_test::Cell --module ./fixture --field envelope.state.payload --code "union_test::Cell::tagged()" --union-tag envelope.state.kind --union-case 4294967297=number --union-case 4294967298=real --first-seen --synchronization thread-confined --backend code-cache --output watch
 ```
 
-The plan checks the tag offset and each alternative against DWARF. A tag
-can be an unsigned 32-bit field or an enum with that underlying type.
-Signed integers, unsigned integers, and floats are supported as 32-bit
-alternatives. Unknown or unreadable tags retain raw storage bytes.
-`--no-values` skips both the discriminator and storage reads.
+A mapped case can name a record alternative, or a typed leaf such as `wide.last`. When a store touches a supported numeric, enum or bool member under a stable tag, replay includes the typed sample and the affected bytes. Record and array alternatives keep their member name and affected bytes. Unknown or unreadable tags retain bytes without a typed sample. A discriminator store records the switch. After a switch, the next full write to the new scalar exposes its new value, and subsequent writes can pair both values. Replay includes the full tag in `storageWrite`. `--no-values` retains the store and affected range while skipping value reads. Existing four-byte member watches retain their event format.
 
 ## Trace writes in the native code cache
 
@@ -632,7 +1154,9 @@ window. Short leaves can use verified alignment padding. A symbol export
 alone allows a fallback to direct call sites when no entry window verifies.
 Preview and status report partial coverage for direct call sites alone.
 For a shared writer, `--module` takes a unique mapped ELF basename or
-absolute path. A shared leaf that uses an entry redirect needs a verified
+absolute path. A shared writer containing calls requires `--follow-calls`;
+otherwise code-cache setup rejects it before translating the writer and tells
+you which module and flag to use. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
 Native watches capture virtual destruction at the destructor entry, including
 deleting destructors that inline the complete destructor. A watch fails to
@@ -733,6 +1257,23 @@ watched address and lifetime even when the callee receives it through an
 alias. Replayed stores include the mapped ELF identity and the runtime
 module generation. A shared library can load after arming and unload
 between calls.
+
+On x86-64, a verified PLT stub can lead to a leaf translation in any bound ELF.
+In-place redirects for a nonleaf callee reached through a PLT call are limited
+to the ELF that owns that PLT stub and the process executable. Nonleaf callees
+with dynamically exported weak symbols run natively to keep process-wide
+runtime entry points safe for the tracer and other callers. These scope limits
+produce explicit coverage gaps. An unbound lazy PLT
+slot also runs natively and produces one explicit gap for that slot while the
+loader binds it; subsequent calls use the current GOT target. These lazy-binding
+gaps have their own diagnostic. Other dispatch gaps are reported once per call
+site and reason. `runtime_gap_hits` tracks every occurrence, and
+`helper_reentries` counts tracer-internal traffic. On AArch64, PLT stubs that
+cannot be translated produce coverage gaps.
+
+On x86-64, an entry redirect requires a verified five-byte nonfaulting patch
+window. A trivial one-store constructor in a library can have a shorter entry,
+which prevents the watch from starting.
 
 Use `--runtime-limit N` to bound nested scope discovery and retained translations. The default is
 1,024. When a callee exceeds the limit or its code cannot be verified and
@@ -861,6 +1402,16 @@ the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
 
+For non-prepared probes using `--include` with a compilation database, the
+selected command's compiler options now apply to the callback as well as the
+header. This includes warning policies: a legacy callback that previously
+compiled may fail with donor flags such as `-Wextra -Werror` if it has an unused
+parameter. Omit an unused parameter's name (`const TraceContext&`) or explicitly
+use it (`(void)context;`). To relax that specific policy for a probe, append
+`--compile-option -Wno-error=unused-parameter`; explicit options follow the
+database options. Generated interpreter initialization does not change the
+callback's warning policy.
+
 ### Probe working directory
 
 Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.
@@ -935,13 +1486,64 @@ observer in place. Cancellation is checked up to the entry switch. Use
 The entry switches directly to the new wrapper. Calls that already entered
 the previous wrapper finish there, with both PRE and POST tagged by the
 previous probe ID. A successful reload reports the new ID and retained
-capacity. The 32-slot process limit includes retired wrappers, which stay
-resident for safe late arrivals. Remove the active generation to restore the
-original entry. Removing a superseded generation drains it while leaving the
+count. There is no fixed probe-count limit; retired wrappers stay
+resident for safe late arrivals, so repeated reloads consume memory. Remove the
+active generation to restore the original entry. Removing a superseded generation drains it while leaving the
 successor in place. Detach drains all generations.
 
 Borrow target pointers and references only during the callback. Use owned
 snapshots for REPL inspection and replay.
+
+### Opt in to scalar overrides
+
+Mark an eligible free-function definition in the application and build it with
+Clang and DWARF. The marker declares the ordinary Linux x86-64 SysV ABI.
+Use it on functions that follow the standard register preservation rules.
+The agent verifies the marked ELF section, mapped entry, calling convention,
+and complete scalar signature before installing a detour.
+
+```cpp
+#include <tracer/override_target.hpp>
+
+TRACER_SCALAR_OVERRIDE_TARGET int compute(int input) { return input * 2; }
+```
+
+In the callback, request an argument change in `pre()` or a return change in
+`post()`. Indexes start at zero.
+
+```cpp
+struct Interceptor {
+  void pre(const Call &call) {
+    if (call.arg<int>(0) == 10)
+      call.override_argument(0, 12);
+  }
+  void post(const Call &call) {
+    if (call.result<int>() == 24)
+      call.override_result(25);
+  }
+};
+```
+
+```text
+%probe validate "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+%probe inject "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+```
+
+Each flag enables only its corresponding hook operation. Overrides require a
+local Unix control socket and a DWARF binding. Use `--prepared-mode off` if a
+prepared package would otherwise be selected. Supported values are `bool`,
+signed 32- and 64-bit integers, unsigned 64-bit integers, `float`, and
+`double`. Match the slot's type and width exactly. A `void` function can use
+argument overrides.
+
+The original function runs with the committed arguments. An escaping hook
+exception discards its staged writes. An exception from the original function
+propagates to its caller without running `post()`. Overrides apply per call,
+including recursion, and preserve the original function's `errno` behavior.
+PRE events show the incoming arguments. POST events show the arguments used
+by the function and its original return value. Reload retains the permissions
+of the active generation. Removing the probe or detaching restores the
+function entry.
 
 ## Collect and inspect
 
@@ -951,7 +1553,7 @@ earlier variables, sessions and background collectors remain usable. Bare
 top-level void calls retain their optional trailing semicolon. Temporary
 collections can be inspected directly, including `live.snapshot().size()`.
 
-### Event ranges
+### C++17 event ranges
 
 Synchronous collection waits for the count, timeout (30 seconds by default),
 or Ctrl+C, then returns an iterable snapshot range:
@@ -964,23 +1566,28 @@ for (const auto &event : captured) tracer.print(event);
 Background collection returns immediately so the prompt remains usable:
 
 ```cpp
-auto live = tracer.events_async(session);
+auto live = tracer.events_async(session, 100, 10);
 // Enter other REPL commands while collection continues.
-for (const auto &event : live) tracer.print(event);
 auto data = live.snapshot();
+for (const auto &event : live) tracer.print(event);
 live.running();
 live.error();
 live.stop();
 ```
 
-Each loop visits a stable snapshot of currently retained events, without waiting
-for new arrivals or consuming them. Later loops can include the same events.
-`snapshot()` returns a `Collection` with received/evicted counters and completion,
+Iteration streams. Each loop starts at the oldest retained event, then waits
+for later ones and yields each as the agent sends it. The loop ends when the
+collector finishes (count, timeout, `stop()` or a stream error) or on Ctrl+C,
+which leaves the collector running. Iterating a finished range visits its
+retained events without waiting, and no loop consumes events, so later loops
+can include the same ones. A range with neither count nor timeout is iterated
+until Ctrl+C or `stop()`. `snapshot()` never waits; it returns a `Collection`
+of the currently retained events with received/evicted counters and completion,
 cancellation and timeout flags. Stream failures appear in `error()` in either
 mode; partial results remain inspectable. `events_async(session, 100, 10)` stops
 at 100 events or 10 seconds; zero count/timeout means no corresponding limit.
-Synchronous counts and timeouts must be positive. Both modes use the REPL
-collection API without requiring coroutines or standard-library ranges.
+Synchronous counts and timeouts must be positive. Both modes use C++17, without
+coroutines or C++20 ranges.
 
 A range reserves the remaining shared event-count and byte budget. While it is
 retained, another capture may have no room; release all copies of the range
@@ -995,7 +1602,7 @@ than calling the facade from user-created threads.
 Use `%help api EventRange` for the range API. Existing `tracer.collect(...)` and
 named collection commands retain their behavior.
 
-### Collection adaptors
+### C++17 collection adaptors
 
 Use `%help api adaptors` for an overview, or look up an individual operation
 with `%help api drop`, `%help api filter`, or any other adaptor name.
@@ -1053,10 +1660,12 @@ propagate on the foreground thread.
 
 Views own their input: lvalue collections are copied and temporaries are moved,
 so stored pipelines remain valid. An event-range view retains its collector
-handle and takes a fresh, non-consuming snapshot at each loop's start. Thus
-`live | take(10)` inspects up to ten **currently retained** events; it does not
-wait for ten new arrivals or limit background collection. Use
-`tracer.events_async(session, 10, 5)` to limit collection itself. Other C++ code
+handle and streams from the oldest retained event at each loop's start, without
+consuming events. Thus `live | take(10)` yields ten events, waiting for those
+that have not arrived yet, and returns as soon as the tenth is read; it does
+not limit background collection. Use `live.snapshot() | take(10)` to inspect
+only **currently retained** events, and `tracer.events_async(session, 10, 5)`
+to limit collection itself. Other C++ code
 can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 
 ### Console commands
@@ -1103,6 +1712,14 @@ first, so a corrupt recording cannot overwrite an existing capture.
 Detail inspection shows typed arguments/results, receiver fields, stack frames,
 and raw metadata. `%events stack NAME --index N` prints the capture status and
 each retained stack frame directly, including frames from replayed events.
+In C++, `event.stack()` returns an owned vector of frames in capture order.
+It is empty when the event has no stored frames.
+
+```cpp
+auto event = tracer.batch("batch").at(0);
+for (const auto& frame : event.stack()) { std::cout << frame.pc << ' ' << frame.function << '\n'; }
+```
+
 Shared-state payloads are decoded with their attached schema when available.
 Native PRE/POST pairing includes server lifetime, session,
 probe, thread and call identity, and marks missing halves. Shared-context
@@ -1139,7 +1756,7 @@ Agent and server loss counters are cumulative samples from retained events.
 They and local buffer evictions are reported separately from incomplete calls.
 
 By default, `%record` uses four-byte little-endian lengths and Protobuf
-TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
+TraceEvent frames, bounded by the Protobuf representation rather than a separate 32 MiB policy. Framed recording and export
 create new files exclusively. `%record FILE --sqlite` creates or appends to a
 SQLite recording and deduplicates events by server instance and sequence.
 Replay rejects truncated headers/bodies and invalid messages. A failed
@@ -1350,15 +1967,75 @@ implementation's `.cpp` with `--include` if its definition is in that file.
 For typed local decoding of a polymorphic snapshot, supply an `EventCodec<T>`
 for the value you want to construct.
 
-For source-prepared pointer and reference returns, Clang also discovers direct
-raw pointer members whose declared pointee is polymorphic and whose concrete
-derived layout is available from the supplied source. At return, a checked RTTI
-read selects the matching layout. A field such as `_imp` holds the original
-address and `_imp_snapshot` holds the copied fields of the live implementation.
-Null pointers, unreadable records, and unknown types remain address-only. The
-target must keep the pointee and its captured data live and stable through POST.
+For source-prepared probes, Clang also discovers the raw pointer and reference
+members of every captured record (arguments, receivers, and results, including
+members declared by public non-virtual bases) and follows them. A field such as
+`_imp` holds the original address and `_imp_snapshot` holds the copied fields
+of the live pointee; a reference member is captured the same way. For a
+polymorphic pointee the admitted layouts are the declared class, when it is
+concrete, and concrete derived classes available from the supplied source, and
+a checked RTTI read selects the matching layout. A non-polymorphic pointee is
+captured by its exact static type, so no policy is needed, provided everything
+the capture must read is checkable: scalars, enums, arrays, strings, `vector`,
+`array`, `optional`, `pair`, `tuple`, `variant`, smart pointers to such types,
+and records of those. A pointee holding anything else (`list`, `map`, `set`,
+`unordered_*`, `deque`, `std::any`, `std::function`, `weak_ptr`) is followed
+automatically only when it is polymorphic and its RTTI matches a derived class,
+or the declared class of an owner-held implementation pointer; otherwise it
+stays address-only unless a `FollowPointers` policy names it. Because there is
+no RTTI to check, only the pointer's alignment and the readability of the whole
+object are verified, and the target must keep the pointee valid and stable
+through POST. A `char` pointer is captured as a bounded (`--string-bytes`,
+longer text is truncated), readability-checked C string and a pointer to an
+arithmetic or enum value as one element; both are stored as `<field>_snapshot`.
+The same rules apply to the pointer and reference members of every captured
+pointee, of records held by value inside a captured record, and of the pointees
+of `std::unique_ptr` and `std::shared_ptr` members, to `--follow-depth` levels.
+A link back to an object that is already captured above it is not followed
+again, and a link cut by the depth bound stays address-only. Null, unreadable,
+unmapped, abstract, incomplete, `std::` and function pointees remain
+address-only, and pointers stored inside standard containers are not followed.
+All roots are encoded before any followed member, shallowest members first, so
+a member that does not fit the per-thread snapshot storage is dropped and never
+displaces a root. Smart pointer members (`std::unique_ptr`, `std::shared_ptr`)
+are captured inline as their address plus a copy of the pointee. Pass
+`--no-automatic-members` to `%probe prepare` or to
+`clang-tracer-prepare-injectors-native`, or set
+`TRACER_PREPARE_AUTOMATIC_MEMBERS=off` in the environment of the prepare tool,
+to follow no members automatically. If a package cannot be built with the fuller
+captures, preparation falls back to narrower ones and reports each step on
+stderr. The agent, the REPL, and the prepare tool must come from the same
+build: an older REPL cannot read nested member snapshots and an older agent
+lacks the readability checks a newer package calls. Followed members are
+encoded in a checked mode: strings are copied out with a checked read, a
+vector's storage and a smart pointer's pointee must be wholly readable first,
+and a shared pointer's control block is never read, so a pointer the target
+left stale makes that member address-only instead of crashing the target. This
+relies on `process_vm_readv`; a seccomp filter that kills that call would kill
+the target. Policy-named members get the same checks, but a `FollowPointers`
+policy on a type the checks cannot cover (node-based containers, `std::any`,
+`std::function`, virtual bases, custom encoders) is your own assertion that the
+pointee is valid. Records with virtual bases, pairs and tuples with reference
+elements, `vector<bool>` and `weak_ptr` are never followed automatically. A
+pointee that needs a custom `tracer_snapshot::encode` is followed automatically
+only when its RTTI matches. Every limit on this capture is an option
+(see [Followed-member limits](#followed-member-limits)); none is hard-coded. A
+pointer or reference to a private nested implementation class
+(`class Widget { class Impl; Impl *impl_; };`) is followed too, because the
+prepared adapter republishes nested class names. If the capture code that
+follows members does not compile, the probe is built without them and the
+validation report says so; setting `TRACER_TEST_BREAK_FOLLOWED_MEMBERS` in the
+target's environment forces that fallback for testing. In a followed member a
+`weak_ptr` is always recorded as expired, and a smart pointer whose pointee was
+left out by the checks or the read budget looks the same as one with no
+pointee.
 
-A reusable record policy can follow specific raw pointer fields wherever that
+Prepared packages of probes that share application types each declare those
+types. One REPL session keeps the first declaration of a type and drops the
+repeats from later packages, reporting them as `reused imported types: ...`,
+so several prepared probes on the same classes can be injected in one session.
+
+A reusable record policy can follow specific raw pointer or reference fields wherever that
 record is captured as an argument, receiver, or result. Define the policy in
 a C++ header and supply it through the existing `%probe prepare --include`
 option alongside the matching application definitions. An explicit policy
@@ -1381,6 +2058,90 @@ snapshot named `<field>_snapshot` for each captured pointee. For example,
 from `cpp_type()`. A null member or a type absent from the prepared package
 has only the address. Pointer returns use `--snapshot-return-pointee` at
 injection. Reference returns already capture the referenced object.
+
+#### Followed-member limits
+
+Every bound on followed-member capture is an option. Nothing is hard-coded: the
+defaults below live in one place (`SnapshotLimits` in `src/snapshot_limits.hpp`),
+each option is validated against the same table, and when a limit cuts something
+the event or the prepare output says which option to raise.
+
+| Option | Environment variable | Set with | Default | Range | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `--follow-depth` | `TRACER_PREPARE_FOLLOW_DEPTH` | prepare tool, `%probe prepare`, `%probe inject` | 3 | 0-40 | Levels of pointees followed below a captured record; `0` follows none. |
+| `--follow-members` | `TRACER_PREPARE_FOLLOW_MEMBERS` | prepare tool, `%probe prepare`, `%probe inject` | 48 | 0-4294967295 | Followed members per probe, policy-named ones first. Each adds about 160 bytes of stack to the generated wrapper. |
+| `--record-members` | `TRACER_PREPARE_RECORD_MEMBERS` | prepare tool, `%probe prepare` | 32 | 0-4294967295 | Pointer members discovered automatically per record. |
+| `--nested-depth` | `TRACER_PREPARE_NESTED_DEPTH` | prepare tool, `%probe prepare` | 2 | 0-4294967295 | Levels of by-value records and smart pointers searched for pointer members. |
+| `--string-bytes` | `TRACER_PREPARE_STRING_BYTES` | prepare tool, `%probe prepare`, `%probe inject` | 4000 | 0-65536 | Bytes kept of one string (`char *` or `std::string`) in a followed member. At most the slice minus 96 bytes of framing. |
+| `--vector-elements` | `TRACER_PREPARE_VECTOR_ELEMENTS` | prepare tool, `%probe prepare`, `%probe inject` | 4096 | 0-4294967295 | Elements of a `std::vector` in a followed member; a larger vector is left out. The captured bytes must also fit `--snapshot-slice` (5000 `int` elements need `--vector-elements 5000 --snapshot-slice 32768`). |
+| `--checked-reads` | `TRACER_PREPARE_CHECKED_READS` | prepare tool, `%probe prepare`, `%probe inject` | 256 | 1-4294967295 | Checked memory reads (system calls) one followed member may spend. |
+| `--snapshot-reserve` | `TRACER_PREPARE_SNAPSHOT_RESERVE` | prepare tool, `%probe prepare`, `%probe inject` | 8192 | 0-4294967295 | Bytes of the per-thread storage that members captured at entry leave for the roots encoded later (a result, nested calls). |
+| `--snapshot-arena` | `TRACER_PREPARE_SNAPSHOT_ARENA` | prepare tool, `%probe prepare`, `%probe inject` | 16384 | 16384-4294967295 | Per-thread storage for all snapshots of a call. Never shrinks: the largest request of any installed probe wins. At least one slice. |
+| `--snapshot-slice` | `TRACER_PREPARE_SNAPSHOT_SLICE` | prepare tool, `%probe prepare`, `%probe inject` | 4096 | 4096-65536 | Bytes of one snapshot payload. Never shrinks: the largest request wins. |
+
+Besides these, `--no-automatic-members` (prepare tool flag, `%probe prepare`
+option, or `TRACER_PREPARE_AUTOMATIC_MEMBERS=off`) follows no member
+automatically, and `TRACER_REPL_DERIVED_CANDIDATES` (environment of the REPL,
+default 15) sets how many derived records are tried per polymorphic pointer
+when the REPL builds its local mappings; a pointer with more candidates is
+reported in the mapping notes.
+
+A value is a number, `unlimited` (the largest value in the Range column) or,
+where the range starts at 0, `off` (0). A value outside the range is refused
+with the range, for example `--follow-depth must be between 0 and 40 (or
+unlimited): 99`. A prepare-time option shapes the package, so `%probe inject`
+can only lower what the package discovered; the other options can be given at
+either step, and the one given at `%probe inject` wins. The three maxima that are
+not "as large as the option holds" are forced by something else:
+
+- `--snapshot-slice` 65536 and, through it, `--string-bytes`: a payload is one
+  string field of the event, which the event writer bounds at 64 KiB
+  (`limits.string_bytes` in `src/context_capture.cpp`). The whole event is also
+  bounded by the server's `--context-event-bytes` (default 256 KiB).
+- `--follow-depth` 40: every followed level nests two protobuf messages in the
+  event, and the protobuf parser refuses more than 100 levels when the server
+  and the REPL read it. Measured end to end, a chain arrives up to 49 levels in
+  a result and 48 in an argument and the event is lost beyond that; 40 keeps
+  eight levels of slack for the receiver and state roots that were not measured.
+- `--snapshot-arena` and `--snapshot-slice` have the built-in sizes as their
+  minimum because the per-thread storage only grows.
+- `--snapshot-arena` accepts up to 4294967295 bytes, but the storage is one
+  anonymous mapping per thread of the target, so `unlimited` asks every thread
+  for 4 GiB of address space. If a mapping fails the storage keeps its size and
+  the capture reports `no snapshot storage was left for a followed member`.
+
+Tune them where the data lives. The depth and the `char *` size, for the
+handle example (`examples/prepared-injectors/handle`):
+
+```text
+%probe prepare "HFW::HfwManager::getItem(int)" --include item.hpp --include item-impl.hpp --output prepared --follow-depth 5
+%probe inject "HFW::HfwManager::getItem(int)" --prepared prepared --prepared-mode require --string-bytes 6000 --snapshot-slice 8192 --snapshot-arena 65536
+```
+
+or `TRACER_PREPARE_FOLLOW_DEPTH=5` in the environment of the REPL or of
+`clang-tracer-prepare-injectors-native`.
+
+What you see when a limit cuts something:
+
+| Cut | Where | Text |
+| --- | --- | --- |
+| Pointer members of a record are beyond `--follow-depth` (prepare) | prepare stderr, once per record | `prepare: pointer members of NAME are address-only: it is N levels below a captured record (--follow-depth, TRACER_PREPARE_FOLLOW_DEPTH)` |
+| More pointer members than `--record-members` (prepare) | prepare stderr, once per record | `prepare: NAME has more followable members than --record-members (N); the rest stay address-only` |
+| Pointer members nested deeper than `--nested-depth` (prepare) | prepare stderr, once per record | `prepare: NAME has pointer members nested more than --nested-depth (N) levels inside it; they stay address-only` |
+| Derived records beyond `TRACER_REPL_DERIVED_CANDIDATES` | mapping notes of the REPL | `derived records of NAME beyond N are not tried (TRACER_REPL_DERIVED_CANDIDATES)` |
+| A member's own pointer members were not followed (`--follow-depth`) | field `<field>_snapshot_cut` of the parent | `its pointer members were not followed: raise --follow-depth` |
+| Members dropped by `--follow-members` below a member | field `<field>_snapshot_cut` of the parent | `some of its pointer members were not followed: raise --follow-members` |
+| Members dropped by `--follow-members` at a root | field `snapshot_cut` of the root | `N pointer members were not followed: raise --follow-members` |
+| String shortened (`--string-bytes`, or the slice bounds it) | field `<field>_snapshot_cut` | `a C string was shortened: raise --string-bytes (and --snapshot-slice, which also bounds it)` (`a string was ...` for a `std::string`) |
+| Vector larger than `--vector-elements` | field `<field>_snapshot_cut` | `a vector was left out because it is larger than the limit: raise --vector-elements` |
+| Checked reads ran out | field `<field>_snapshot_cut` | `the checked reads of a followed member ran out: raise --checked-reads` |
+| Member does not fit the slice | field `<field>_snapshot_cut` | `a followed member does not fit the snapshot payload: raise --snapshot-slice or --snapshot-arena` |
+| No storage left for a member | field `<field>_snapshot_cut` | `no snapshot storage was left for a followed member: raise --snapshot-arena or lower --snapshot-reserve` |
+| Member does not fit the event (shared-context events) | field `<field>_snapshot_cut` | `the followed member did not fit the event: raise --context-event-bytes of the server` |
+
+`<field>_snapshot_cut` is a string field next to `<field>_snapshot`, so
+`event.result_snapshot().field("_chain_snapshot_cut")` reads it; a cut inside a
+nested member sits in that member's record.
 
 To choose the captured fields for one implementation, pass a C++ file with
 `--callback` to `%probe inject`. Define an overload of `tracer_snapshot::encode`
@@ -1440,6 +2201,66 @@ selected unsupported type rejects the import. Generated conversions are checked 
 before entering the live interpreter. Header/generation errors retain previous
 variables and tracing sessions. An accepted header has normal C++ semantics,
 including execution of its static initializers.
+
+The native REPL applies Clang's `-fno-access-control` to all local C++ input,
+checking, and mapping generation. This lets you inspect private and protected
+members directly and lets generated decoders include them. Pass
+`-fno-access-control` when compiling a generated header with non-public
+members outside the REPL.
+
+The REPL can generate a factory when Clang can map every argument of a unique
+constructor to a captured field. It recognizes direct member initialization
+and forwarding through supported base constructors. The factory constructs
+the value and copies any remaining assignable fields. This also covers const
+fields initialized by the constructor. A prepared adapter can retain the
+verified initializer list. Constructor code that transforms values or depends
+on application state needs a custom `EventCodec<T>`. The factory requires
+usable local lifetime definitions and does not reconstruct raw-pointer
+ownership from captured addresses.
+
+Eligible derived records decode inherited fields as well as their own fields.
+Use `DeclaringType::field` for field names shared by multiple base or derived
+declarations. A shared virtual base contributes its fields once. Polymorphic
+records need locally usable construction, destruction, and virtual function
+definitions. With the REPL's own local Linux x86-64 server, a prepared probe
+can resolve an out-of-line destructor from a shared library already mapped in
+the target. With a server the REPL did not start, the library is used only when
+the target is a process on this host, owned by the REPL's user, whose
+`/proc/PID/maps` confirms the reported mappings; otherwise the record is
+rebuilt field by field, as described below. The REPL checks the mapped ELF identity and requires one
+library exporting the required C++ ABI symbols. It loads that library into the
+REPL process and binds those symbols before generating the typed decoder. No
+additional probe options are required. Library initializers run in the REPL
+when the loader opens the library.
+
+A record that cannot be constructed locally is decoded as
+`tracer_repl::Reconstructed<T>`; use `->` to reach the record. This covers
+records with raw pointer or reference members, records whose constructor,
+virtual functions, or destructor are unavailable or cannot be inferred, and
+records that contain such a record by value or through a `std::unique_ptr`.
+Records that map normally keep doing so. A reconstructed record's fields are
+rebuilt without running its constructors or destructor and its vptr is null, so
+read fields and call non-virtual members only. A pointer member refers to a
+local copy of its captured pointee, which is itself rebuilt the same way, so a
+captured chain of pointers can be followed with `->`. It is null when the
+pointee was not captured or its captured type is neither the declared pointee
+nor one of the imported application records derived from it (at most 15 derived
+records are considered); a captured pointee that fails to decode raises the
+decode error. A `char` pointer points at a copy of the captured string and a
+pointer to a scalar at a copy of the value. A reference member needs its
+referent: decoding throws `std::runtime_error` naming the record and field when
+it was not captured. Smart pointer members point at the local copy of the
+pointee, or are empty when it was not captured. Other raw pointers are null. Do
+not move, copy, assign or destroy the reconstructed record itself; it owns the
+pointees, so do not move from, reset or assign its `std::unique_ptr` members
+either, because those only view the copies. Records with virtual bases cannot
+be reconstructed. Define your own `EventCodec<T>` before first use to replace
+the generated reconstruction.
+
+Use `result_snapshot()` for field inspection when only the captured layout is
+available. If additional definitions are needed for a typed result, prepare
+the package in one session, then import the application definitions and
+inject the saved package in a fresh session.
 
 If a generated decoder fails to compile (for example, a set element lacks its
 required comparison operator), the entire import is rejected without changing
@@ -1578,10 +2399,11 @@ and numeric ranges. For classes with constructor-only/const members, specialize
 `EventCodec<T>` with `static T decode(const EventValue&)` and return an object
 from your constructor or factory. This custom conversion runs locally.
 
-Automatic target capture supports complete ABI-validated records with public
-serializable fields, including nested records and supported STL members.
-Private/protected fields, unions, bit-fields, volatile data, arbitrary raw
-pointees and wide/custom-character strings are explicitly unavailable.
+Automatic target capture uses complete ABI-validated layouts and serializable
+fields, including nested records and supported STL members. Prepared layouts
+can include private and protected fields. Unions, bit-fields, volatile data,
+arbitrary raw pointees and wide/custom-character strings are unavailable for
+general automatic record capture.
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
 or over-budget snapshots throw; partial objects are never returned as complete.
@@ -1615,6 +2437,15 @@ comment in the multiline editor. Ctrl+C discards the entire pending input;
 earlier variables and tracing sessions remain available. Ctrl+J always inserts
 a newline; `%cpp load FILE` submits a multiline source file.
 
+End a `%` command line with `\` between arguments to continue on the next
+line. The final line submits the command. The same syntax works in piped input
+and `--startup` files.
+
+```text
+%module index \
+  --file ./app
+```
+
 In an interactive terminal the editor history persists in
 `$HOME/.clang-tracer-history` (mode 0600) and reloads at startup. Each accepted
 entry is merged into the file as it is entered, so concurrent REPLs share it and
@@ -1646,6 +2477,192 @@ cannot be rolled back, and arbitrary native loops or crashes do not have
 guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
+
+## Install a local C++ plugin package
+
+Copy the trusted `examples/repl-public-plugin` directory to
+`~/.local/share/clang-tracer/plugins/my-api/`. If `XDG_DATA_HOME` is set,
+use `$XDG_DATA_HOME/clang-tracer/plugins/my-api/`. Keep `plugin.toml`,
+`src/`, and `include/` together. Launch `clang-tracer-repl` normally and
+enter C++ at the prompt.
+
+```cpp
+#include <my_api/my_type.hpp>
+my_api::my_instance.add(3);
+my_api::MyType local{};
+local.add(5);
+std::cout << my_api::my_instance.count << " " << local.count << std::endl;
+```
+
+The first startup reports `compiled` and prints `3 5` for the sample.
+A fresh startup with the same compiler inputs reports `cache hit` and
+starts with fresh plugin state. The REPL loads the manifest’s `[repl]`
+`sources` into one private JIT scope. Its public `include/` directory
+provides C++ declarations to the REPL and its checker. External definitions
+declared in those headers can link to the plugin’s code and storage.
+The class in `src/plugin.cpp` registers commands and stays in the plugin scope.
+
+The package manifest supports `id`, `[repl]` `sources`, and optional
+`compile_commands`, `translation_unit`, and `extra_flags` in that section.
+Paths to sources and compilation databases are relative to the manifest
+unless a database path is absolute. Keep the entire package owned by the REPL
+user, with group and other write permissions disabled. Package symlinks must
+resolve within the package. Use trusted paths for external compiler inputs.
+Restart the REPL to replace a package with public headers. A live C++ expression can retain addresses from that
+generation.
+
+## Load local C++ plugins
+
+Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL
+compiles it with its current local C++ compiler profile, so include paths and
+defines can come from `--cpp-arg` or `%cpp options compdb`. Use
+`%plugin enable FILE --as NAME` to load a plugin now and on future launches.
+
+```text
+%plugin enable examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin enable examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin commands a
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a value
+%plugin run b value
+```
+
+Enabled plugins load before the prompt or any `--startup` script. The REPL
+saves absolute source paths under `$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins`
+or `~/.config/clang-tracer/repl/enabled-plugins`. Startup uses the launcher's
+C++ options, including any `--cpp-arg` flags. A plugin that fails to load is
+reported by name and startup continues. `%plugin disable NAME` removes its
+startup registration and the current session can keep using the loaded plugin.
+Use `%plugin load FILE --as NAME` for a single session.
+
+The first load reports `compiled`. A later load of the same source and compiler
+inputs reports `cache hit`. The REPL preprocesses the source to check the
+effective inputs, then reuses native code generation on a hit. Cached objects
+live under `$XDG_CACHE_HOME/clang-tracer/repl/plugins` or
+`~/.cache/clang-tracer/repl/plugins` when XDG_CACHE_HOME is unset. Each load
+links into a fresh JIT scope. A successful reload resets that plugin's globals
+and leaves peer plugins active. A failed reload keeps the prior generation.
+
+Include `clang_tracer_repl_plugin.hpp` and define `tracer::repl::Plugin` in
+one C++ source file. List your commands in a static array. The SDK supplies
+the entry point and dispatches each command to the same instance of your
+class.
+
+```cpp
+#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t count_ = 0;
+
+public:
+  uint64_t tick() noexcept { return ++count_; }
+  uint64_t value() const noexcept { return count_; }
+
+  static constexpr Command commands[] = {
+      command<&Plugin::tick>("tick", "Increment the count."),
+      command<&Plugin::value>("value", "Read the count."),
+  };
+};
+```
+
+Commands are `noexcept`, take no arguments, and return a value convertible
+to `uint64_t`. Use constant initialization and trivial destruction for plugin
+state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
+in `clang_tracer_repl_plugin.h` can still load.
+
+A plugin JIT scope resolves definitions from its own compiled sources. Calls
+that require symbols from libc, the C++ runtime, the host process, or another
+plugin fail with the unresolved symbol names. Header-only C++ operations work
+when they generate self-contained code. Mark local helpers `noexcept`. A
+potentially throwing call at `-O0` can introduce C++ exception runtime symbols.
+For code that requires no exception handling, `-fno-exceptions` can avoid those
+references. Optimization can also inline a helper. Use trusted plugin sources
+because they execute native code in the REPL or target process.
+
+## Install an agent extension for automatic attachment
+
+On the REPL machine, copy a trusted extension package to
+`~/.local/share/clang-tracer/plugins/agent-counter/` (or the corresponding
+`XDG_DATA_HOME` path). Save `examples/jit-plugin-globals/plugin_b.cpp` as
+`src/plugin.cpp` in that package. Put the following `plugin.toml` at its
+root and set the executable to the exact absolute path reported by the
+target's Linux host.
+
+```toml
+id = "agent-counter"
+sdk = 1
+
+[agent]
+sources = ["src/plugin.cpp"]
+
+[agent.target]
+executable = "/absolute/path/to/application"
+```
+
+Start the server with `CLANG_TRACER_ALLOW_AGENT_PLUGINS=1` in its environment
+and attach to the application as usual. A new matching attachment activates
+the package before returning to the REPL prompt. Selecting an existing
+attachment preserves its plugin state. Approval or load failures identify the
+package and leave the attachment available.
+
+Single-file extensions use the existing REPL-object compatibility check.
+The agent compiles from source on a cache miss. Multi-file packages send
+their translation units and bundled headers for compilation in one target JIT
+scope. Optional `compile_commands`, `translation_unit`, and `extra_flags`
+under `[agent]` apply to target compilation. Use target-host paths for
+external build inputs. The agent caches the resulting objects and links a fresh
+instance for each matching attachment.
+
+The latency extension in `examples/repl-agent-observer` registers its return
+observer on attach. Add native probes after the observer loads. Reload an
+installed observer with `%plugin agent reload NAME`. The manifest supplies
+the sources and compiler settings for the new generation.
+
+## Load plugins in an injected agent
+
+Start a local managed server with agent plugins enabled and attach to a Linux
+x86-64 target. For a remote REPL, set the same environment variable on the
+server before starting it.
+
+```sh
+CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"
+```
+
+```text
+%plugin agent load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin agent load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin agent run a tick
+%plugin agent run b tick
+%plugin agent reload a examples/jit-plugin-globals/plugin_a.cpp
+%plugin agent run a value
+%plugin agent run b value
+```
+
+On a Linux x86-64 REPL, loading or reloading automatically offers an object
+from the REPL cache or compiles one if needed. The agent checks the compiler
+profile, target and CPU, resolved source and headers, and object integrity
+before linking an offer. It reports `REPL object` when it accepts the offer,
+`cache hit` when it uses its own cache, or `compiled` when it compiles the
+source in the target. The same commands handle all three cases.
+
+The C++17 build uses the same default language, SDK/sysroot, include and access
+options for REPL compilation and agent validation. Resource directory paths are
+canonicalized so installed paths also match. User compiler options remain part
+of the cache identity; incompatible profiles still fall back to target compilation.
+
+The same V1 command descriptor works in both runtimes. The agent supplies
+the SDK header and resolves other includes from its compiler environment.
+The target's cache is under
+`$XDG_CACHE_HOME/clang-tracer/agent/plugins` or
+`~/.cache/clang-tracer/agent/plugins` when XDG_CACHE_HOME is unset.
+
+The server opt-in authorizes its clients to supply trusted plugin source and
+objects that execute with the target process's permissions. Each attachment
+owns its plugin instances. A reload links a fresh generation of the named plugin and
+preserves its peers. Detaching releases the attachment's instances, and the
+compiled objects remain available for reuse.
 
 ## Cleanup and scripted use
 

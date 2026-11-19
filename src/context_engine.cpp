@@ -1,6 +1,7 @@
 #include "context_engine.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <optional>
 #include <utility>
 
@@ -23,7 +24,6 @@ struct Execution {
   unsigned guards = 0;
   bool lifecycle = false;
   std::unique_ptr<ScopeRecord> retired;
-  Execution();
   ~Execution();
 };
 
@@ -117,11 +117,12 @@ public:
   std::size_t outstanding_tasks = 0; // Protected by admission_gate.
   std::vector<std::shared_ptr<ScopeRecord>> ancestry;
   std::unique_ptr<ScopeRecord> retired_next;
-  std::array<Slot, kMaxSlots> slots;
+  std::deque<Slot> slots;
   std::size_t constructed = 0;
 
   explicit ScopeRecord(std::shared_ptr<const ScopeRegistration> r)
-      : registration(std::move(r)) {}
+      : registration(std::move(r))
+      , slots(registration->states.size()) {}
 
   ~ScopeRecord() noexcept {
     // This destructor and its deleter are native; no module can unload while
@@ -179,7 +180,6 @@ void drain_retired() noexcept {
   }
 }
 
-Execution::Execution() = default;
 Execution::~Execution() { drain_retired(); }
 
 void retire(ScopeRecord *record) noexcept {
@@ -195,9 +195,6 @@ void validate(const ScopeRegistration &registration) {
   if (!registration.identity || !registration.owner_code ||
       registration.states.empty()) {
     fail(ErrorCode::incompatible_registration);
-  }
-  if (registration.states.size() > kMaxSlots) {
-    fail(ErrorCode::capacity);
   }
   for (std::size_t i = 0; i < registration.states.size(); ++i) {
     const auto &s = registration.states[i];
@@ -325,8 +322,8 @@ void Context::push(InvocationFrame &frame,
       }
     }
   }
-  if (size_ == kMaxBindings) {
-    fail(ErrorCode::capacity);
+  if (size_ == bindings_.size()) {
+    bindings_.resize(size_ + 1);
   }
   std::shared_ptr<ScopeRecord> record;
   if (!fresh) {
@@ -352,16 +349,13 @@ void Context::push(InvocationFrame &frame,
         std::make_unique<ScopeRecord>(registration).release(), retire);
     // Descendants pin whole ancestor records. Metadata preparation precedes
     // user construction and publication; allocation failure changes no cursor.
-    record->ancestry.reserve(std::min(size_, kMaxSlots));
+    record->ancestry.reserve(size_);
     for (std::size_t i = 0; i < size_; ++i) {
       const auto &b = bindings_[i];
       if (!b.record || b.retired ||
           std::find(record->ancestry.begin(), record->ancestry.end(),
                     b.record) != record->ancestry.end()) {
         continue;
-      }
-      if (record->ancestry.size() == kMaxSlots) {
-        fail(ErrorCode::capacity);
       }
       record->ancestry.push_back(b.record);
     }
@@ -447,8 +441,8 @@ void HookAccess::add(std::shared_ptr<ScopeRecord> record, Identity state) {
       return;
     }
   }
-  if (size_ == kMaxSlots) {
-    fail(ErrorCode::capacity);
+  if (size_ == entries_.size()) {
+    entries_.resize(size_ + 1);
   }
   entries_[size_].record = std::move(record);
   entries_[size_++].slot = slot;
@@ -469,7 +463,7 @@ HookAccess::HookAccess(Context& context, ::tracer::compat::span<const SlotReques
     add(context.resolve(request), request.state);
   }
   if (all_visible) {
-    std::array<Identity, kMaxSlots> seen{};
+    std::vector<Identity> seen;
     std::size_t seen_count = 0;
     for (std::size_t i = context.size_; i; --i) {
       const auto &b = context.bindings_[i - 1];
@@ -481,10 +475,8 @@ HookAccess::HookAccess(Context& context, ::tracer::compat::span<const SlotReques
             seen.begin() + seen_count) {
           continue;
         }
-        if (seen_count == kMaxSlots) {
-          fail(ErrorCode::capacity);
-        }
-        seen[seen_count++] = s.identity;
+        seen.push_back(s.identity);
+        ++seen_count;
         add(b.record, s.identity);
       }
     }
@@ -733,8 +725,7 @@ TaskCapture::capture(Context &context,
                      std::shared_ptr<PropagationLedger> ledger) noexcept {
   // Reserve queued AND running metadata at admission, including the full
   // worker-context restoration frame and shared ownership bookkeeping.
-  constexpr std::size_t charge =
-      sizeof(TaskCapture) + sizeof(TaskAttachment) + 64;
+  constexpr std::size_t base_charge = sizeof(TaskCapture) + sizeof(TaskAttachment) + 64;
   try {
     context.check_lifecycle();
     if (execution.guards) {
@@ -750,11 +741,11 @@ TaskCapture::capture(Context &context,
                     record) != result->records_.begin() + result->size_) {
         return;
       }
-      if (result->size_ >=
-          std::min(kMaxSlots, result->ledger_->limits_.ancestry)) {
+      if (result->size_ >= result->ledger_->limits_.ancestry) {
         fail(ErrorCode::capacity);
       }
-      result->records_[result->size_++] = record;
+      result->records_.push_back(record);
+      ++result->size_;
     };
     for (std::size_t i = 0; i < context.size_; ++i) {
       const auto &b = context.bindings_[i];
@@ -766,6 +757,10 @@ TaskCapture::capture(Context &context,
       }
       add(b.record);
     }
+    const auto charge =
+        base_charge + result->records_.capacity() *
+                          (sizeof(std::shared_ptr<ScopeRecord>) + sizeof(Context::Binding));
+    result->charged_bytes_ = charge;
     {
       std::lock_guard gate(admission_gate);
       auto &budget = *result->ledger_;
@@ -820,15 +815,15 @@ void TaskCapture::finish() noexcept {
 }
 
 void TaskCapture::release() noexcept {
-  std::array<std::shared_ptr<ScopeRecord>, kMaxSlots> released;
+  std::vector<std::shared_ptr<ScopeRecord>> released;
   {
     std::lock_guard gate(admission_gate);
     --ledger_->tasks_;
-    ledger_->bytes_ -= sizeof(TaskCapture) + sizeof(TaskAttachment) + 64;
+    ledger_->bytes_ -= charged_bytes_;
     for (std::size_t i = 0; i < size_; ++i) {
       --records_[i]->outstanding_tasks;
-      released[i] = std::move(records_[i]);
     }
+    released.swap(records_);
     size_ = 0;
   } // Potential final release happens after the admission gate has released.
 }
@@ -853,11 +848,11 @@ TaskAttachment::TaskAttachment(Context &context,
     for (std::size_t i = 0; i < task_->size_; ++i) {
       task_->records_[i]->check_domain();
     }
+    std::vector<Context::Binding> incoming(task_->size_);
     saved_size_ = context.size_;
     saved_frame_ = context.frame_;
-    for (std::size_t i = 0; i < saved_size_; ++i) {
-      saved_[i] = std::move(context.bindings_[i]);
-    }
+    saved_.swap(context.bindings_);
+    context.bindings_.swap(incoming);
     context.size_ = 0;
     context.frame_ = nullptr;
     for (std::size_t i = 0; i < task_->size_; ++i) {
@@ -883,9 +878,7 @@ TaskAttachment::~TaskAttachment() noexcept {
     context_.bindings_[--context_.size_] = {};
   }
   context_.frame_ = saved_frame_;
-  for (std::size_t i = 0; i < saved_size_; ++i) {
-    context_.bindings_[i] = std::move(saved_[i]);
-  }
+  context_.bindings_.swap(saved_);
   context_.size_ = saved_size_;
   task_->finish();
 }

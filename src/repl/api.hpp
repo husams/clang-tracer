@@ -34,6 +34,59 @@ struct SessionHandle {
   std::uint64_t connection = 0;
 };
 
+struct StackFrame {
+  std::uint64_t pc;
+  std::uint64_t stack_pointer;
+  std::string kind;
+  std::string module;
+  std::uint64_t module_offset;
+  std::string function;
+  std::string file;
+  std::uint32_t line;
+  bool application_frame;
+};
+
+struct ModuleList {
+  ModuleList() = default;
+  ModuleList(const ModuleList &) = default;
+  ModuleList(ModuleList &&) noexcept = default;
+  ModuleList &operator=(const ModuleList &) = default;
+  ModuleList &operator=(ModuleList &&) noexcept = default;
+  // Keep the destructor available to JIT expressions that return temporaries.
+  ~ModuleList();
+
+  std::vector<std::string> paths;
+
+  bool empty() const { return paths.empty(); }
+  std::size_t size() const { return paths.size(); }
+  const std::string &at(std::size_t index) const { return paths.at(index); }
+  auto begin() const { return paths.begin(); }
+  auto end() const { return paths.end(); }
+};
+
+struct ModuleMapping {
+  std::uint64_t begin_address = 0;
+  std::uint64_t end_address = 0; // Exclusive.
+  std::uint64_t file_offset = 0;
+  std::string device;
+  std::uint64_t inode = 0;
+  std::string build_id;
+};
+
+struct ModuleInfo {
+  ModuleInfo() = default;
+  ModuleInfo(const ModuleInfo &) = default;
+  ModuleInfo(ModuleInfo &&) noexcept = default;
+  ModuleInfo &operator=(const ModuleInfo &) = default;
+  ModuleInfo &operator=(ModuleInfo &&) noexcept = default;
+  // Keep the destructor available to JIT expressions that return temporaries.
+  ~ModuleInfo();
+
+  std::string path;
+  std::string mapping_token;
+  std::vector<ModuleMapping> mappings;
+};
+
 class Event {
   std::shared_ptr<const EventData> data_;
 
@@ -44,6 +97,10 @@ public:
   std::uint64_t call_id() const;
   std::string phase() const;
   std::string function_name() const;
+  // Owned frames in capture order. Empty when the event has no stored frames.
+  std::vector<StackFrame> stack() const;
+  bool callback_error() const;
+  std::string callback_error_message() const;
   // Presence includes VOID results; reading void as a value is rejected.
   bool has_result() const;
   // Values own their scalar data and do not retain target addresses.
@@ -56,15 +113,33 @@ public:
   // Owned state from a named Context event, in the event's state order.
   EventValue state_snapshot(std::size_t index = 0) const;
 
-  template <class T> T state_as(std::size_t index = 0) const {
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T state_as(std::size_t index = 0) const {
     return state_snapshot(index).template as<T>();
   }
 
-  template <class T> T argument_as(std::size_t index) const {
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> state_as(std::size_t index = 0) const {
+    return state_snapshot(index).template as<T>();
+  }
+
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T argument_as(std::size_t index) const {
     return argument_snapshot(index).template as<T>();
   }
 
-  template <class T> T result_as() const {
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> argument_as(std::size_t index) const {
+    return argument_snapshot(index).template as<T>();
+  }
+
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T result_as() const {
+    return result_snapshot().template as<T>();
+  }
+
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> result_as() const {
     return result_snapshot().template as<T>();
   }
 
@@ -72,6 +147,8 @@ public:
   std::string result() const;
   std::string describe() const;
 };
+
+enum class CallbackErrorFilter { include, exclude, only };
 
 struct Collection {
   Collection() = default;
@@ -106,6 +183,7 @@ struct EventQuery {
   std::string session_id;
   // Zero reads all matches, subject to the collection's retention limits.
   std::uint64_t count = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordOptions {
@@ -121,6 +199,7 @@ struct RecordOptions {
   std::uint64_t count = 0;
   // Zero uses the console timeout for counted recordings.
   unsigned timeout_seconds = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordResult {
@@ -131,8 +210,11 @@ struct RecordResult {
   bool timed_out = false;
 };
 
-// Iteration visits a stable snapshot of the events retained at begin().
-// It never waits for new events; collection continues independently.
+// Iteration streams: each loop starts at the oldest retained event, then
+// blocks for later ones as the agent sends them. It ends when the collector
+// finishes (count, timeout, stop() or a stream error) or on Ctrl+C. A finished
+// range therefore iterates its retained events without waiting. snapshot()
+// never blocks.
 class EventRange {
   std::shared_ptr<BackgroundEvents> state_;
   explicit EventRange(std::shared_ptr<BackgroundEvents> state);
@@ -142,21 +224,20 @@ public:
   struct Sentinel {};
 
   class Iterator {
-    std::shared_ptr<const Collection> snapshot_;
-    std::size_t index_ = 0;
+    std::shared_ptr<BackgroundEvents> state_;
+    // The next event is fetched lazily so that adaptors such as take(n) stop
+    // without waiting for an event they will not yield.
+    mutable std::uint64_t cursor_ = 0;
+    mutable std::optional<Event> current_;
+    bool load() const;
 
   public:
-    explicit Iterator(Collection snapshot)
-        : snapshot_(std::make_shared<const Collection>(std::move(snapshot))) {}
+    explicit Iterator(std::shared_ptr<BackgroundEvents> state) : state_(std::move(state)) {}
 
-    const Event& operator*() const { return snapshot_->at(index_); }
+    const Event& operator*() const;
+    Iterator& operator++();
 
-    Iterator& operator++() {
-      ++index_;
-      return *this;
-    }
-
-    bool operator!=(Sentinel) const { return index_ < snapshot_->size(); }
+    bool operator!=(Sentinel) const { return load(); }
   };
 
   Collection snapshot() const;
@@ -164,7 +245,7 @@ public:
   std::string error() const;
   void stop();
 
-  Iterator begin() const { return Iterator(snapshot()); }
+  Iterator begin() const { return Iterator(state_); }
 
   Sentinel end() const { return {}; }
 };
@@ -176,6 +257,10 @@ public:
   explicit Facade(Controller &controller);
   const SessionHandle &selected_session() const;
   SessionHandle attach(std::uint32_t pid);
+  // Query the selected attachment. The filter matches a case-sensitive path substring.
+  ModuleList modules(const std::string &filter = {});
+  // Accept an exact path or unique basename from the selected attachment.
+  ModuleInfo module_info(const std::string &name);
   void prepare(const std::string &selector, const std::string &header,
                const std::string &output, const std::string &compdb = {},
                const std::string &translation_unit = {});

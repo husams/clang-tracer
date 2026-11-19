@@ -18,6 +18,7 @@
 #include "help.hpp"
 #include "interpreter.hpp"
 #include "compiler_profile.hpp"
+#include "plugins.hpp"
 #include "shell.hpp"
 #include "syntax.hpp"
 
@@ -102,7 +103,7 @@ int main(int argc, char **argv) {
                      "  --context-event-bytes N --context-transport-memory-bytes N (managed server)\n"
                      "  --cpp-arg ARG (repeatable) --startup FILE --fail-fast\n"
                      "  --extra-arg=ARG --extra-args FLAGS (repeatable, for probe compilation)\n"
-                     "C++23; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
+                     "C++17; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
                      "Use %help for tracing commands and %help api for C++ "
                      "APIs. Tab completes C++ members. Without --endpoint, "
@@ -153,6 +154,7 @@ int main(int argc, char **argv) {
       } else if (option == "--timeout") {
         settings.timeout_seconds =
             static_cast<unsigned>(tr::unsigned_number(value, "timeout", 300));
+        settings.bulk_apply_timeout_seconds = settings.timeout_seconds;
       } else if (option == "--context-event-bytes") {
         settings.context_event_bytes = static_cast<std::uint32_t>(
             tr::unsigned_number(value, option, UINT32_MAX));
@@ -197,19 +199,34 @@ int main(int argc, char **argv) {
     tr::Input input(color);
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
+    tr::Plugins plugins;
     tr::CppEngine cpp(facade, std::move(cpp_args));
     input.use_cpp(cpp);
     auto choose = [&](const std::string &prompt) {
       return input.read(prompt).value_or("");
     };
+    const auto read_startup = [&]() -> std::optional<std::string> {
+      std::string line;
+      if (std::getline(startup, line)) {
+        std::cout << controller.prompt() << line << '\n';
+        return line;
+      }
+      if (!startup.eof())
+        throw std::runtime_error("cannot read REPL startup file: " + startup_path);
+      return {};
+    };
+    if (input.terminal()) {
+      std::cout << "Clang Tracer native C++17 REPL. %help lists commands; "
+                   "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
+    }
+    plugins.load_installed(cpp, std::cout, std::cerr);
+    plugins.load_enabled(cpp, std::cout, std::cerr);
+    controller.on_attach(
+        [&](const auto& session) { plugins.load_attached(controller, session, cpp, std::cerr); });
     if (pid) {
       controller.attach(pid);
     } else if (!process.empty()) {
       controller.select_process(process, choose);
-    }
-    if (input.terminal()) {
-      std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
-                   "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
     }
     bool failed = false;
     while (true) {
@@ -217,7 +234,8 @@ int main(int argc, char **argv) {
       // returns so the live interpreter is never re-entered.
       for (const auto &adapter : controller.take_pending_imports()) {
         try {
-          const auto imported = cpp.import_prepared_adapter(adapter);
+          const auto imported = cpp.import_prepared_adapter(
+              adapter.source, controller.prepared_import_modules(adapter.session));
           if (!imported.empty())
             std::cout << imported << '\n';
         } catch (const std::exception &error) {
@@ -233,18 +251,12 @@ int main(int argc, char **argv) {
           std::cerr << "recorded C++ types skipped: " << error.what() << '\n';
         }
       }
-      const auto line = [&]() -> std::optional<std::string> {
+      auto line = [&]() -> std::optional<std::string> {
         if (startup.is_open()) {
-          std::string command;
-          if (std::getline(startup, command)) {
-            std::cout << controller.prompt() << command << '\n';
-            return command;
-          }
-          if (!startup.eof())
-            throw std::runtime_error("cannot read REPL startup file: " + startup_path);
+          if (auto command = read_startup()) return command;
           startup.close();
         }
-        return input.read(controller.prompt());
+        return input.read(controller.prompt(), true);
       }();
       if (!line)
         break;
@@ -264,7 +276,21 @@ int main(int argc, char **argv) {
           }
           continue;
         }
-        auto command = tr::parse_command(*line);
+        if (!input.terminal() || startup.is_open()) {
+          auto marker = tr::command_continuation(*line);
+          while (marker != std::string_view::npos) {
+            const auto part = startup.is_open() ? read_startup() : input.read(controller.prompt());
+            if (!part)
+              throw std::invalid_argument("incomplete REPL command continuation");
+            marker = tr::command_continuation(*part);
+            // Consume the whole command even after it exceeds the parser's limit.
+            if (line->size() <= tr::max_command_size) {
+              line->push_back('\n');
+              line->append(*part, 0, tr::max_command_size + 1 - line->size());
+            }
+          }
+        }
+        auto command = tr::parse_command(std::move(*line));
         if (command.has("--cwd")) {
           auto &directory = command.options.at("--cwd").front();
           std::error_code error;
@@ -276,6 +302,13 @@ int main(int argc, char **argv) {
         expand_extra_compile_arguments(command);
         if (command.kind == tr::CommandKind::help) {
           tr::print_help(std::cout, command.arguments, cpp, color);
+        } else if (tr::is_plugin_command(command.kind)) {
+          plugins.execute(command, cpp, std::cout);
+        } else if (command.kind == tr::CommandKind::agent_plugin_load ||
+                   command.kind == tr::CommandKind::agent_plugin_reload) {
+          controller.execute(command, [&](auto &request, const auto &path) {
+            plugins.prepare_agent_plugin(request, path, controller.agent_plugin_manifest(request), cpp);
+          });
         } else if (command.kind == tr::CommandKind::type) {
           tr::print_code(std::cout, cpp.describe_symbol(command.arguments.at(0)),
                          tr::Syntax::cpp, color);
@@ -350,9 +383,6 @@ int main(int argc, char **argv) {
               break;
             }
             source += *part + '\n';
-            if (source.size() > 4 * 1024 * 1024) {
-              throw std::runtime_error("interceptor exceeds 4 MiB");
-            }
           }
           if (save) {
             controller.draft(command.arguments.at(0), std::move(source));

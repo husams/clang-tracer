@@ -1,6 +1,6 @@
 # Build and deploy on RHEL-compatible Linux
 
-The native backend requires Linux x86-64, C++23 and matching LLVM/Clang 21 or 22
+The native backend requires Linux x86-64, C++20 and matching LLVM/Clang 21 or 22
 development libraries. The scripts have been verified on Rocky Linux 9.8 with
 LLVM/Clang 21.1.8. Red Hat Enterprise Linux itself has not been tested.
 
@@ -137,12 +137,8 @@ on the tracing server does not change an existing target's environment.
 The injected agent requires PIC static gRPC, Protobuf and their transport
 dependencies so they can be isolated from copies already loaded by the target.
 Supply a static gRPC CMake package through `CMAKE_PREFIX_PATH` and set
-`-DProtobuf_USE_STATIC_LIBS=ON`. Build those dependencies with
-`-DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON` and, for
-protobuf's CMake build, `-Dprotobuf_BUILD_SHARED_LIBS=OFF`. Keep their compiler,
-standard library and target runtime compatible with the tracing build.
-If a prefix contains both shared and static libraries, select the archives
-explicitly where needed, for example `-DZLIB_LIBRARY=/path/to/libz.a`.
+`-DProtobuf_USE_STATIC_LIBS=ON`; the GCC 8.5 recipe in
+[gcc85-compatibility.md](gcc85-compatibility.md) builds matching archives.
 The agent build rejects extra exports and shared transport dependencies.
 Shared LLVM, Clang and other remaining system dependencies must be available
 on the deployment host. The install adds a relative agent-library search path

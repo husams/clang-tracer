@@ -2,7 +2,6 @@
 
 #include <string>
 
-
 #include "payload.hpp"
 
 namespace prepared_history {

@@ -49,10 +49,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include "session.hpp"
-#include "injector.hpp"
-#include "debug_resolver.hpp"
-#include "header_context.hpp"
 #include "context_collector.hpp"
 #include "context_journal.hpp"
 #include "context_package.hpp"
@@ -61,6 +57,7 @@
 #include "header_context.hpp"
 #include "injector.hpp"
 #include "session.hpp"
+#include "scalar_overrides.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 
@@ -68,8 +65,6 @@ namespace tracer {
 namespace {
 namespace api = clangtracer::v1;
 
-constexpr std::size_t kSessionLimit = 64;
-constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 
 void set_probe_extra_compile_arguments(
     api::ProbeSpec &spec, const google::protobuf::RepeatedPtrField<std::string> &options) {
@@ -112,26 +107,15 @@ grpc::Status validate_resolution_inputs(std::string_view selector,
     return {grpc::StatusCode::INVALID_ARGUMENT,
             "prepared injection requires --compdb to use --include"};
   }
-  if (headers.size() > 16) {
-    return {grpc::StatusCode::INVALID_ARGUMENT,
-            "at most 16 include headers are allowed"};
-  }
   for (const auto &header : headers) {
     if (!valid_text(header, 4095) || header.front() != '/' ||
         header.find_first_of("\"\r\n") != std::string::npos) {
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid optional include"};
     }
   }
-  if (options.size() > 128) {
-    return {grpc::StatusCode::INVALID_ARGUMENT,
-            "at most 128 compiler options are allowed"};
-  }
-  std::size_t option_bytes = 0;
   for (const auto &option : options) {
-    option_bytes += option.size() + 1;
-    if (!valid_text(option, 4096) || option_bytes > 65536) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "compiler options must be nonempty and total at most 64 KiB"};
+    if (!valid_text(option, SIZE_MAX)) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "compiler options must be nonempty without NUL"};
     }
   }
   if (!safe_preflight_compiler_arguments(options.begin(), options.end())) {
@@ -216,8 +200,6 @@ public:
         return existing;
       stores_.erase(found);
     }
-    if (stores_.size() >= kStoreLimit)
-      return {};
 
     const auto directory = root_ / digest_directory_name(key);
     std::error_code error;
@@ -231,7 +213,6 @@ public:
   }
 
 private:
-  static constexpr std::size_t kStoreLimit = 64;
 
   static std::string digest_directory_name(std::string_view key) {
     llvm::SHA256 hash;
@@ -494,6 +475,7 @@ private:
     std::uint32_t pid = 0;
     std::string function_name;
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
+    std::uint64_t object_probe_registration_id = 0;
   };
 
 public:
@@ -526,7 +508,8 @@ public:
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
                  std::uint32_t pid, std::string function_name, bool active,
                  const clangtracer::v1::PreparedInjector *prepared = nullptr,
-                 SnapshotBinding snapshot = {{}, {}, {}, nullptr}) {
+                 SnapshotBinding snapshot = {{}, {}, {}, nullptr},
+                 std::uint64_t object_probe_registration_id = 0) {
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
     if (prepared && tracer::prepared::is_typed_version(prepared->format_version()) &&
         !prepared->adapter_declarations().empty() &&
@@ -546,28 +529,17 @@ public:
       if (existing != active_probes_.end()) {
         function_name = existing->second.function_name;
         replay_types = existing->second.replay_types;
+        object_probe_registration_id = existing->second.object_probe_registration_id;
       } else if (const auto known = known_probes_.find(key);
                  known != known_probes_.end()) {
         function_name = known->second.function_name;
         replay_types = known->second.replay_types;
+        object_probe_registration_id = known->second.object_probe_registration_id;
       }
-      ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types)};
+      ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types),
+                             object_probe_registration_id};
       active_probes_[key] = identity;
-      constexpr std::size_t kKnownProbeLimit = 4096;
-      bool retain_probe_identity = true;
-      if (!::tracer::compat::contains(known_probes_, key) &&
-          known_probes_.size() >= kKnownProbeLimit) {
-        const auto stale =
-            std::find_if(known_probes_.begin(), known_probes_.end(), [&](const auto& entry) {
-              return !::tracer::compat::contains(active_probes_, entry.first);
-            });
-        if (stale != known_probes_.end())
-          known_probes_.erase(stale);
-        else
-          retain_probe_identity = false;
-      }
-      if (retain_probe_identity)
-        known_probes_[key] = std::move(identity);
+      known_probes_[key] = std::move(identity);
       received_.try_emplace(key, 0);
     } else {
       flush_snapshot_probe_locked(key);
@@ -1320,11 +1292,8 @@ private:
       } else {
         parsed = event.ParseFromArray(bytes.data(), static_cast<int>(count));
       }
-      if (!parsed ||
-          event.protocol_version() != kProtocolVersion ||
-          event.session_id().empty() || event.probe_id() == 0 ||
-          event.pid() == 0 || event.tid() == 0 ||
-          event.arguments_size() > static_cast<int>(kMaxArguments)) {
+      if (!parsed || event.protocol_version() != kProtocolVersion || event.session_id().empty() ||
+          event.probe_id() == 0 || event.pid() == 0 || event.tid() == 0) {
         continue;
       }
       bool valid_arguments = true;
@@ -1366,18 +1335,17 @@ private:
                  type == clangtracer::v1::FLOAT64) &&
                 data == clangtracer::v1::Value::kRealValue);
       };
-      // Bound named snapshots and reject ambiguous or unsafe terminal names.
-      bool valid_named =
-          event.named_arguments_size() + event.object_fields_size() <= 16;
+      // Reject ambiguous or unsafe terminal names.
+      bool valid_named = true;
       std::set<std::string> argument_names, field_names;
       std::set<std::uint32_t> indices;
       const auto check_named = [&](const clangtracer::v1::NamedValue &item,
                                    std::set<std::string> &names) {
         const auto &name = item.name();
-        if (name.empty() || name.size() > 63 || !names.insert(name).second ||
-            !item.has_value() || item.value().type() == clangtracer::v1::VOID ||
-            !valid_result(item.value()))
+        if (name.empty() || !names.insert(name).second || !item.has_value() ||
+            item.value().type() == clangtracer::v1::VOID || !valid_result(item.value())) {
           return false;
+        }
         for (std::size_t i = 0; i < name.size(); ++i) {
           const char c = name[i];
           if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
@@ -1445,6 +1413,7 @@ private:
         // Older version-2 agents published entry-only events without call IDs.
         valid_phase = event.call_id() == 0 && !event.has_result();
         break;
+      case clangtracer::v1::EXCEPTION:
       case clangtracer::v1::PRE:
         valid_phase = event.call_id() != 0 && !event.has_result();
         break;
@@ -1452,10 +1421,20 @@ private:
         valid_phase = event.call_id() != 0 && event.has_result() &&
                       valid_result(event.result());
         break;
+      case clangtracer::v1::AGENT_OBSERVER: {
+        const auto& id = event.agent_latency().plugin_id();
+        valid_phase = event.call_id() != 0 && !event.has_result() &&
+                      event.arguments().empty() && !id.empty() && id.size() < 128 &&
+                      id.front() != '-' &&
+                      id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
+                          std::string::npos;
+        break;
+      }
       default:
         break;
       }
-      if (!valid_phase)
+      if (event.has_agent_latency() != (event.phase() == clangtracer::v1::AGENT_OBSERVER) ||
+          !valid_phase)
         continue;
       // Function names are assigned by the server from the registered ProbeSpec.
       if (!event.function_name().empty())
@@ -1470,8 +1449,9 @@ private:
       event.clear_replay_types();
       event.clear_object_observation();
       event.set_function_name(active->second.function_name);
+      event.set_object_probe_registration_id(active->second.object_probe_registration_id);
       const auto snapshot = snapshot_probes_.find(key);
-      if (snapshot == snapshot_probes_.end()) {
+      if (event.phase() == api::AGENT_OBSERVER || snapshot == snapshot_probes_.end()) {
         ++received_[key];
         append_native_locked(std::move(event));
       } else {
@@ -1489,12 +1469,13 @@ public:
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
                 std::string context_durable_directory,
-                EventHistoryLimits limits, ContextTransportBudget context_budget)
+                EventHistoryLimits limits, ContextTransportBudget context_budget,
+                bool local_control)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
-        context_budget_(context_budget),
+        context_budget_(context_budget), local_control_(local_control),
         events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
@@ -1565,12 +1546,6 @@ public:
         return {grpc::StatusCode::ALREADY_EXISTS,
                 "a session already owns this PID"};
       }
-      if (sessions_.size() + pending_pids_.size() >= kSessionLimit &&
-          !evict_finished_session_locked()) {
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
-                "session limit reached: " + std::to_string(kSessionLimit) +
-                    " sessions are attached, attaching, or failed; detach one first"};
-      }
       if (!pending_pids_.insert(pid).second) {
         return {grpc::StatusCode::ALREADY_EXISTS,
                 "an attach for this PID is in progress"};
@@ -1637,8 +1612,6 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
-      if (request->module().find('\0') != std::string::npos)
-        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid debug module"};
       client::DebugLookupOptions lookup;
       lookup.module = request->module();
       lookup.max_entries = request->debug_max_entries();
@@ -1678,7 +1651,6 @@ public:
     if (request->selector().empty() ||
         request->selector().find('\0') != std::string::npos ||
         request->callback_source().empty() ||
-        request->callback_source().size() > kMaxCallbackSource ||
         request->callback_source().find('\0') != std::string::npos) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "selector and callback source must be nonempty and contain no NUL"};
@@ -1722,6 +1694,12 @@ public:
                                        request->translation_unit());
       set_probe_extra_compile_arguments(resolved.spec, request->extra_compile_arguments());
       resolved.spec.set_callback_source(request->callback_source());
+      resolved.spec.set_allow_argument_overrides(request->allow_argument_overrides());
+      resolved.spec.set_allow_result_override(request->allow_result_override());
+      resolved.spec.set_allow_replacement(request->allow_replacement());
+      resolved.spec.set_allow_call_original(request->allow_call_original());
+      resolved.spec.set_trace_exceptions(request->trace_exceptions());
+      resolved.spec.set_reclaimable(request->reclaimable());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
         return input_valid;
@@ -1748,6 +1726,8 @@ public:
   grpc::Status AddProbe(grpc::ServerContext *,
                         const clangtracer::v1::AddProbeRequest *request,
                         clangtracer::v1::Probe *response) override {
+    if (request->spec().object_watch_id())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "install grouped methods with ObjectProbe"};
     const auto validation = validate_probe(request->spec());
     if (!validation.ok())
       return validation;
@@ -1767,13 +1747,12 @@ public:
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
     try {
+      if (object_probe_member(session->id(), request->probe_id()))
+        return {grpc::StatusCode::FAILED_PRECONDITION, "stop the object probe before changing its methods"};
       auto spec = session->reload_spec(request->probe_id(), request->callback_source());
       const auto validation = validate_probe(spec);
       if (!validation.ok())
         return validation;
-      const auto retained = session->agent_retained_count();
-      if (retained == kMaxProbes || session->snapshot().probes_size() >= kMaxProbes)
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reload reached the 32 retained-probe limit"};
       std::uint64_t pending_id = 0;
       const auto status = install_probe(session, spec, {}, pending_id, response->mutable_probe(),
                                         request->probe_id(), [&] {
@@ -1781,7 +1760,7 @@ public:
       });
       if (!status.ok())
         return status;
-      response->set_retained_limit(kMaxProbes);
+      response->set_retained_limit(0); // No fixed probe limit.
       if (const auto used = session->agent_retained_count())
         response->set_agent_retained(*used);
       return grpc::Status::OK;
@@ -1792,6 +1771,27 @@ public:
     }
   }
 
+  grpc::Status AgentPlugin(grpc::ServerContext *,
+                           const api::AgentPluginRequest *request,
+                           api::AgentPluginResponse *response) override {
+    const auto *enabled = std::getenv("CLANG_TRACER_ALLOW_AGENT_PLUGINS");
+    if (!enabled || std::string_view(enabled) != "1")
+      return {grpc::StatusCode::PERMISSION_DENIED,
+              "agent plugins require CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 on the server"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->agent_plugin(*request);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status RemoveProbe(grpc::ServerContext *,
                            const clangtracer::v1::RemoveProbeRequest *request,
                            clangtracer::v1::Probe *response) override {
@@ -1799,6 +1799,8 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
+    if (object_probe_member(session->id(), request->probe_id()))
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stop the object probe registration"};
     return remove_probe(session, request->probe_id(), response);
   }
 
@@ -1810,6 +1812,7 @@ public:
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
     try {
+      session->refresh_process_state();
       session->detach();
       const auto snapshot = session->snapshot();
       for (const auto &probe : snapshot.probes()) {
@@ -1823,6 +1826,8 @@ public:
       }
       erase_active_pid_if_inactive(session);
       response->CopyFrom(snapshot);
+      if (const auto group = object_probe_group(session->id()))
+        describe_object_probe(session, *group, *response->mutable_object_probe());
       return grpc::Status::OK;
     } catch (const std::exception &error) {
       sync_event_probes(session);
@@ -1867,8 +1872,8 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
-      if (request->include_mappings()) {
-        *response = client::list_debug_module_mappings(session->pid());
+      if (request->include_mappings() || !request->elf_path().empty()) {
+        *response = client::list_debug_module_mappings(session->pid(), request->elf_path());
         response->set_mapping_token(session->id() + ":" + response->mapping_token());
       } else {
         for (const auto &path : client::list_debug_modules(session->pid()))
@@ -1903,6 +1908,106 @@ public:
     return memory::read(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status AllocateMemory(grpc::ServerContext *, const api::AllocateMemoryRequest *request,
+                           api::MemoryAllocation *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->allocate_memory(request->size());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status FreeMemory(grpc::ServerContext *, const api::FreeMemoryRequest *request,
+                           api::MemoryAllocation *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->free_memory(request->allocation_id());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status LoadTargetLibrary(grpc::ServerContext *, const api::LoadTargetLibraryRequest *request,
+                           api::TargetLibrary *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->load_target_library(request->path());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status ApplyMemoryPatch(grpc::ServerContext *context, const api::ApplyMemoryPatchRequest *request,
+                                api::MemoryPatch *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "memory patching requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::apply_patch(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status RestoreMemoryPatch(grpc::ServerContext *, const api::RestoreMemoryPatchRequest *request,
+                                  api::MemoryPatch *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "memory patching requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->restore_memory_patch(request->patch_id());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status StartPageMonitor(grpc::ServerContext *context, const api::StartPageMonitorRequest *request,
+                                api::PageMonitorResult *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "page monitoring requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::start_page_monitor(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status StopPageMonitor(grpc::ServerContext *, const api::StopPageMonitorRequest *request,
+                               api::PageMonitorResult *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "page monitoring requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->stop_page_monitor();
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status ScanMemory(grpc::ServerContext *context, const api::ScanMemoryRequest *request,
                           api::ScanMemoryResponse *response) override {
     auto session = find_session(request->session_id());
@@ -1911,8 +2016,56 @@ public:
     return memory::scan(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status StartInstructionTrace(grpc::ServerContext *context,
+      const api::StartInstructionTraceRequest *request, api::InstructionTrace *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "instruction tracing requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::start_instruction_trace(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status StopInstructionTrace(grpc::ServerContext *,
+      const api::StopInstructionTraceRequest *request, api::InstructionTrace *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "instruction tracing requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->stop_instruction_trace();
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status LiveUpdate(grpc::ServerContext *context, const api::LiveUpdateRequest *request,
+                          api::LiveUpdateStatus *response) override {
+    const auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    const std::lock_guard lock(session->operation_mutex());
+    if (request->action() != api::LiveUpdateRequest::STATUS) {
+      const auto group = snapshot_group(session->id());
+      if (group && snapshot_group_active(*group, session->snapshot())) {
+        response->set_state(api::LiveUpdateStatus::BLOCKED);
+        response->set_diagnostic("stop the active snapshot watch before changing native code");
+        return grpc::Status::OK;
+      }
+    }
+    *response = session->live_update(*request, [&] { return context->IsCancelled(); });
+    return grpc::Status::OK;
+  }
+
   grpc::Status ObjectWatch(grpc::ServerContext *, const api::ObjectWatchRequest *request,
                            api::ObjectWatchStatus *response) override {
+    if (request->lifetimes_only() || request->staged_registration())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "use ObjectProbe for a type registration"};
     const bool prepare = request->action() == api::ObjectWatchRequest::PREPARE;
     auto session = find_session(request->session_id());
     if (!prepare && !session)
@@ -1985,8 +2138,8 @@ public:
         const bool logical_range = vector || map || pointee;
         const bool tagged_union = !request->union_tag().empty();
         if (tagged_union != !request->union_cases().empty() ||
-            request->union_cases_size() > 128 || (tagged_union && (ownership || logical_range)))
-          throw std::invalid_argument("a standalone tagged union requires --union-tag and --union-case");
+            request->union_cases_size() > 128 || (tagged_union && ownership))
+          throw std::invalid_argument("tagged union capture requires --union-tag and --union-case");
         if (tagged_union &&
             request->synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
             request->synchronization() != api::ObjectWatchRequest::CALLER_LOCK)
@@ -2044,6 +2197,37 @@ public:
         snapshot_groups_.erase(session->id());
       }
       return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status ObjectProbe(grpc::ServerContext *context, const api::ObjectProbeRequest *request,
+                            api::ObjectProbeStatus *response) override {
+    using GroupRequest = api::ObjectProbeRequest;
+#if !defined(__linux__) || !defined(__x86_64__)
+    return {grpc::StatusCode::UNIMPLEMENTED, "object probe requires Linux x86-64"};
+#endif
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    const std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      const auto group = object_probe_group(session->id());
+      switch (request->action()) {
+      case GroupRequest::STATUS:
+      case GroupRequest::STOP:
+        if (!group || (request->registration_id() && group->id != request->registration_id()))
+          return {grpc::StatusCode::NOT_FOUND, "no matching type registration in this session"};
+        if (request->action() == GroupRequest::STOP)
+          stop_object_probe(session, *group);
+        return describe_object_probe(session, *group, *response);
+      case GroupRequest::PREVIEW:
+      case GroupRequest::START:
+        return bind_object_probe(*context, session, *request, group, *response);
+      default:
+        return {grpc::StatusCode::INVALID_ARGUMENT, "unknown object probe action"};
+      }
     } catch (const std::exception &error) {
       return status_for(error);
     }
@@ -2257,15 +2441,19 @@ public:
     const std::string callback = request->has_callback_source()
         ? request->callback_source()
         : "struct Interceptor { void pre(const Call&) {} void post(const Call&) {} };";
-    if (callback.empty() || callback.size() > kMaxCallbackSource ||
-        callback.find('\0') != std::string::npos)
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "callback source must be 1 to 65536 bytes without NUL"};
+    if (callback.empty() || callback.find('\0') != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "callback source must be nonempty without NUL"};
+    }
 
     auto session = find_session(request->session_id());
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
+    const auto cancelled = [&] {
+      return context->IsCancelled() || std::chrono::system_clock::now() >= context->deadline();
+    };
+    if (cancelled())
+      return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled before preflight"};
     const auto snapshot = session->snapshot();
     if (std::any_of(snapshot.probes().begin(), snapshot.probes().end(),
                     [&](const auto &probe) { return probe.bulk_batch_id() == batch_id; }))
@@ -2277,8 +2465,6 @@ public:
       return status;
     response->set_batch_id(batch_id);
     *response->mutable_unmatched_exact_selectors() = preview.unmatched_exact_selectors();
-    if (preview.has_available_slots())
-      response->set_available_slots(preview.available_slots());
 
     bool blocked = !preview.unmatched_exact_selectors().empty();
     std::set<std::uint64_t> entries;
@@ -2286,6 +2472,12 @@ public:
       auto &row = *response->add_entries();
       const auto &function = candidate.function();
       *row.mutable_function() = function;
+      if (candidate.abi_status() == api::BulkTraceCandidate::ALIAS) {
+        // Same code as a primary selected in this batch: its probe covers this name.
+        row.set_status(Entry::ALIASED);
+        row.set_diagnostic(candidate.diagnostic());
+        continue;
+      }
       if (candidate.abi_status() != api::BulkTraceCandidate::DWARF_SUPPORTED) {
         row.set_status(Entry::BLOCKED);
         row.set_diagnostic(api::BulkTraceCandidate::AbiStatus_Name(candidate.abi_status()) +
@@ -2306,24 +2498,30 @@ public:
       response->set_diagnostic("selection contains blocked or unmatched entries");
     else if (response->entries().empty())
       response->set_diagnostic("selection matched no entries");
-    else if (!preview.has_available_slots())
-      response->set_diagnostic("agent capacity could not be verified");
-    else if (static_cast<unsigned>(response->entries_size()) > preview.available_slots())
-      response->set_diagnostic("selection exceeds available retained probe slots");
     if (!response->diagnostic().empty())
       return grpc::Status::OK;
 
     // Resolve all exact bindings before changing target code. The agent checks
     // the binding again at installation, including the mapped image identity.
     std::vector<api::ProbeSpec> specs;
+    std::vector<int> installing; // entry index of each spec; aliases get no probe of their own
     specs.reserve(response->entries_size());
     client::DebugLookupOptions lookup;
-    lookup.is_cancelled = [&] { return context->IsCancelled(); };
+    lookup.is_cancelled = cancelled;
+    int index = -1;
     for (auto &row : *response->mutable_entries()) {
+      ++index;
+      if (row.status() == Entry::ALIASED)
+        continue;
       const auto &function = row.function();
       lookup.module = function.module_path();
       try {
-        auto spec = client::resolve_debug_callable(session->pid(), function.selector(), lookup).spec;
+        // The entry points of one constructor or destructor (C1/C2, D0/D1/D2) share a selector;
+        // bind the previewed one by its linkage symbol.
+        const bool cdtor = client::is_constructor_symbol(function.linkage_symbol()) ||
+                           client::is_destructor_symbol(function.linkage_symbol());
+        auto spec = client::resolve_debug_callable(
+            session->pid(), cdtor ? function.linkage_symbol() : function.selector(), lookup).spec;
         const auto &info = spec.debug_info();
         if (info.module() != function.module_path() || spec.symbol() != function.linkage_symbol() ||
             info.runtime_entry() != function.runtime_address() ||
@@ -2333,9 +2531,12 @@ public:
         const auto validation = validate_probe(spec);
         if (!validation.ok())
           throw std::runtime_error(validation.error_message());
+        if (cdtor)  // rows of one declaration differ only by entry point
+          row.set_diagnostic("constructor/destructor entry " + function.linkage_symbol());
         specs.push_back(std::move(spec));
+        installing.push_back(index);
       } catch (const std::exception &error) {
-        if (context->IsCancelled())
+        if (cancelled())
           return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled during preflight"};
         row.set_status(Entry::BLOCKED);
         row.set_diagnostic(error.what());
@@ -2349,23 +2550,37 @@ public:
 
     // Keep the attempted IDs even when installation throws after preparing
     // or writing an entry. Only IDs retained by this batch can be restored.
-    std::vector<std::uint64_t> attempted(specs.size());
-    for (std::size_t i = 0; i < specs.size() && !context->IsCancelled(); ++i) {
-      auto &row = *response->mutable_entries(i);
+    std::vector<std::uint64_t> attempted(response->entries_size());
+    for (std::size_t i = 0; i < specs.size() && !cancelled(); ++i) {
+      auto &row = *response->mutable_entries(installing[i]);
       api::Probe probe;
-      const auto result = install_probe(session, specs[i], batch_id, attempted[i], &probe);
+      const auto result = install_probe(session, specs[i], batch_id, attempted[installing[i]],
+                                        &probe, 0, cancelled);
       if (!result.ok()) {
         row.set_status(Entry::INSTALL_FAILED);
         row.set_diagnostic(result.error_message());
-        response->set_diagnostic("bulk installation failed");
+        response->set_diagnostic(cancelled() ? "bulk trace apply cancelled" :
+                                               "bulk installation failed");
         break;
       }
       *row.mutable_probe() = std::move(probe);
       row.set_status(Entry::INSTALLED);
     }
-    if (context->IsCancelled() && response->diagnostic().empty())
+    if (cancelled() && response->diagnostic().empty())
       response->set_diagnostic("bulk trace apply cancelled");
     if (response->diagnostic().empty()) {
+      // An alias reports the probe that covers it.
+      for (auto &alias : *response->mutable_entries()) {
+        if (alias.status() != Entry::ALIASED)
+          continue;
+        for (const auto &primary : response->entries())
+          if (primary.status() == Entry::INSTALLED &&
+              primary.function().runtime_address() == alias.function().runtime_address() &&
+              primary.function().module_path() == alias.function().module_path()) {
+            *alias.mutable_probe() = primary.probe();
+            break;
+          }
+      }
       response->set_complete(true);
       return grpc::Status::OK;
     }
@@ -2531,11 +2746,25 @@ private:
   ContextTransportBudget context_budget_;
   std::condition_variable context_endpoint_cv_;
   bool context_endpoint_ready_ = false;
+  const bool local_control_;
   EventHub events_;
   std::atomic<std::uint64_t> next_probe_id_;
   std::mutex mutex_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
   std::map<std::string, std::shared_ptr<SnapshotGroup>> snapshot_groups_;
+  struct ObjectProbeGroup {
+    std::uint64_t id = 0;
+    bool published = false;
+    bool finished = false;
+    api::ObjectWatchStatus stopped_watch;
+    api::ObjectWatchStatus preview_watch;
+    api::ObjectProbeRequest definition;
+    api::ObjectProbeBinding binding;
+    std::vector<std::uint64_t> methods;
+    std::string diagnostic;
+  };
+  // Individual groups are accessed under the corresponding session operation lock.
+  std::map<std::string, std::shared_ptr<ObjectProbeGroup>> object_probe_groups_;
   std::map<std::uint32_t, std::string> active_by_pid_;
   std::set<std::uint32_t> pending_pids_;
   // Session ids in attach order, oldest first, so history eviction is FIFO.
@@ -2562,6 +2791,7 @@ private:
       const auto active = active_by_pid_.find(found->second->pid());
       if (active != active_by_pid_.end() && active->second == found->first)
         active_by_pid_.erase(active);
+      object_probe_groups_.erase(found->first);
       sessions_.erase(found);
       session_order_.erase(it);
       return true;
@@ -2591,33 +2821,32 @@ private:
   std::vector<SnapshotMethod> prepare_snapshot_watch(const api::ObjectWatchRequest &request,
                                                      Session *session,
                                                      api::ObjectWatchStatus &response) {
-    if (request.methods().empty() || request.methods_size() > 16 ||
-        request.concrete_type().empty() || request.concrete_type().size() > 512 ||
-        request.stack_depth() > 64 || request.no_values() || !request.base_type().empty() ||
-        request.first_seen() || request.writer_entry() || request.writer_tid() || request.event_buffer() ||
-        !request.vector_field().empty() ||
+    if (request.methods().empty() || request.concrete_type().empty() ||
+        request.concrete_type().size() > 512 || request.stack_depth() > 64 || request.no_values() ||
+        !request.base_type().empty() || request.first_seen() || request.writer_entry() ||
+        request.writer_tid() || request.event_buffer() || !request.vector_field().empty() ||
         request.has_element_key() || !request.map_field().empty() || !request.map_key().empty() ||
-        !request.pointee_field().empty() ||
-        !request.union_tag().empty() || !request.union_cases().empty() ||
-        !request.async_signals().empty() ||
+        !request.pointee_field().empty() || !request.union_tag().empty() ||
+        !request.union_cases().empty() || !request.async_signals().empty() ||
         !request.element_key_field().empty() || !request.mutation_symbol().empty() ||
-        !request.additional_mutation_symbols().empty() ||
-        !request.owner_type().empty() || !request.collection().empty() ||
-        !request.owner_add().empty() || !request.owner_get().empty() ||
-        !request.owner_remove().empty() || !request.owner_snapshot().empty() ||
-        !request.code_symbol().empty() || !request.code_module().empty() ||
-        !request.additional_code_symbols().empty() || request.syscall_output() || request.cfi_stack() ||
-        request.serialize_wait_us() || request.follow_calls() || request.runtime_limit() ||
-        !request.shared_file().empty() ||
+        !request.additional_mutation_symbols().empty() || !request.owner_type().empty() ||
+        !request.collection().empty() || !request.owner_add().empty() ||
+        !request.owner_get().empty() || !request.owner_remove().empty() ||
+        !request.owner_snapshot().empty() || !request.code_symbol().empty() ||
+        !request.code_module().empty() || !request.additional_code_symbols().empty() ||
+        request.syscall_output() || request.cfi_stack() || request.serialize_wait_us() ||
+        request.follow_calls() || request.runtime_limit() || !request.shared_file().empty() ||
         request.overflow_policy() != api::ObjectWatchRequest::DROP_NEW ||
         !request.borrow_caller().empty() || !request.snapshot_field().empty() ||
-        request.backend() != api::ObjectWatchRequest::PTRACE ||
-        !request.max_elements() || request.max_elements() > context_engine::max_capture_items ||
-        !request.max_string_bytes() || request.max_string_bytes() > max_snapshot_bytes ||
-        !request.snapshot_max_bytes() || request.snapshot_max_bytes() > max_snapshot_bytes ||
-        !request.snapshot_max_depth() || request.snapshot_max_depth() > context_engine::max_capture_depth ||
-        !request.max_instances() || request.max_instances() > 65536)
-      throw std::invalid_argument("snapshot watches require 1 to 16 prepared methods and a concrete receiver type");
+        request.backend() != api::ObjectWatchRequest::PTRACE || !request.max_elements() ||
+        request.max_elements() > context_engine::max_capture_items || !request.max_string_bytes() ||
+        request.max_string_bytes() > max_snapshot_bytes || !request.snapshot_max_bytes() ||
+        request.snapshot_max_bytes() > max_snapshot_bytes || !request.snapshot_max_depth() ||
+        request.snapshot_max_depth() > context_engine::max_capture_depth ||
+        !request.max_instances() || request.max_instances() > 65536) {
+      throw std::invalid_argument(
+          "snapshot watches require prepared methods and a concrete receiver type");
+    }
     if (request.snapshot_module().size() > 4096 ||
         request.snapshot_module().find('\0') != std::string::npos ||
         (!session && !request.snapshot_module().empty()))
@@ -2626,8 +2855,6 @@ private:
         request.synchronization() != api::ObjectWatchRequest::CALLER_LOCK &&
         request.synchronization() != api::ObjectWatchRequest::STABLE_AT_BOUNDARIES)
       throw std::invalid_argument("snapshot watch requires a declared receiver synchronization policy");
-    if (request.snapshot_fields_size() > 128 || request.snapshot_keys_size() > 128)
-      throw std::invalid_argument("too many selected snapshot paths or identity rules");
     std::set<std::string> fields;
     for (const auto &field : request.snapshot_fields())
       if (field.empty() || field.size() > 512 || field.find('\0') != std::string::npos ||
@@ -2645,15 +2872,17 @@ private:
     std::set<std::uint64_t> entries;
     for (const auto &prepared : request.methods()) {
       std::string_view receiver = prepared.header_types().record_name();
-      if (receiver.starts_with("::"))
+      if (::tracer::compat::starts_with(receiver, "::"))
         receiver.remove_prefix(2);
       std::string_view type = request.concrete_type();
-      if (type.starts_with("::"))
+      if (::tracer::compat::starts_with(type, "::"))
         type.remove_prefix(2);
-      if (prepared.ByteSizeLong() > 65536 || prepared.module_sha256().size() != 32 ||
+      if (prepared.module_sha256().size() != 32 ||
           !tracer::prepared::is_typed_version(prepared.format_version()) ||
-          prepared.signature().kind() != api::METHOD || receiver != type)
-        throw std::invalid_argument("snapshot method requires a pinned typed adapter for the selected receiver");
+          prepared.signature().kind() != api::METHOD || receiver != type) {
+        throw std::invalid_argument(
+            "snapshot method requires a pinned typed adapter for the selected receiver");
+      }
       api::ProbeSpec spec;
       std::string module = request.executable_file();
       if (session) {
@@ -2662,7 +2891,7 @@ private:
         try {
           spec = client::bind_prepared_callable(session->pid(), prepared, lookup).spec;
         } catch (const std::runtime_error &error) {
-          if (!std::string_view(error.what()).starts_with("PREPARED_MODULE_MISMATCH"))
+          if (!::tracer::compat::starts_with(std::string_view(error.what()), "PREPARED_MODULE_MISMATCH"))
             throw;
           std::vector<std::string> candidates;
           const auto wanted = lookup.module.empty() ? prepared.module_name() : lookup.module;
@@ -2820,6 +3049,304 @@ public:
     return snapshot_watch_status(session, *group, api::ObjectWatchRequest::STATUS, response);
   }
 
+  std::shared_ptr<ObjectProbeGroup> object_probe_group(const std::string &session_id) {
+    const std::lock_guard lock(mutex_);
+    const auto found = object_probe_groups_.find(session_id);
+    return found == object_probe_groups_.end() ? nullptr : found->second;
+  }
+
+  bool object_probe_member(const std::string &session_id, std::uint64_t id) {
+    const auto group = object_probe_group(session_id);
+    return group && std::find(group->methods.begin(), group->methods.end(), id) != group->methods.end();
+  }
+
+  static api::ObjectWatchRequest object_probe_watch_request(
+      const api::ObjectProbeRequest &request, const api::Session &session) {
+    using Watch = api::ObjectWatchRequest;
+    const auto &input = request.watch();
+    const auto valid = [](const std::string &value) {
+      return value.size() <= 512 && value.find('\0') == std::string::npos;
+    };
+    if (input.concrete_type().empty() || !valid(input.concrete_type()) ||
+        !valid(input.field()) || !valid(input.code_symbol()) || !valid(input.code_module()) ||
+        !valid(input.union_tag()) || input.additional_code_symbols_size() > 15 ||
+        input.union_cases_size() > 32)
+      throw std::invalid_argument("invalid object probe type, field, union, or writer selector");
+    Watch watch;
+    watch.set_session_id(request.session_id());
+    watch.set_concrete_type(input.concrete_type());
+    watch.set_backend(Watch::CODE_CACHE);
+    watch.set_staged_registration(true);
+    watch.set_lifetimes_only(input.field().empty());
+    watch.set_field(input.field());
+    watch.set_code_symbol(input.code_symbol());
+    watch.set_code_module(watch.lifetimes_only() && input.code_module().empty()
+                              ? request.method_module() : input.code_module());
+    watch.set_follow_calls(input.follow_calls());
+    watch.set_max_elements(256);
+    watch.set_max_string_bytes(256);
+    watch.set_no_values(input.no_values());
+    watch.set_first_seen(input.first_seen());
+    watch.set_union_tag(input.union_tag());
+    watch.set_synchronization(input.synchronization());
+    if (watch.first_seen() && !request.methods().empty())
+      throw std::invalid_argument("--first-seen is supported for write-only object-probe packages");
+    if (watch.lifetimes_only() && (request.methods().empty() || !watch.code_symbol().empty() ||
+        watch.follow_calls() || watch.first_seen() || watch.no_values() ||
+        !watch.union_tag().empty() || !input.union_cases().empty() || !input.additional_code_symbols().empty()))
+      throw std::invalid_argument("lifetime-only object probes require methods and take no writer options");
+    if ((!watch.lifetimes_only() && watch.code_symbol().empty()) ||
+        (watch.union_tag().empty() != input.union_cases().empty()) ||
+        (watch.follow_calls() && !request.methods().empty()))
+      throw std::invalid_argument("invalid write selection or runtime writer following with method probes");
+    const bool synchronized = watch.synchronization() == Watch::THREAD_CONFINED ||
+                              watch.synchronization() == Watch::CALLER_LOCK;
+    if (!watch.union_tag().empty() && !synchronized)
+      throw std::invalid_argument("tagged union capture requires thread-confined or caller-lock synchronization");
+    if (watch.first_seen() && !watch.code_module().empty()) {
+      if (watch.code_module() != session.executable() &&
+          watch.code_module() != std::filesystem::path(session.executable()).filename().string())
+        throw std::invalid_argument("first-seen capture requires a standalone executable writer");
+      watch.clear_code_module();
+    }
+    for (const auto &writer : input.additional_code_symbols()) {
+      if (writer.empty() || !valid(writer))
+        throw std::invalid_argument("invalid additional writer selector");
+      watch.add_additional_code_symbols(writer);
+    }
+    for (const auto &entry : input.union_cases()) {
+      if (entry.member().empty() || !valid(entry.member()))
+        throw std::invalid_argument("invalid union case member");
+      *watch.add_union_cases() = entry;
+    }
+    return watch;
+  }
+
+  grpc::Status describe_object_probe(const std::shared_ptr<Session> &session,
+                                    ObjectProbeGroup &group, api::ObjectProbeStatus &response) {
+    using Watch = api::ObjectWatchRequest;
+    response.set_registration_id(group.id);
+    *response.mutable_binding() = group.binding;
+    session->refresh_process_state();
+    if (group.finished)
+      *response.mutable_watch() = group.stopped_watch;
+    if (!group.finished && session->has_object_probe_registration(group.id)) {
+      Watch watch;
+      watch.set_action(Watch::STATUS);
+      watch.set_watch_id(group.id);
+      *response.mutable_watch() = session->object_watch(watch, 0, {});
+    }
+    const auto current = session->snapshot();
+    const bool exited = current.state() == api::Session::EXITED;
+    const bool detached = current.state() == api::Session::DETACHED;
+    const bool terminated = exited || detached;
+    bool methods_live = false;
+    for (const auto &probe : current.probes()) {
+      if (std::find(group.methods.begin(), group.methods.end(), probe.id()) == group.methods.end())
+        continue;
+      auto &reported = *response.add_methods();
+      reported = probe;
+      if (terminated) {
+        reported.set_active(false);
+        reported.set_draining(false);
+      }
+      methods_live |= reported.active() || reported.draining();
+    }
+    if (terminated) {
+      group.published = false;
+      group.finished = true;
+      group.stopped_watch = response.watch();
+    }
+    response.set_active(group.published && response.watch().active());
+    response.set_restoration_pending(!terminated && (response.watch().restoration_pending() ||
+        (!response.active() && (methods_live || !group.finished))));
+    response.set_diagnostic(terminated ? (exited ? "target exited" : "session detached") : group.diagnostic);
+    return grpc::Status::OK;
+  }
+
+  void stop_object_probe(const std::shared_ptr<Session> &session, ObjectProbeGroup &group) {
+    using Watch = api::ObjectWatchRequest;
+    if (group.finished)
+      return;
+    session->refresh_process_state();
+    const auto state = session->snapshot().state();
+    if (state == api::Session::EXITED || state == api::Session::DETACHED)
+      return; // describe_object_probe retires and reports the terminal registration.
+    const bool has_watch = session->has_object_probe_registration(group.id);
+    if (has_watch)
+      session->set_object_probe_active(group.id, false);
+    group.published = false;
+    for (auto it = group.methods.rbegin(); it != group.methods.rend(); ++it) {
+      api::Probe probe;
+      const auto result = remove_probe(session, *it, &probe);
+      if (!result.ok()) {
+        group.diagnostic = "method restoration pending for " + std::to_string(*it) + ": " +
+                           result.error_message();
+        return;
+      }
+    }
+    if (!has_watch) {
+      group.finished = true;
+      return;
+    }
+    Watch watch;
+    watch.set_action(Watch::STOP);
+    watch.set_watch_id(group.id);
+    watch.set_staged_registration(true);
+    const auto stopped = session->object_watch(watch, 0, {});
+    group.finished = !stopped.active() && !stopped.restoration_pending();
+    group.stopped_watch = stopped;
+    group.diagnostic = stopped.diagnostic();
+  }
+
+  grpc::Status bind_object_probe(grpc::ServerContext &context,
+      const std::shared_ptr<Session> &session, const api::ObjectProbeRequest &request,
+      const std::shared_ptr<ObjectProbeGroup> &previous, api::ObjectProbeStatus &response) {
+    using Request = api::ObjectProbeRequest;
+    using Watch = api::ObjectWatchRequest;
+    const bool starting = request.action() == Request::START;
+    if ((request.methods().empty() != request.callback_source().empty()) ||
+        request.callback_source().find('\0') != std::string::npos ||
+        request.method_module().size() > 4096 || request.method_module().find('\0') != std::string::npos)
+      throw std::invalid_argument("invalid object probe methods or callback source");
+    auto definition = request;
+    definition.clear_preview();
+    definition.set_action(Request::START);
+    if (previous && !previous->finished) {
+      if (previous->published && previous->definition.SerializeAsString() == definition.SerializeAsString()) {
+        const auto status = describe_object_probe(session, *previous, response);
+        if (!starting && response.active()) {
+          *response.mutable_watch() = previous->preview_watch;
+          response.set_diagnostic("showing the verified binding of the active registration");
+        }
+        return status;
+      }
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stop the existing object probe registration first"};
+    }
+    session->preflight_object_probe();
+    auto watch = object_probe_watch_request(request, session->snapshot());
+    std::vector<api::ProbeSpec> methods;
+    methods.reserve(request.methods_size());
+    std::set<std::uint64_t> entries;
+    for (const auto &artifact : request.methods()) {
+      if (!tracer::prepared::is_typed_version(artifact.format_version()) || artifact.selector().empty())
+        throw std::invalid_argument("object probe requires an exact typed prepared method");
+      client::DebugLookupOptions lookup;
+      lookup.module = request.method_module();
+      lookup.is_cancelled = [&] { return context.IsCancelled(); };
+      auto spec = client::bind_prepared_callable(session->pid(), artifact, lookup).spec;
+      const auto &info = spec.debug_info();
+      if (spec.signature().kind() != api::METHOD ||
+          info.record_name() != watch.concrete_type() ||
+          !info.runtime_entry() || !info.entry_size() ||
+          !entries.insert(info.runtime_entry()).second)
+        throw std::invalid_argument("method requires a unique exact receiver of the registered type");
+      spec.set_callback_source(request.callback_source());
+      spec.set_native_backend("entry");
+      const auto validated = validate_probe(spec);
+      if (!validated.ok())
+        return validated;
+      methods.push_back(std::move(spec));
+    }
+
+    if (watch.lifetimes_only() && watch.code_module().empty())
+      watch.set_code_module(methods.front().debug_info().module());
+    const bool verify_method_lifetimes = !methods.empty();
+    watch.set_action(Watch::PREVIEW);
+    const auto preview = session->object_watch(watch, 0, {}, verify_method_lifetimes);
+    *response.mutable_watch() = preview;
+    auto &binding = *response.mutable_binding();
+    *binding.mutable_watch() = preview.plan();
+    for (int i = 0; i < request.methods_size(); ++i) {
+      const auto &info = methods[i].debug_info();
+      const auto &artifact = request.methods(i);
+      const auto boundary = object_watch::Plan::method_boundary(
+          info.module(), artifact, &info, true, session->pid());
+      const auto method_pc = boundary.binding.runtime_pc();
+      const auto method_width = boundary.binding.patch_size();
+      const auto overlaps_method = [&](std::uint64_t pc, std::size_t size) {
+        return size && (pc >= method_pc ? pc - method_pc < method_width : method_pc - pc < size);
+      };
+      for (const auto &patch : preview.redirects())
+        if (overlaps_method(patch.pc(), patch.original().size()))
+          throw std::invalid_argument("method overlaps an object lifecycle or writer patch: " + artifact.selector());
+      // Even a call-site redirect may translate the entire verified writer
+      // body. A method detour inside that body invalidates the cache's input.
+      for (const auto &entry : preview.plan().bindings())
+        if (overlaps_method(entry.runtime_pc(), entry.original().size()))
+          throw std::invalid_argument("method patch overlaps an object lifecycle or writer body: " + artifact.selector());
+      const bool owns_lifetime = std::any_of(binding.watch().bindings().begin(),
+          binding.watch().bindings().end(), [&](const auto &entry) {
+        return (entry.role() == "construct" || entry.role() == "construct (complete/base alias)" ||
+                entry.role() == "construct (provisional: incomplete lifetime coverage)") &&
+            entry.module() == info.module();
+      });
+      if (!owns_lifetime)
+        throw std::invalid_argument("method and its constructor evidence must be verified in the same image");
+      *binding.add_methods() = info;
+      *binding.add_method_patches() = boundary.binding;
+    }
+    if (request.has_preview() && request.preview().SerializeAsString() != binding.SerializeAsString())
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stale object probe binding; preview the attached image again"};
+    if (!starting) {
+      response.set_diagnostic("verified exact receiver methods and candidate watch patches");
+      return grpc::Status::OK;
+    }
+
+    auto group = std::make_shared<ObjectProbeGroup>();
+    do { group->id = next_probe_id_.fetch_add(1); } while (!group->id);
+    group->definition = std::move(definition);
+    group->binding = binding;
+    group->preview_watch = preview;
+    watch.set_action(Watch::START);
+    *watch.mutable_prepared_bindings() = binding.watch();
+    {
+      const std::lock_guard lock(mutex_);
+      object_probe_groups_[session->id()] = group;
+    }
+    try {
+      for (auto &spec : methods) {
+        spec.set_object_watch_id(group->id);
+        api::Probe probe;
+        std::uint64_t id = 0;
+        const auto result = install_probe(session, spec, {}, id, &probe, 0, [&] {
+          return context.IsCancelled() || std::chrono::system_clock::now() >= context.deadline();
+        });
+        if (result.ok() && probe.active()) {
+          group->methods.push_back(id);
+          continue;
+        }
+        if (id) {
+          const auto snapshot = session->snapshot();
+          for (const auto &current : snapshot.probes())
+            if (current.id() == id)
+              group->methods.push_back(id);
+        }
+        throw std::runtime_error("object probe method installation failed: " + result.error_message());
+      }
+      if (context.IsCancelled() || std::chrono::system_clock::now() >= context.deadline())
+        throw std::runtime_error("object probe activation cancelled");
+      const auto installed = session->object_watch(watch, group->id, [this](auto event) {
+        events_.publish_object_observation(std::move(event));
+      }, verify_method_lifetimes);
+      if (!installed.active() || installed.restoration_pending())
+        throw std::runtime_error("object probe watch failed to become active");
+      session->set_object_probe_active(group->id, true);
+      group->published = true;
+      group->diagnostic = installed.diagnostic();
+    } catch (const std::exception &error) {
+      try {
+        stop_object_probe(session, *group);
+      } catch (const std::exception &cleanup) {
+        group->diagnostic = std::string("restoration pending: ") + cleanup.what();
+      }
+      if (group->finished)
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+      group->diagnostic = std::string(error.what()) + " | " + group->diagnostic;
+    }
+    return describe_object_probe(session, *group, response);
+  }
+
   void erase_active_pid_if_inactive(const std::shared_ptr<Session> &session) {
     const auto state = session->snapshot().state();
     if (state != clangtracer::v1::Session::DETACHED &&
@@ -2874,7 +3401,8 @@ public:
               ? selector
               : spec.symbol();
       events_.set_probe(session->id(), pending_probe_id, session->pid(),
-                        function_name, true, &spec.prepared(), std::move(snapshot));
+                        function_name, true, &spec.prepared(), std::move(snapshot),
+                        spec.object_watch_id());
       const auto lineage = admit_probe_package(spec);
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "
@@ -2948,13 +3476,11 @@ public:
       if (snapshot.state() != clangtracer::v1::Session::ATTACHED)
         return {grpc::StatusCode::FAILED_PRECONDITION,
                 "target process exited during bulk preview"};
-      preview.set_retained_limit(kMaxProbes);
-      preview.set_session_retained(snapshot.probes_size());
-      if (agent_retained) {
+      preview.set_retained_limit(0); // No fixed probe limit.
+      preview.set_session_retained(std::count_if(snapshot.probes().begin(), snapshot.probes().end(),
+          [](const auto &probe) { return !probe.reclaimed(); }));
+      if (agent_retained)
         preview.set_agent_retained(*agent_retained);
-        const auto retained = std::max(*agent_retained, preview.session_retained());
-        preview.set_available_slots(kMaxProbes - std::min(kMaxProbes, retained));
-      }
       response->Swap(&preview);
       return grpc::Status::OK;
     } catch (const client::DebugLookupLimit &error) {
@@ -2988,6 +3514,10 @@ public:
   }
 
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
+    if ((has_scalar_overrides(spec) || spec.reclaimable()) && !local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "scalar overrides require a local Unix control socket"};
+    if (const auto *error = scalar_override_error(spec))
+      return {grpc::StatusCode::INVALID_ARGUMENT, error};
     if ((!spec.native_backend().empty() && spec.native_backend() != "auto" &&
          spec.native_backend() != "entry") ||
         (!spec.direct_caller().empty() &&
@@ -3000,10 +3530,6 @@ public:
     const bool typed_prepared = tracer::prepared::is_typed_version(spec.prepared().format_version());
     if (typed_prepared && !spec.include_headers().empty() && !spec.has_header_context())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared injection requires a callback compilation context for optional includes"};
-    if (spec.ByteSizeLong() > 256 * 1024) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "probe specification exceeds 256 KiB"};
-    }
     if (spec.symbol().empty() ||
         spec.symbol().size() >= sizeof(Request{}.symbol) ||
         spec.symbol().find('\0') != std::string::npos) {
@@ -3011,10 +3537,8 @@ public:
               "symbol must be 1 to 511 bytes without NUL"};
     }
     if (spec.callback_source().empty() ||
-        spec.callback_source().size() > kMaxCallbackSource ||
         spec.callback_source().find('\0') != std::string::npos) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "callback source must be 1 to 65536 bytes without NUL"};
+      return {grpc::StatusCode::INVALID_ARGUMENT, "callback source must be nonempty without NUL"};
     }
     const auto &signature = spec.signature();
     if (signature.kind() != clangtracer::v1::FUNCTION &&
@@ -3037,16 +3561,10 @@ public:
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid receiver diagnostic"};
     }
-    if (spec.compile_options_size() > 128) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "at most 128 compiler options are allowed"};
-    }
-    std::size_t compile_option_bytes = 0;
     for (const auto &option : spec.compile_options()) {
-      compile_option_bytes += option.size() + 1;
-      if (!valid_text(option, 4096) || compile_option_bytes > 65536) {
+      if (!valid_text(option, SIZE_MAX)) {
         return {grpc::StatusCode::INVALID_ARGUMENT,
-                "compiler options must be nonempty and total at most 64 KiB"};
+                "compiler options must be nonempty without NUL"};
       }
     }
     if (!safe_preflight_compiler_arguments(spec.compile_options().begin(),
@@ -3064,29 +3582,22 @@ public:
         return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
       }
     }
-    if (spec.argument_names_size() > 8 || spec.include_headers_size() > 16 ||
-        (spec.has_debug_info() &&
-         (spec.debug_info().ByteSizeLong() > 64 * 1024 ||
-          spec.debug_info().module().empty() ||
-          spec.debug_info().selector().empty() ||
-          spec.debug_info().runtime_entry() == 0 ||
-          spec.debug_info().entry_size() == 0 ||
-          spec.debug_info().entry_size() >
-              std::numeric_limits<std::uint64_t>::max() -
-                  spec.debug_info().runtime_entry() ||
-          spec.debug_info().record_calling_convention() <
-              clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
-          spec.debug_info().record_calling_convention() >
-              clangtracer::v1::RECORD_PASS_BY_REFERENCE ||
-          spec.debug_info().fields_size() > 128 ||
-          spec.debug_info().arguments_size() > 8))) {
+    if (spec.has_debug_info() &&
+        (spec.debug_info().module().empty() || spec.debug_info().selector().empty() ||
+         spec.debug_info().runtime_entry() == 0 || spec.debug_info().entry_size() == 0 ||
+         spec.debug_info().entry_size() >
+             std::numeric_limits<std::uint64_t>::max() - spec.debug_info().runtime_entry() ||
+         spec.debug_info().record_calling_convention() <
+             clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
+         spec.debug_info().record_calling_convention() >
+             clangtracer::v1::RECORD_PASS_BY_REFERENCE)) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid debug callable metadata"};
     }
     for (const auto &name : spec.argument_names()) {
-      if (!valid_text(name, 63))
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "invalid debug argument name"};
+      if (!valid_text(name, SIZE_MAX)) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid debug argument name"};
+      }
     }
     for (const auto &header : spec.include_headers()) {
       if (!valid_text(header, 4095) || header.front() != '/' ||
@@ -3098,15 +3609,13 @@ public:
       if (!spec.has_debug_info() || (!typed_prepared && spec.include_headers().empty()) ||
           !valid_text(context.working_directory(), 4095) ||
           context.working_directory().front() != '/' ||
-          !valid_text(context.inference(), 4096, true) ||
-          context.ByteSizeLong() > 64 * 1024 ||
-          context.compiler_arguments_size() > 512)
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "invalid header compilation context"};
+          !valid_text(context.inference(), SIZE_MAX, true)) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid header compilation context"};
+      }
       for (const auto &argument : context.compiler_arguments())
-        if (!valid_text(argument, 65536, true))
-          return {grpc::StatusCode::INVALID_ARGUMENT,
-                  "invalid header compiler argument"};
+        if (!valid_text(argument, SIZE_MAX, true)) {
+          return {grpc::StatusCode::INVALID_ARGUMENT, "invalid header compiler argument"};
+        }
       const auto begin = context.compiler_arguments().begin();
       const auto end = context.compiler_arguments().end();
       if (typed_prepared ? !safe_prepared_callback_compiler_arguments(begin, end)
@@ -3118,32 +3627,24 @@ public:
       const auto &receiver = spec.receiver();
       if (signature.kind() != clangtracer::v1::METHOD ||
           !spec.receiver_unavailable_reason().empty() ||
-          receiver.ByteSizeLong() > 64 * 1024 ||
           !valid_text(receiver.translation_unit(), 4095) ||
           receiver.translation_unit().front() != '/' ||
           !valid_text(receiver.working_directory(), 4095) ||
           receiver.working_directory().front() != '/' ||
-          !valid_text(receiver.record_name(), 4096) ||
-          !valid_text(receiver.clang_version(), 256) ||
-          !valid_text(receiver.target_triple(), 256) ||
-          receiver.compiler_arguments_size() == 0 ||
-          receiver.compiler_arguments_size() > 512 ||
-          receiver.fields_size() > 128 || receiver.size() == 0 ||
-          receiver.alignment() == 0) {
+          !valid_text(receiver.record_name(), 4096) || !valid_text(receiver.clang_version(), 256) ||
+          !valid_text(receiver.target_triple(), 256) || receiver.compiler_arguments_size() == 0 ||
+          receiver.size() == 0 || receiver.alignment() == 0) {
         return {grpc::StatusCode::INVALID_ARGUMENT,
                 "invalid Clang receiver context"};
       }
-      std::size_t argument_bytes = 0;
       for (const auto &argument : receiver.compiler_arguments()) {
-        if (!valid_text(argument, 65536, true)) {
+        if (!valid_text(argument, SIZE_MAX, true)) {
           return {grpc::StatusCode::INVALID_ARGUMENT,
                   "invalid receiver compiler argument"};
         }
-        argument_bytes += argument.size() + 1;
       }
-      if (argument_bytes > 65536 || receiver.compiler_arguments(0).empty()) {
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "receiver compiler arguments exceed 64 KiB or omit driver"};
+      if (receiver.compiler_arguments(0).empty()) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "receiver compiler arguments omit driver"};
       }
       if (!safe_preflight_compiler_arguments(
               receiver.compiler_arguments().begin() + 1,
@@ -3174,10 +3675,8 @@ public:
         !spec.debug_info().result_cpp_type().empty() &&
         spec.debug_info().has_result_object_type() &&
         !spec.debug_info().result_object_type().record_name().empty();
-    if ((!valid_value(signature.result(), true) && !object_result_proven) ||
-        signature.arguments_size() > static_cast<int>(kMaxArguments)) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "signature has unsupported result or too many arguments"};
+    if (!valid_value(signature.result(), true) && !object_result_proven) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "signature has unsupported result"};
     }
     for (const int type_value : signature.arguments()) {
       const auto type = static_cast<clangtracer::v1::ValueType>(type_value);
@@ -3200,9 +3699,6 @@ public:
     }
     if (message.find("target symbol was not found") != std::string::npos) {
       return {grpc::StatusCode::NOT_FOUND, message};
-    }
-    if (message.find("retained-probe limit") != std::string::npos) {
-      return {grpc::StatusCode::RESOURCE_EXHAUSTED, message};
     }
     if (message.find("unsupported or PC-relative") != std::string::npos ||
         message.find("CET landing") != std::string::npos) {
@@ -3293,7 +3789,7 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
   }
   TracerService service(canonical_agent, event_path, directory.path(),
                         operation_timeout, endpoint, durable_root,
-                        history_limits, context_budget);
+                        history_limits, context_budget, !socket_path.empty());
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
       {}, stream_limits,

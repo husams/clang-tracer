@@ -36,6 +36,9 @@ int main() {
   while (running) {
     std::printf("CALL value=%d result=%d\n", value,
                 prepared_demo::compute(value));
+    const auto record = prepared_demo::compute_struct(value);
+    std::printf("STRUCT value=%d marker=%d payload=%lld\n", value,
+                record.marker, record.payload[2]);
     std::fflush(stdout);
     value = value == 5 ? 1 : value + 1;
     timespec delay{0, 250'000'000};

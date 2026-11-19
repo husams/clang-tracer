@@ -36,9 +36,15 @@ enum class Hook : std::uint8_t {
   dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return,
   lifetime_reused, admission_gap, rmw, collection_update
 };
+enum class ProvisionalReason : std::uint8_t {
+  none, uncertain_construction, instance_limit, unobserved_construction
+};
 inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
 }
+enum class DispatchGap : std::uint8_t {
+  translation_failed = 1, runtime_limit, lazy_plt, outside_plt_scope, weak_scope
+};
 enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_tail };
 
 struct Instruction {
@@ -98,13 +104,19 @@ struct CollectionPlan {
 };
 
 struct SharedFileIdentity {
+  // Display metadata only. Mapping validation uses the pathname of the pinned
+  // descriptor, including procfs's deleted suffix after unlink/replacement.
   std::uint64_t device = 0;
   std::uint64_t inode = 0;
+  std::array<char, 64> reference{};
+  bool active() const { return reference.front() != '\0'; }
 };
 
 struct ConstructorReturn { Address entry, return_pc; };
 
 struct Init {
+  std::uint64_t identity_watch_id = 0;
+  bool provisional_method_watch = false;
   char path[4096]{};
   char module[4096]{};
   char error[512]{};
@@ -150,6 +162,7 @@ struct Observation {
   std::uint32_t owner_index_plus_one;
   std::uint32_t runtime_module;
   Hook hook;
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   std::uint8_t values, depth, stack_status;
   std::uint8_t gap;
   bool has_shared_file_offset;
@@ -160,6 +173,7 @@ struct Observation {
   Address logical_boundary;
   object_watch::ValueWrite storage_write;
   object_watch::ValueStoreBytes storage_before, storage_after;
+  object_watch::UnionWriteState union_before, union_after;
   std::array<Address, stack_limit> frames, stack_pointers;
 };
 
@@ -188,7 +202,7 @@ struct RuntimeAdmission {
   Address function = 0, patches = 0;
   std::size_t count = 0, scope = 0, width = 0;
   std::uint32_t module = 0;
-  Address device = 0, inode = 0, file_offset = 0;
+  Address file_offset = 0;
 };
 
 struct Channel {
@@ -196,6 +210,7 @@ struct Channel {
   alignas(64) std::atomic<std::uint64_t> activity{0};
   std::atomic<std::uint64_t> runtime_prefix_gate{0};
   std::atomic<std::uint32_t> reclaim_request{0};
+  std::atomic<bool> registration_active{true};
   std::atomic<std::uint32_t> runtime_translations{0}, runtime_reclaimed{0};
   std::atomic<std::uint32_t> static_fragments{0}, static_reclaimed{0};
   RuntimeAdmission admission;
@@ -204,6 +219,7 @@ struct Channel {
   std::atomic<std::uint64_t> matched_dispatches{0};
   std::atomic<std::uint64_t> deadline_ns{0};
   std::atomic<unsigned> capture_limit{0};
+  std::atomic<std::uint64_t> runtime_gap_hits{0}, helper_reentries{0};
   // Aligned Slot objects follow the header in the shared mapping.
   Slot *slot(std::size_t index) noexcept {
     return reinterpret_cast<Slot *>(reinterpret_cast<std::uintptr_t>(this) +

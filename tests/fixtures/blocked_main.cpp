@@ -32,6 +32,7 @@
 #ifndef PR_SET_PTRACER_ANY
 #define PR_SET_PTRACER_ANY (~0UL)
 #endif
+
 namespace {
 
 constexpr int kWorkerCount = 4;

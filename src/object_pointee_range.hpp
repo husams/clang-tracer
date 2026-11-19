@@ -1,16 +1,16 @@
 #pragma once
+#include "tracer/compat.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 
 namespace tracer::object_watch {
 constexpr unsigned max_pointee_hops = 32;
 using RangeHeader = std::array<std::uint64_t, max_pointee_hops>;
 
 template <typename ReadPointer>
-bool read_pointee_chain(std::uint64_t owner, std::span<const std::uint64_t> offsets,
+bool read_pointee_chain(std::uint64_t owner, ::tracer::compat::span<const std::uint64_t> offsets,
                         RangeHeader &header, ReadPointer read) {
   for (std::size_t index = 0; index < offsets.size(); ++index) {
     if (!owner || offsets[index] > UINT64_MAX - owner ||

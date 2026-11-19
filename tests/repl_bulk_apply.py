@@ -4,9 +4,11 @@ from contextlib import ExitStack
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 from repl_browser_integration import Transcript, stop
 
@@ -53,7 +55,7 @@ def main(repl, server, target):
 
         manifest = root / "overloads.textproto"
         send(f'%trace preview --include "X::*" --save "{manifest}"')
-        output.expect(r"^dry-run matched=2 dwarf_supported=2 .*available=31 fits=yes$")
+        output.expect(r"^dry-run matched=2 dwarf_supported=2 .*available=unlimited fits=yes$")
         output.expect(r"^manifest=")
         conflict = root / "conflict.textproto"
         send(f'%trace preview --exact "BoolOnly::b(bool)" --include "X::*" --save "{conflict}"')
@@ -62,7 +64,7 @@ def main(repl, server, target):
         conflict_id = output.expect(r"^bulk apply starting batch=([0-9a-f]{32})$")[1]
         output.expect(r'^BLOCKED "BoolOnly::b\(bool\)".*reason="entry is already hooked"$')
         output.expect(r'^NOT_ATTEMPTED "X::f\(int\)"')
-        output.expect(rf"^bulk apply batch={conflict_id} complete=false available=31$")
+        output.expect(rf"^bulk apply batch={conflict_id} complete=false$")
         assert code() == prior
 
         mismatched = root / "int-only.cpp"
@@ -75,7 +77,7 @@ def main(repl, server, target):
         failed_batch = output.expect(r"^bulk apply starting batch=([0-9a-f]{32})$")[1]
         rolled_back = output.expect(r'^ROLLED_BACK "X::f\(int\)".*probe=(\d+) restored=true$')[1]
         output.expect(r'^INSTALL_FAILED "X::f\(long\)".*argument 0 type does not match')
-        output.expect(rf"^bulk apply batch={failed_batch} complete=false available=31$")
+        output.expect(rf"^bulk apply batch={failed_batch} complete=false$")
         assert code() == prior
         send(f"%collect --probe {prior_probe} --count 2 --timeout 10")
         output.expect(r"received=2")
@@ -87,7 +89,7 @@ def main(repl, server, target):
         batch = output.expect(r"^bulk apply starting batch=([0-9a-f]{32})$")[1]
         int_probe = output.expect(r'^INSTALLED "X::f\(int\)".*probe=(\d+) restored=false$')[1]
         long_probe = output.expect(r'^INSTALLED "X::f\(long\)".*probe=(\d+) restored=false$')[1]
-        output.expect(rf"^bulk apply batch={batch} complete=true available=30$")
+        output.expect(rf"^bulk apply batch={batch} complete=true$")
         assert len({prior_probe, rolled_back, int_probe, long_probe}) == 4
         installed = code()
         assert installed["BoolOnly::b(bool)"] == prior["BoolOnly::b(bool)"]
@@ -103,6 +105,18 @@ def main(repl, server, target):
             output.expect(rf"^REMOVED .*probe={int_probe} restored=true$")
             output.expect(rf"^bulk remove batch={batch} complete=true$")
             assert code() == prior
+
+        send(f'%trace apply --manifest "{manifest}"')
+        interrupted = output.expect(r"^bulk apply starting batch=([0-9a-f]{32})$")[1]
+        deadline = time.monotonic() + 15
+        while code()["X::f(int)"] == original["X::f(int)"]:
+            assert time.monotonic() < deadline, "first probe did not install"
+            time.sleep(0.005)
+        console.send_signal(signal.SIGINT)
+        output.expect(rf"^bulk restore batch={interrupted} complete=true$")
+        output.expect(r"^error: bulk trace apply: .* \| batch restored$")
+        assert code() == prior
+
         send(f"%collect --probe {prior_probe} --count 2 --timeout 10")
         output.expect(r"received=2")
         send("%detach")

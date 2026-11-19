@@ -9,9 +9,11 @@ execute_process(COMMAND "${NM}" -D --defined-only --extern-only "${AGENT}"
 if(NOT _result EQUAL 0)
   message(FATAL_ERROR "Cannot inspect agent exports: ${_error}")
 endif()
-set(_required tracer_agent_start tracer_agent_stop tracer_agent_validate
-  tracer_agent_runtime_profile_v1 tracer_agent_capacity_v1
-  tracer_agent_object_cache_v37
+set(_required tracer_agent_start tracer_agent_stop tracer_agent_validate tracer_agent_plugin_v1
+  tracer_agent_plugin_v2
+  tracer_agent_runtime_profile_v1 tracer_agent_capacity_v1 tracer_agent_reclaim_v1
+  tracer_agent_page_monitor_start_v1 tracer_agent_page_monitor_stop_v1
+  tracer_agent_object_cache_v41 tracer_agent_live_v1
   tracer_context_pthread_create_detour)
 string(REPLACE "\n" ";" _lines "${_symbols}")
 set(_exports)
@@ -47,7 +49,7 @@ string(REPLACE "\n" ";" _lines "${_dynamic}")
 foreach(_line IN LISTS _lines)
   if(_line MATCHES "\\(NEEDED\\).*\\[lib(protobuf[^]]*|grpc[^]]*|gpr|absl[^]]*|re2|cares|z|ssl|crypto|upb|address_sorting)\\.so[^]]*\\]")
     message(FATAL_ERROR
-      "Agent has a shared transport dependency: ${_line}. Build PIC static protobuf/gRPC and their dependencies; see docs/build-rhel.md.")
+      "Agent has a shared transport dependency: ${_line}. Build PIC static protobuf/gRPC and their dependencies; see docs/gcc85-compatibility.md.")
   endif()
 endforeach()
 message(STATUS "Agent exports only its required symbols and has no shared transport dependencies")

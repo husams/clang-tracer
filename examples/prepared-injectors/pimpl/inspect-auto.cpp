@@ -67,7 +67,8 @@ bool check_auto_item(const tracer_repl::EventValue &root) {
   const int id = root.field("id").as<int>();
   if (id < 101 || id > 606 ||
       root.field("_stamp").as<std::uint64_t>() == 0 ||
-      root.fields().count("_stamp_snapshot") != 0)
+      root.fields().count("_stamp_snapshot") != 1 ||
+      root.field("_stamp_snapshot").field("serial").as<int>() != id + 700)
     return false;
   if (root.field("_unreadable").as<std::uint64_t>() == 0 ||
       root.fields().count("_unreadable_snapshot") != 0)
@@ -119,13 +120,19 @@ bool check_auto_pimpl(const tracer_repl::Collection &captured,
     const auto &type = implementation.cpp_type();
     if (type == "HFW::ItemV1") {
       ++versions[0];
-      correct = correct && local.version == 1 && local.private_value == 808;
+      const auto item = implementation.as<HFW::ItemV1>();
+      correct = correct && local.version == 1 && local.private_value == 808 &&
+          item.version == local.version && item.private_code == local.private_value;
     } else if (type == "HFW::ItemV2") {
       ++versions[1];
-      correct = correct && local.version == 2 && local.private_value == 909;
+      const auto item = implementation.as<HFW::ItemV2>();
+      correct = correct && local.version == 2 && local.private_value == 909 &&
+          item.generation == 2 && item.private_tag == local.private_value;
     } else if (type == "HFW::ItemV3") {
       ++versions[2];
-      correct = correct && local.version == 3 && local.private_value == 1;
+      const auto item = implementation.as<HFW::ItemV3>();
+      correct = correct && local.version == 3 && local.private_value == 1 &&
+          item.schema == local.version && item.private_trusted;
     } else {
       correct = false;
     }

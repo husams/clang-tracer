@@ -59,7 +59,7 @@ def run_case(preparer, compiler, case):
                         "file": str(source),
                         "arguments": [
                             compiler,
-                            "-std=c++23",
+                            "-std=c++17",
                             "-I",
                             str(app),
                             "-c",
@@ -89,7 +89,7 @@ def run_case(preparer, compiler, case):
         header.unlink()
         (output / "verify.cpp").write_text(verify)
         subprocess.run(
-            [compiler, "-std=c++23", "-fsyntax-only", "verify.cpp"],
+            [compiler, "-std=c++17", "-fsyntax-only", "verify.cpp"],
             cwd=output,
             check=True,
         )

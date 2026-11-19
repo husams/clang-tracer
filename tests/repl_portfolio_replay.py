@@ -97,7 +97,7 @@ def object_watch(args, root, target, control, out):
     if args.truncated:
         assert len(events) == 1
         gap = events[0]["objectObservation"]
-        assert gap["kind"] == "COVERAGE_GAP" and "exceeds capture budget" in gap["diagnostic"], gap
+        assert gap["kind"] == "COVERAGE_GAP" and "exceeds byte budget" in gap["diagnostic"], gap
         print("bounded snapshot emitted one coverage gap and withheld incomplete deltas")
         return
     for event in events:

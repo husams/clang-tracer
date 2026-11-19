@@ -1,6 +1,6 @@
 # Command reference
 
-Use the [first probe](user.md#create-a-target-and-a-basic-probe) for the examples below. Substitute its PID for `12345` and use actual session IDs, probe IDs, addresses, and tokens from your output.
+Browse the [command appendix](command-reference.md) for individual commands and examples. See [the C++17 branch reference](cpp17.md) for additional commands and options. Use the [first probe](user.md#create-a-target-and-a-basic-probe) for the examples below. Substitute its PID for `12345` and use actual session IDs, probe IDs, addresses, and tokens from your output.
 
 ## Native REPL startup
 
@@ -38,30 +38,56 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 | `%use s1` | Select an attached session for subsequent commands. |
 | `%status` | Show current connection, session, and retained collections. |
 | `%detach s1` | Detach and restore that session. Omit the ID for the selected session. |
-| `%modules --details` | List eligible application modules. `--details` adds executable mappings, ELF identity, and a mapping token. |
+| `%modules --filter libdemo.so --details` | List application modules from the selected process. `--filter TEXT` matches a case-sensitive path substring in either listing. `--details` adds executable mappings, ELF identity, and a mapping token. |
 | `%threads` | List selected target threads, including TIDs, names, and start times. |
 | `%symbols --filter add --limit 20 --addresses` | Browse supported DWARF callables. `--filter TEXT` matches a substring and `--module TEXT` narrows module paths. `--limit N` is a page size, with 0 meaning unbounded. `--page TOKEN` continues the query. `--addresses` adds verified live entries. `--mapping TOKEN` supplies a module mapping snapshot. `--address PC --mapping TOKEN` looks up a live PC and disables paging. |
 
 ## Native REPL module index commands
 
-| Command | Purpose |
-| --- | --- |
-| `%module index --file ELF [--debug-file FILE] [--output INDEX]` | Index ELF symbols and DWARF and select the index. The default output is `<ELF>.tracer.sqlite`. |
-| `%module index --module PATH --mapping TOKEN [--output INDEX]` | Index an exact mapped ELF using the REPL's local server. Get the path and token from `%modules --details`. |
-| `%module use INDEX` | Select a saved index for queries, emission and probe preparation. |
-| `%module types [--filter GLOB] [--index INDEX]` | List named types and known layout sizes. |
-| `%module symbols [--exported] [--filter GLOB] [--index INDEX]` | List symbols and their IDs. Use `--exported` to select dynamic exports. |
-| `%module show (--type NAME \| --symbol SELECTOR \| --id ID)` | Inspect a type or symbol. Add `--index INDEX` to select a saved index explicitly. |
-| `%module emit [--type NAME] [--symbol SELECTOR] [--id ID] --output DIR` | Generate declarations, read-only field views and a manifest for selected entries. |
+See [the module index walkthrough](user.md#index-debug-information-and-prepare-a-probe-from-a-binary) for a complete example. Queries and emission work offline once the index exists.
 
-List commands accept `--format json`, `--limit N` and `--page TOKEN`.
+| Command and example | Options and behavior |
+| --- | --- |
+| `%module index --file ./target --output target.sqlite` | Index a local Linux x86-64 ELF. `--file ELF` requires no attached process. |
+| `%module index --module /path/to/target --mapping TOKEN --output live.sqlite` | Index an attached module using the REPL's own local Linux server. Both `--module PATH` and `--mapping TOKEN` come from `%modules --details`. Refresh a stale token before retrying. |
+| `%module use target.sqlite` | Select a saved index for subsequent queries, emission, and probe preparation. |
+| `%module types --index target.sqlite --filter "demo::*" --limit 10` | List named types and known sizes. Accepts the query options below. |
+| `%module symbols --index target.sqlite --filter "demo::*" --exported` | List symbol IDs and selectors. `--exported` selects dynamic exports. Accepts the query options below. |
+| `%module show --symbol "add(int, int)"` | Print one detailed JSON record. Choose exactly one of `--type NAME`, `--symbol SELECTOR`, or `--id ID`. Add `--index INDEX` to select an index explicitly. |
+| `%module emit --symbol "add(int, int)" --output recovered-add` | Write `declarations.hpp`, `views.hpp`, and `manifest.json` to a new directory. Repeat `--type NAME`, `--symbol SELECTOR`, or `--id ID` to select entries. Add `--index INDEX` to select an index explicitly. |
+
+| Option | Meaning |
+| --- | --- |
+| Index `--output INDEX` | Write a new SQLite file. Defaults to `<ELF>.tracer.sqlite`. Successful indexing selects it for the current REPL. |
+| Index `--debug-file FILE` | Supply matching separate debug information. Without this option, the indexer looks for a verified companion and can read embedded DWARF. |
+| Index `--max-entries N`, `--max-depth N` | Bound scanned entries and DWARF depth. Omit or pass zero for no limit. Exceeding a budget aborts the build. Ctrl+C cancels REPL indexing. |
+| Query `--index INDEX` | Read this index for the command. Otherwise use the selected index, then `module-index.sqlite` in the current directory. |
+| Query `--filter GLOB` | Match named types or symbol names, selectors and linkage names with a glob. Quote patterns. |
+| Query `--limit N`, `--page TOKEN` | Limit a list and continue with the returned `next_page` token. Zero or omitted limit returns all matches. Keep the same index, filter, and export selection when paging. |
+| Query `--format json` | Return an object with `entries` and `next_page` from `types` or `symbols`. |
+
+## Standalone module index CLI
+
+Use `clang-tracer-module` for shell scripts and offline indexing. It takes local
+file paths and prints JSON for index metadata and queries.
+
+| Command and example | Options and behavior |
+| --- | --- |
+| `clang-tracer-module --help` | Show usage. |
+| `clang-tracer-module index --file ./target --output target.sqlite` | Create an index. The REPL's file-mode `--output`, `--debug-file`, `--max-entries`, and `--max-depth` options apply. |
+| `clang-tracer-module info --index target.sqlite` | Print the indexed ELF identity, debug provenance, and diagnostics. |
+| `clang-tracer-module types --index target.sqlite --filter int` | List types. Supports `--filter`, `--limit`, and `--page`. |
+| `clang-tracer-module symbols --index target.sqlite --exported --limit 20` | List symbols. Supports `--filter`, `--limit`, `--page`, and `--exported`. |
+| `clang-tracer-module show --index target.sqlite --symbol "add(int, int)"` | Show one record. Use exactly one of `--symbol SELECTOR`, `--type NAME`, or `--id ID`. |
+| `clang-tracer-module emit --index target.sqlite --symbol SYMBOL_ID --output recovered-add` | Emit headers and manifest. Copy IDs from the query results and repeat `--symbol SYMBOL_ID` or `--type TYPE_ID`. |
 
 ## Native REPL probe and bulk trace commands
 
 | Command and example | Options and behavior |
 | --- | --- |
-| `%probe prepare "add(int, int)" --include add.hpp --output prepared` | Generate a reusable local package. The first `--include HEADER` supplies the declaration and additional includes supply types. `--output NEW_DIR` must be new. `--compdb PATH` selects the compilation database, defaulting to the command's directory. `--translation-unit FILE` selects an explicit command. `--module ELF` pins ELF identity. `--metadata-only` skips adapter files. Accepts extra compiler arguments and `--cwd`. |
-| `%probe prepare SELECTOR --output prepared [--module-index INDEX] [--module ELF] [--generated DIR]` | Prepare from DWARF and ELF metadata in a module index. Omit `--module-index` to use the default. Use `--id ID` to select a specific indexed symbol. |
+| `%probe prepare "add(int, int)" --include add.hpp --output prepared` | Generate a reusable local package. The first `--include HEADER` supplies the declaration and additional includes supply types. `--output NEW_DIR` must be new. `--compdb PATH` selects the compilation database, defaulting to the command's directory. `--translation-unit FILE` selects an explicit command. `--module ELF` pins ELF identity. `--metadata-only` skips adapter files. `--no-automatic-members` disables automatic pointer-member selection. `--follow-depth`, `--follow-members`, `--string-bytes` and the other followed-member limits are listed with defaults and ranges in [Followed-member limits](../native-repl.md#followed-member-limits). Accepts extra compiler arguments and `--cwd`. |
+| `%probe prepare "add(int, int)" --module-index target.sqlite --output prepared-add` | Prepare from an index using the recorded ELF path, or pass `--module ELF` to verify an explicit path to the same build. Use `--id ID` to disambiguate a matching selector and `--generated DIR` to reuse a verified emitted bundle. Accepts `--cwd` and `--metadata-only`. |
+| `%probe prepare "add(int, int)" --signature "int(int, int)" --module ./target --output prepared-explicit` | Prepare from a user-supplied function type and ELF. Use `--member` for an unqualified instance method. Accepts `--cwd` and `--metadata-only`. |
 | `%probe resolve "add(int, int)"` | Show resolved signature, ABI and target metadata. Accepts resolution options below. |
 | `%probe validate "add(int, int)" --callback hook.cpp` | Compile and link the local callback without installing it. Accepts resolution options. |
 | `%probe inject "add(int, int)" --callback hook.cpp --stack-depth 16` | Install or replace the probe. Accepts resolution and deployment options. |
@@ -77,6 +103,19 @@ List commands accept `--format json`, `--limit N` and `--page TOKEN`.
 | `%trace preview --exact "add(int, int)" --save trace.textproto` | Report eligibility and capacity before installing anything. Select using repeatable `--module GLOB`, `--include GLOB`, `--exclude GLOB`, and `--exact SELECTOR`. Require an include or exact rule. Alternatively `--manifest FILE` loads rules, and `--save NEW_FILE` writes the manifest. |
 | `%trace apply --manifest trace.textproto --callback hook.cpp` | Install eligible probes in a batch. `--callback FILE` overrides the default observer. The server attempts to restore newly installed probes on partial failure. |
 | `%trace remove batch-1` | Restore the probes owned by the returned batch ID, or retry restoration. |
+
+A constructor or destructor has several entry points (`C1`/`C2`, `D0`/`D1`/`D2`).
+Select one by its linkage symbol (`%probe inject _ZN3app4LeafC1Ei`); the error for
+an ambiguous selector lists the symbols. `%trace preview` and `%trace apply` cover
+every entry point, and a prepared package binds the complete-object entry point
+(`C1`/`D1`). See [Observe constructors and destructors](../native-repl.md#observe-constructors-and-destructors).
+
+For indexed preparation, supply neither headers nor an explicit signature.
+The search order is `--module-index INDEX`, then `<ELF>.tracer.sqlite` when
+`--module ELF` is given, then the index selected with `%module index` or
+`%module use`, then `module-index.sqlite` in the command's working directory.
+Use `--prepared DIR --prepared-mode require` when validating and injecting the
+resulting package.
 
 | Resolution and deployment option | Meaning |
 | --- | --- |
@@ -120,7 +159,7 @@ List commands accept `--format json`, `--limit N` and `--page TOKEN`.
 | `%events list sample --limit 10` | List indexed summaries. `--limit N` defaults to 20. |
 | `%events show sample --index 1` | Print one event and its values by zero-based index. |
 | `%events stack sample --index 0` | Print one event's full retained stack and capture status. |
-| `%events calls sample` | Pair PRE and POST, report durations and identify missing halves. |
+| `%events calls sample` | Pair PRE with POST or EXCEPTION, report durations and identify missing events. |
 | `%events stats sample` | Aggregate call counts, duration buckets, caller edges and loss per probe. |
 | `%events clear sample` | Release the named collection's buffer allocation. |
 | `%events open capture.db --as replayed` | Replay framed Protobuf or SQLite into a new named bounded collection. SQLite can load stored C++ types and mappings. |
@@ -131,7 +170,7 @@ List commands accept `--format json`, `--limit N` and `--page TOKEN`.
 | `--count N`, `--timeout SEC` | Stop after N matching events or at the deadline. Without a count, streams normally run until Ctrl+C. Counted streams default to a 30-second deadline. |
 | `--name NAME`, `--after CURSOR` | Match an exact selector, linkage name or custom event name and begin strictly after the cursor. Repeat names for an OR filter. |
 | `--session ID`, `--all` | Use one named session or every session. Omit both to use the selected session. |
-| `--probe ID`, `--phase PRE\|POST` | Narrow by probe ID or phase in the client. |
+| `--probe ID`, `--phase PRE\|POST\|EXCEPTION` | Narrow by probe ID or phase in the client. |
 | `--as NAME` | Name the retained live collection. Valid on `%events` and `%collect`. |
 
 Ctrl+C cancels active capture and preserves partial results. Trigger new calls from the target terminal while a synchronous capture waits. The [native REPL walkthrough](../native-repl.md) explains replay filters, stack attribution, retention and mapping details.
@@ -203,43 +242,6 @@ clang-tracer --request list.textproto --output sessions.pb list
 clang-tracer --request watch.textproto --count 2 --output events.pb watch
 ```
 
-## Python console startup and server commands
-
-```bash
-clang-tracer-console --endpoint 127.0.0.1:50051 --timeout 45 --color auto
-python -m clang_tracer --help
-```
-
-`--endpoint` specifies a server and defaults to the environment or loopback. Omit it and use `server start` to create an owned server. `--timeout` sets a unary RPC deadline (default 30 seconds). `--color auto|always|never` selects a color policy. Auto respects terminal detection and `NO_COLOR`. `--help` and `-h` show startup options.
-
-| Command and example | Options and behavior |
-| --- | --- |
-| `server start --timeout 45 --event-history-limit 8192` | Start a private local server. `--executable PATH` and `--agent PATH` select binaries. `--timeout SEC` sets the readiness deadline (default 30) and `--operation-timeout SEC` sets the native deadline (default 10, range 1–300). `--durable-directory PATH` enables durable context recording. Supports the five history and transport budget flags in the native server reference. |
-| `server status` | Show endpoint readiness and ownership. |
-| `server stop --timeout 45` | Gracefully stop the owned server. The shutdown deadline defaults to 30 seconds. Retry if the child is still shutting down. |
-| `attach 12345` | Attach and select the process's session. |
-| `sessions` | List sessions and probes. |
-| `use s1` | Switch to an existing session. |
-| `modules` | List eligible application ELF paths. |
-| `symbols --filter "add(" --limit 20` | List DWARF callables. `--filter TEXT` and `--module TEXT` match case-sensitive substrings. `--limit N` sets the page size (zero is unbounded) and `--page TOKEN` resumes it. |
-| `detach s1` | Restore and detach this session. Omit the session to detach the selected one. |
-| `probe resolve "add(int, int)"` | Resolve using DWARF. Accepts Python resolution options. |
-| `probe validate "add(int, int)" --callback hook.cpp --level compile` | Compile and check a local callback for the target. `--level syntax` selects syntax-only validation. Accepts Python resolution options. |
-| `probe inject "add(int, int)" --callback hook.cpp --stack full --print-result` | Resolve and install a callback. `--stack N\|full` captures entry stacks. `--internal-frames` includes runtime and JIT frames. `--print-arguments` and `--print-result` include snapshots. `--package SERVER_PATH` selects a shared-context package lineage. Accepts Python resolution options. |
-| `probe add probe.textproto` | Install an explicit `ProbeSpec` from a local Protobuf text file. |
-| `probe remove 1` | Restore the original target entry for this probe. |
-| `events --count 2 --timeout 30` | Stream events until a count, deadline, or Ctrl+C. Accepts console stream options. |
-| `collect 2 --name "add(int, int)"` | Stream and display events. Optional positional count limits the capture. Accepts console stream options. |
-| `record capture.db 2 --sqlite` | Save a required positive count to a new framed Protobuf file or append to SQLite. Accepts console stream options. Default deadline 30 seconds. |
-| `drain capture.db --listen --count 10` | Commit to SQLite then acknowledge shared history. `--listen` includes future events. Omit it to drain the initial snapshot. `--count N` limits writes and acknowledgements. Accepts console stream options. |
-| `help probe inject` | Show help for a topic. Omit topic for the index. `help colors` describes color options. |
-| `! pwd` | Run the rest of the line in a local `/bin/sh`. Working-directory changes stay in that shell. |
-| `exit` or `quit` | Exit and stop any server this console owns. |
-
-Python resolution options are repeatable `--include HEADER` and `--compile-option ARG`, plus `--compdb PATH`, `--module TEXT`, `--debug-max-entries N`, and `--debug-max-depth N`. The headers and database are on the server. Zero DWARF budgets mean unlimited traversal.
-
-Console stream options are repeatable `--session ID` and `--name NAME`, plus `--pid PID`, `--after SEQUENCE`, and `--timeout SECONDS`. The default session filter is the selected session, or all sessions when none is selected. Names match an exact selector, linkage name or emitted context event name. Ctrl+C interrupts the stream and returns to the prompt. An expired cursor reports `OUT_OF_RANGE`.
-
 ## Offline probe preparation
 
 ```bash
@@ -248,15 +250,24 @@ clang-tracer-prepare-injectors-native --selector "add(int, int)" \
   --translation-unit target.cpp --output prepared
 ```
 
+For offline preparation from a saved index, use the same preparer.
+
+```bash
+clang-tracer-prepare-injectors-native --selector "add(int, int)" \
+  --module-index target.sqlite --module ./target --output prepared-indexed
+```
+
 | Option | Meaning |
 | --- | --- |
 | `--help` | Show usage. |
 | `--selector SELECTOR` | Required exact C++ selector. |
-| `--include HEADER` | Required declaration header. Repeat for supporting types. |
-| `--compdb FILE_OR_DIR` | Required compilation database. |
+| `--include HEADER` | Declaration header for source preparation. Repeat for supporting types. |
+| `--compdb FILE_OR_DIR` | Required compilation database for source preparation. |
 | `--translation-unit FILE` | Select an explicit entry. Otherwise preparation tries the first include's recorded command, then an adjacent source. |
 | `--output NEW_DIRECTORY` | Required new output directory. |
 | `--module ELF` | Pin the package to an ELF build. |
+| `--signature TYPE`, `--member` | Prepare with an explicit function type. Requires `--module`. Use `--member` for an unqualified instance method. |
+| `--module-index INDEX`, `--id ID`, `--generated DIR` | Prepare from a saved index, optionally selecting the symbol by ID and reusing an emitted bundle. With no explicit index, the CLI tries the module sidecar and then `module-index.sqlite`. |
 | `--metadata-only` | Skip separate C++ adapter files. |
 | `--extra-arg ARG` | Append one compiler argument. Repeat as needed. |
 
@@ -285,3 +296,5 @@ The REPL starts `clang-tracer-repl-check` internally for syntax checks, completi
 | Deploy `--destdir DIR` | Stage installation under a separate filesystem root. |
 
 See [Build and deploy](../build-rhel.md) for resource headers, custom layouts, and verification.
+
+For Python scripting and console commands, see the [optional Python reference](python-client.md).

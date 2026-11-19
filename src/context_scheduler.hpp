@@ -14,7 +14,10 @@ namespace tracer::context_scheduler {
 struct Identity {
   std::uint64_t generation = 0;
   std::uint64_t value = 0;
-  friend bool operator==(Identity, Identity) = default;
+  friend constexpr bool operator==(Identity left, Identity right) noexcept {
+    return left.generation == right.generation && left.value == right.value;
+  }
+  friend constexpr bool operator!=(Identity left, Identity right) noexcept { return !(left == right); }
 };
 
 // Fixed metadata copied into event records by the schema/export bridge.

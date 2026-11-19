@@ -6,23 +6,44 @@ std::string make_class_callback_bridge(const CallbackClassPlan &plan) {
 #include <optional>
 #include <type_traits>
 #include <cerrno>
+#if defined(__GLIBCXX__)
+#include <bits/cxxabi_forced.h>
+#endif
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
-extern "C" void tracer_callback_failure(unsigned long long) noexcept;
+extern "C" void tracer_callback_failure(unsigned long long,
+                                         const tracer::TraceContext *,
+                                         const char *) noexcept;
+struct tracer_callback_lifecycle_guard final {
+  int saved_errno;
+  ~tracer_callback_lifecycle_guard() {
+    tracer_callback_lifecycle_leave();
+    errno = saved_errno;
+  }
+};
 struct tracer_invocation_instance final {
 )CPP";
   code += "  std::optional<" + plan.type + "> interceptor;\n";
   code += R"CPP(
   bool hooks_enabled = false;
   bool cleaned = false;
-  explicit tracer_invocation_instance(const tracer::TraceContext &raw) noexcept {
+  explicit tracer_invocation_instance(const tracer::TraceContext &raw) {
     const int saved_errno = errno;
+    bool construction_failed = false;
     if (tracer_callback_lifecycle_enter(raw.probe_id)) {
+      tracer_callback_lifecycle_guard lifecycle_guard{saved_errno};
       try { interceptor.emplace(); hooks_enabled = true; }
-      catch (...) { tracer_callback_failure(raw.probe_id); }
-      tracer_callback_lifecycle_leave();
+#if defined(__GLIBCXX__)
+      catch (const __cxxabiv1::__forced_unwind &) {
+        throw;
+      }
+#endif
+      catch (...) { construction_failed = true; }
     }
+    if (construction_failed)
+      tracer_callback_failure(raw.probe_id, &raw,
+                              "interceptor construction failed");
     errno = saved_errno;
   }
   tracer_invocation_instance(const tracer_invocation_instance &) = delete;

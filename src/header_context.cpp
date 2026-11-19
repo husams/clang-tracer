@@ -56,7 +56,7 @@ std::unique_ptr<tooling::CompilationDatabase> load_database(const std::string& h
   std::unique_ptr<tooling::CompilationDatabase> database;
   if (database_path.empty()) {
     database = tooling::CompilationDatabase::autoDetectFromSource(header, error);
-    // Standalone headers still work with the default C++23 context.
+    // Standalone headers still work with the default C++20 context.
     if (!database) {
       return {};
     }
@@ -297,17 +297,12 @@ static PreparedHeaderCommand normalize_prepared_header_command(tooling::CompileC
   }
   std::vector<const char*> option_argv;
   option_argv.reserve(donor.CommandLine.size() - 1);
-  std::size_t raw_bytes = 0;
   bool clang_cl_forwarded_operand = false;
   for (std::size_t i = 1; i < donor.CommandLine.size(); ++i) {
     const llvm::StringRef raw(donor.CommandLine[i]);
     if (raw.empty() || raw.front() == '@') {
       throw std::invalid_argument(
           "header compilation command contains unsupported option: @response-file");
-    }
-    raw_bytes += raw.size();
-    if (raw_bytes > 65536 || i > 512) {
-      throw std::invalid_argument("header compilation command exceeds limits");
     }
     if (raw == "--") {
       if (i + 2 != donor.CommandLine.size() ||
@@ -605,8 +600,6 @@ void resolve_prepared_callback_context(clangtracer::v1::ProbeSpec& spec, const s
     auto* options = context->mutable_compiler_arguments();
     std::rotate(options->begin(), options->end() - 2, options->end());
   }
-  if (context->ByteSizeLong() > 64 * 1024 || context->compiler_arguments_size() > 512)
-    throw std::invalid_argument("callback compilation command exceeds limits");
   if (!safe_prepared_callback_compiler_arguments(context->compiler_arguments().begin(),
                                                  context->compiler_arguments().end()))
     throw std::invalid_argument("invalid callback include or macro option in compilation database");
@@ -718,8 +711,7 @@ void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string&
     if (argument == "-fsyntax-only")
       continue;
     bytes += argument.size();
-    if (argument.find('\0') != std::string::npos || argument.size() > 65536 || bytes > 65536 ||
-        context->compiler_arguments_size() >= 512) {
+    if (argument.find('\0') != std::string::npos) {
       throw std::invalid_argument(
           "header compilation command exceeds limits");
     }
@@ -727,8 +719,7 @@ void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string&
   }
   for (const auto& argument : spec.compile_options()) {
     bytes += argument.size();
-    if (argument.find('\0') != std::string::npos || argument.size() > 65536 ||
-        bytes > 65536 || context->compiler_arguments_size() >= 512) {
+    if (argument.find('\0') != std::string::npos) {
       throw std::invalid_argument(
           "combined header compiler command exceeds limits");
     }

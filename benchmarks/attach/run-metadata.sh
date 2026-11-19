@@ -45,11 +45,11 @@ else
   echo "$functions" > "$fixtures/functions.txt"
 fi
 
-"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++23 -I"$source_root/src" -I"$source_root/include" \
+"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++20 -I"$source_root/src" -I"$source_root/include" \
   $("$llvm_config" --cxxflags | sed 's/-std=[^ ]*//g; s/-fno-exceptions//g') \
   "$source_root/benchmarks/attach/metadata.cpp" "$source_root/src/admission.cpp" \
   $("$llvm_config" --ldflags --libs --system-libs) "${link_flags[@]}" -ldl -o "$output/metadata"
-"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++23 -I"$source_root/src" -I"$source_root/include" \
+"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++20 -I"$source_root/src" -I"$source_root/include" \
   $("$llvm_config" --cxxflags | sed 's/-std=[^ ]*//g; s/-fno-exceptions//g') \
   "$source_root/benchmarks/attach/bootstrap.cpp" \
   "$source_root/src/admission.cpp" "$source_root/src/injector.cpp" \

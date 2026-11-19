@@ -3,6 +3,9 @@
 #include "arm_object_watch.hpp"
 #include "arm_snapshot_protocol.hpp"
 #include "injector.hpp"
+#include "mapped_path.hpp"
+#include "mapped_elf.hpp"
+#include <sys/uio.h>
 #include "linux_syscalls.hpp"
 #include "native_entry.hpp"
 #include "object_snapshot.hpp"
@@ -40,12 +43,13 @@ struct MappedFile {
   std::string path;
   std::size_t size;
   void *data = nullptr;
-  struct stat identity{};
-  MappedFile(const std::string &name, std::size_t width) : path(name + "-XXXXXX"), size(width) {
+  MappedFile(const std::string &name, std::size_t width)
+      : path((fs::canonical(fs::absolute(name).parent_path()) / fs::path(name).filename()).string() + "-XXXXXX"),
+        size(width) {
     const int fd = ::mkstemp(path.data());
     if (fd < 0)
       throw std::runtime_error("cannot create private method snapshot channel");
-    data = ::fstat(fd, &identity) || ::ftruncate(fd, size) ? MAP_FAILED :
+    data = ::ftruncate(fd, size) ? MAP_FAILED :
         ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (data == MAP_FAILED) {
@@ -82,7 +86,8 @@ struct MethodWatch::Impl {
   std::map<Address, Address> method_probes;
   std::vector<std::string> keys, fields;
   mutable std::mutex mutex;
-  std::jthread reader;
+  std::thread reader;
+  std::atomic<bool> stop_reader{false};
   std::uint64_t cursor = 0, next_call = 1;
   std::uint64_t seen_drops = 0, drop_barrier = 0;
   Clock::time_point deadline = Clock::time_point::max();
@@ -130,10 +135,14 @@ struct MethodWatch::Impl {
   bool has_control_mapping() const {
     std::ifstream maps("/proc/" + std::to_string(session.pid()) + "/maps");
     for (std::string line; std::getline(maps, line);) {
-      unsigned long long inode = 0;
-      unsigned device_major = 0, device_minor = 0;
-      if (std::sscanf(line.c_str(), "%*x-%*x %*s %*x %x:%x %llu", &device_major, &device_minor, &inode) == 3 &&
-          inode == control.identity.st_ino && makedev(device_major, device_minor) == control.identity.st_dev)
+      unsigned long long begin = 0, end = 0, offset = 0;
+      char permissions[5]{};
+      int path_offset = 0;
+      if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %*s %*s %n", &begin, &end,
+                      permissions, &offset, &path_offset) == 4 &&
+          tracer::detail::canonical_mapped_path(line.substr(path_offset)) == control.path &&
+          offset == 0 && end >= begin && end - begin >= control.size &&
+          std::string_view(permissions) == "rw-s")
         return true;
     }
     return false;
@@ -148,12 +157,13 @@ struct MethodWatch::Impl {
       unsigned long long begin = 0, end = 0, offset = 0, inode = 0;
       unsigned device_major = 0, device_minor = 0;
       char permissions[5]{};
-      if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu", &begin, &end, permissions,
-                      &offset, &device_major, &device_minor, &inode) != 7)
+      int path_offset = 0;
+      if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n", &begin, &end, permissions,
+                      &offset, &device_major, &device_minor, &inode, &path_offset) != 7)
         return false;
-      if (inode == control.identity.st_ino && makedev(device_major, device_minor) == control.identity.st_dev)
+      if (tracer::detail::canonical_mapped_path(line.substr(path_offset)) == control.path)
         return false;
-      if (std::ranges::any_of(redirects, [&](const auto &patch) {
+      if (std::any_of(std::begin(redirects), std::end(redirects), [&](const auto &patch) {
             return patch.gateway >= begin && patch.gateway < end;
           }))
         return false;
@@ -167,7 +177,7 @@ struct MethodWatch::Impl {
       iovec remote{reinterpret_cast<void *>(patch.instruction.pc), sizeof(code)};
       const auto length = linux_api::process_vm_readv(session.pid(), &local, 1, &remote, 1, 0);
       if (length == sizeof(code) ? code == patch.replacement :
-          length != -1 || errno != EFAULT || std::ranges::any_of(ranges, [&](const auto &range) {
+          length != -1 || errno != EFAULT || std::any_of(std::begin(ranges), std::end(ranges), [&](const auto &range) {
             return patch.instruction.pc >= range.first && patch.instruction.pc < range.second;
           }))
         return false;
@@ -404,7 +414,8 @@ void MethodWatch::start() {
     }
     verified.emplace_back(pc, std::move(boundary.body));
   }
-  std::ranges::sort(p.redirects, {}, [](const auto &r) { return r.instruction.pc; });
+  std::sort(p.redirects.begin(), p.redirects.end(),
+      [](const auto &a, const auto &b) { return a.instruction.pc < b.instruction.pc; });
   for (std::size_t i = 1; i < p.redirects.size(); ++i)
     if (p.redirects[i - 1].instruction.pc == p.redirects[i].instruction.pc)
       throw std::runtime_error("snapshot method redirect overlaps another method");
@@ -437,22 +448,38 @@ void MethodWatch::start() {
   if (module != p.session.executable())
     std::memcpy(init.code.module, module.c_str(), module.size() + 1);
   std::vector<std::pair<Address, Address>> read_only;
-  struct stat identity{};
-  if (::stat(module.c_str(), &identity))
+  auto binary = llvm::object::createBinary(module);
+  if (!binary)
+    throw std::runtime_error(llvm::toString(binary.takeError()));
+  const auto *image = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!image)
     throw std::runtime_error("cannot identify the method snapshot RTTI provider");
   std::ifstream maps("/proc/" + std::to_string(p.session.pid()) + "/maps");
   for (std::string line; std::getline(maps, line);) {
-    unsigned long long begin = 0, end = 0, inode = 0;
+    unsigned long long begin = 0, end = 0, offset = 0, inode = 0;
     unsigned device_major = 0, device_minor = 0;
     char permissions[5]{};
     int path = 0;
-    if (std::sscanf(line.c_str(), "%llx-%llx %4s %*x %x:%x %llu %n", &begin, &end, permissions,
-                    &device_major, &device_minor, &inode, &path) != 6 || !inode || begin >= end ||
+    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n", &begin, &end, permissions,
+                    &offset, &device_major, &device_minor, &inode, &path) != 7 || begin >= end ||
         (std::string_view(permissions) != "r--p" && std::string_view(permissions) != "r-xp") ||
         std::string_view(line).substr(path) != module)
       continue;
-    if (inode != identity.st_ino ||
-        makedev(device_major, device_minor) != identity.st_dev)
+    const auto mapping_bias = tracer::detail::mapped_elf_bias(*image, begin, end, offset, false, bias);
+    if (!mapping_bias || !tracer::detail::matches_mapped_elf(*image, *mapping_bias, [&](auto address, auto expected) {
+          std::array<char, 4096> bytes;
+          while (!expected.empty()) {
+            const auto size = std::min(expected.size(), bytes.size());
+            iovec local{bytes.data(), size}, remote{reinterpret_cast<void *>(address), size};
+            if (linux_api::process_vm_readv(p.session.pid(), &local, 1, &remote, 1, 0) !=
+                    static_cast<ssize_t>(size) ||
+                std::string_view(bytes.data(), size) != expected.substr(0, size))
+              return false;
+            address += size;
+            expected.remove_prefix(size);
+          }
+          return true;
+        }))
       throw std::runtime_error("cannot identify the method snapshot RTTI provider");
     read_only.emplace_back(begin, end);
   }
@@ -462,7 +489,7 @@ void MethodWatch::start() {
   for (std::size_t index = 0; index != read_only.size(); ++index)
     init.read_only[index] = {read_only[index].first, read_only[index].second};
   const auto spec = bound.SerializeAsString();
-  constexpr char entry_name[] = "tracer_agent_arm_snapshot_v2";
+  constexpr char entry_name[] = "tracer_agent_arm_snapshot_v3";
   const auto count = p.redirects.size();
   const auto table_size = count * sizeof(Function);
   const auto code_size = count * sizeof(Instruction);
@@ -522,8 +549,8 @@ void MethodWatch::start() {
   process.remote_free(remote, size);
   if (p.request.timeout_seconds())
     p.deadline = Clock::now() + std::chrono::seconds(p.request.timeout_seconds());
-  p.reader = std::jthread([&p](std::stop_token stop) {
-    while (!stop.stop_requested()) {
+  p.reader = std::thread([&p] {
+    while (!p.stop_reader.load(std::memory_order_acquire)) {
       {
         const std::lock_guard lock(p.mutex);
         p.drain();
@@ -555,7 +582,7 @@ void MethodWatch::start() {
     p.pending_restore = process.unsafe();
     if (!p.installed && !p.pending_restore) {
       p.reclaim();
-      p.reader.request_stop();
+      p.stop_reader.store(true, std::memory_order_release);
       p.reader.join();
     }
     throw;
@@ -612,11 +639,11 @@ api::ObjectWatchStatus MethodWatch::stop() {
         break;
       }
       auto patches = p.patches(true);
-      std::erase_if(patches, [&](const auto &patch) {
+      patches.erase(std::remove_if(patches.begin(), patches.end(), [&](const auto &patch) {
         std::uint32_t actual;
         process.remote_read(patch.address, &actual, sizeof(actual));
         return !std::memcmp(&actual, patch.replacement, sizeof(actual));
-      });
+      }), patches.end());
       const auto restored = process.patch_code_batch(patches, [&] {
         if (!p.alive() || !p.has_control_mapping())
           throw std::runtime_error("target mappings changed during method snapshot restoration");
@@ -642,7 +669,7 @@ api::ObjectWatchStatus MethodWatch::stop() {
     std::this_thread::sleep_for(1ms);
   if (!replaced && p.alive() && p.channel.activity.load(std::memory_order_acquire))
     throw std::runtime_error("timed out draining active method snapshot callbacks");
-  p.reader.request_stop();
+  p.stop_reader.store(true, std::memory_order_release);
   if (p.reader.joinable())
     p.reader.join();
   {

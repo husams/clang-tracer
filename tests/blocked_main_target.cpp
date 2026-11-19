@@ -25,6 +25,7 @@
 #ifndef PR_SET_PTRACER_ANY
 #define PR_SET_PTRACER_ANY (~0UL)
 #endif
+
 extern "C" int blocked_worker_probe(int value);
 
 namespace {

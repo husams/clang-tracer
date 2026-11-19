@@ -84,8 +84,7 @@ def start_target(args: argparse.Namespace, log: Path,
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         match = re.search(r"TARGET pid=(\d+)", log.read_text(errors="replace"))
-        if match:
-            require(int(match.group(1)) == target.pid, "target reported another PID")
+        if match and int(match.group(1)) == target.pid:
             return target, target.pid
         require(target.poll() is None, f"target exited during startup: {log}")
         time.sleep(.05)

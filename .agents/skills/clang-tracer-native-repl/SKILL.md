@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prebuilt object lifetimes and field writes, method snapshots, prepared probes, bulk tracing, observer reload, read-only inspection, typed SQLite replay, and reusable .repl scripts. Use unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, object tracking and snapshots, prepared probes, observer reload, live code and object updates, native mocks, C++ plugins, and SQLite replay.
 ---
 
 # Clang Tracer native REPL
@@ -10,7 +10,8 @@ is `tracer[PID]>`. Use the [Python client skill](../clang-tracer-python/SKILL.md
 when the task explicitly calls for Python. For supported syntax and examples,
 use the repository revision that matches the running binaries. If the current
 checkout lacks the linked demos or manual, read them from the matching branch
-or release. For the current checkout, start with `docs/native-repl.md` and the linked examples.
+or release. For a current `c++17` build, start with
+`git show origin/c++17:docs/native-repl.md`.
 
 At the prompt, use `%help` to discover the installed commands and `%help probe inject`
 or `%help events open` for options. `%help api` lists the C++ API, and topics such
@@ -18,6 +19,30 @@ as `%help api tracer.record`, `%help api tracer.replay`, and `%help api Event`
 show examples and signatures. Use `%type tracer.events_async` to inspect a C++
 declaration or its overloads without evaluation, and `%complete "tracer."` for
 member completion. Use `NO_COLOR=1` for plain terminal output.
+
+## Choose the workflow on `c++17`
+
+Use C++17 for new target, callback, and REPL snippets. Match the REPL, server,
+and agent to the same release. Regenerate prepared probes and object plans with
+that release using the original ELF, DWARF, and compile commands as applicable.
+
+- [Object tracking](references/object-tracking.md) covers lifetimes, store
+  locations, shared-library writers, and type-wide registration.
+- [Object state](references/object-state.md) covers method snapshots, keyed
+  collections, and structured field writes.
+- [Observer reload](references/observer-reload.md) updates a running probe's
+  callback with `%probe reload`.
+- [Mocking](references/mocking.md) covers typed native mocks with fixtures
+  and opt-in scalar replacement.
+- [Live updates](references/live-updates.md) covers application code
+  replacement, owner-backed object updates, and managed migration.
+- [Plugins](references/plugins.md) covers controller and injected-agent
+  plugins.
+
+Check `%help live update`, `%help object-probe prepare`, and
+`%help plugin load` before using features backported to `c++17`.
+An earlier installation can lack these commands even when the source
+checkout has them.
 
 ## Run a native script
 
@@ -96,13 +121,6 @@ DWARF-supported and available for a new probe. Use `--callback FILE` to compile
 a custom observer for each match. Keep the reported batch ID to remove its probes
 or retry any incomplete restoration.
 
-Use `%probe reload PROBE_ID --callback observer-v2.cpp` to update an active
-observer while keeping its binding and deployment options. A rejected callback
-leaves the existing observer active. Calls already in flight finish under the
-old ID. Use the new ID for subsequent filtering or removal, and check `%probes`
-if the reload reply was interrupted. Retired generations still count toward
-the target's retained-probe limit.
-
 Use `%events stats NAME` on live or replayed collections for per-probe counts,
 duration histograms, and caller edges. Caller edges require captured entry stacks.
 
@@ -139,6 +157,10 @@ for the installed syntax.
   adapter for a typed package. `--metadata-only` omits the separate adapter files
   and keeps the embedded adapter. Injection can use the package without the
   original application headers.
+- **Callback build flags.** For non-prepared probes with `--include` and a
+  compilation database, the selected command's flags also apply to the
+  callback. Make the callback compile under the project's warning policy
+  and validate with the same flags used for injection.
 - **Virtual methods and templates.** Select the concrete virtual implementation
   reached by dispatch, or use explicit template arguments and a full parameter
   list, such as `prepared_concrete::Handler::convert<int>(int) const`. Injection
@@ -148,8 +170,9 @@ for the installed syntax.
   Read `argument_snapshot()` and `result_snapshot()` for field inspection,
   or `argument_as<T>()` and `result_as<T>()` for supported C++ values.
   Use snapshots for records with application-defined copy, move, or destruction.
-  For a raw pointer, inspect its address or capture an owned field payload in
-  the callback while the pointee is valid.
+  For a raw pointer return, use `--snapshot-return-pointee` at injection to
+  capture fields when the pointee layout is available. See the workflow below
+  for polymorphic implementation members of a returned record.
   `receiver_snapshot()` captures entry-time fields across access levels and
   base classes. Qualify hidden field names. Owning pointer snapshots can expose
   an owned pointee under `value`, weak pointers expose `expired`, and variants
@@ -169,6 +192,52 @@ for the installed syntax.
   done. For named collections, use `%events stats NAME` to check for loss and
   incomplete captures.
 
+### Capture polymorphic implementation fields from a return
+
+1. Use `%probe prepare` with the function declaration header first and include
+   the matching source that defines the polymorphic base and concrete classes.
+   Clang discovers eligible direct raw pointer members such as `_imp` and the
+   derived layouts visible during preparation. RTTI selects a layout at POST.
+2. Inject with `--prepared DIRECTORY --prepared-mode require`. Add
+   `--snapshot-return-pointee` for `Item*`. An `Item&` return captures its record
+   directly. Keep the pointees and captured data live and stable through POST.
+3. Collect POST and read `event.result_snapshot()` or
+   `event.result_as<tracer_repl::EventValue>()`. The root holds `_imp` as an
+   address. Check `root.fields().count("_imp_snapshot")` before inspecting
+   `root.field("_imp_snapshot")`. Use `cpp_type()` for the concrete type and
+   `field("name").as<T>()` for a field. Skip null outer pointer results.
+   Null, unreadable, and unknown member pointees remain address-only.
+
+These steps use automatic capture. `result_as<T>()` decodes the root snapshot.
+For `HFW::Item` returns the concrete `ItemV1`, `ItemV2`, and `ItemV3` records
+are nested and lack generated class decoders. Use `EventValue` for field
+inspection, or choose the hook that matches the requested customization.
+
+- **Select which members to follow.** Include a header specializing
+  `tracer_snapshot::FollowPointers<Record>` during preparation. Its member
+  list replaces the inferred list and can include supported non-polymorphic
+  pointers. The policy applies when capturing that record as a result,
+  receiver, or argument.
+- **Project a concrete type during capture.** In `%probe inject`, put
+  `--callback FILE` immediately after the selector and before `--prepared`.
+  Define a `tracer_snapshot::encode(const Concrete&) noexcept` overload
+  returning a named snapshot-compatible record by value. For either PImpl demo,
+  keep the usual preparation and inject with `--callback demo/pimpl/encoder.cpp`
+  to replace `ItemV2` fields with `summary` while retaining its `cpp_type()`.
+  An encoder-only file needs no interceptor hooks.
+- **Construct a local typed value.** Specialize `tracer_repl::EventCodec<T>`.
+  Decode the nested implementation with `impl.as<T>()` or define a decoder
+  that reads `_imp_snapshot` from the root for `event.result_as<T>()`.
+
+Use the matching revision's [PImpl demos](../../../examples/prepared-injectors/README.md#pimpl-return-snapshots).
+Run `./examples/prepared-injectors/run-native.sh --pimpl-pointer` and
+`./examples/prepared-injectors/run-native.sh --pimpl-reference` in separate
+sessions and paste the printed commands. With `--smoke`, verify
+`NATIVE_PIMPL_POINTER=1` and `NATIVE_PIMPL_REFERENCE=1`. For installed validation,
+point `CLANG_TRACER_REPL`, `CLANG_TRACER_SERVER`, `CLANG_TRACER_AGENT`, and
+`TRACER_PREPARE_EXECUTABLE` at the same installed release. Set
+`CLANG_TRACER_PREPARED_BUILD` to the matching fixture build.
+
 ### Prepare with multiple headers in C++
 
 On builds with the multi-header overload, pass a braced list or a
@@ -185,16 +254,6 @@ in the same order. To override the compile flags in C++, pass the compilation
 database and translation unit after the output directory. Use
 `%help api tracer.prepare` for an example and `%type tracer.prepare` for the
 installed overloads.
-
-## Trace object lifetimes and state
-
-Use the matching Linux x86-64 or AArch64 REPL, server, and agent with the existing ELF and matching DWARF. For individual writes, use `%object prepare TYPE --module ELF --field FIELD --code SELECTOR --backend code-cache --output DIRECTORY`. Choose `ptrace` for diagnostic single-stepping. The backend is saved in the plan. For net method changes, prepare with `--on METHOD`, the original `--include` and compile command, and a verified `--synchronization` policy.
-
-Attach, run `%object preview --plan DIRECTORY`, and check the binding and admitted sites. Use `%object start --plan DIRECTORY` to arm the watch. Writes capture values by default. Add `--no-values` to a write watch to record completed stores, including same-value stores, without samples. Record while the workload runs with `%record capture.db --sqlite --name object.trace --probe WATCH_ID --count N --timeout SECONDS`. Check `%object status WATCH_ID`, then stop with `%object stop WATCH_ID` and confirm restoration before `%detach`. Open the recording with `%events open capture.db --as saved` and inspect it with `%events list saved` or `%events show saved --index 0`.
-
-For an exact writer line, select a typed leaf of a nested record with `--field`. Follow keyed vector entries with `--vector` and `--element-key`, ordered or unordered map entries with `--map` and `--map-key`, or verified pointer paths with `--pointee`. Supply each storage-changing boundary with `--mutation` and verify rebinding and writer coverage in replay. For logical entry changes at verified mutation boundaries, add `--mode logical-writes` and declare synchronization. Repeat `--mutation` for insert, erase, move, swap and resize functions. Use `--mutation "destroy=SYMBOL"` for a directly called function that ends the selected container's lifetime. Inspect `LOGICAL_UPDATE` for the mutation, before and after indices or sizes, and typed values alongside actual store events. For individual writes to verified libstdc++ strings, variants and any payloads, select the complex field itself with `--first-seen` and a declared synchronization policy. Inspect `storageWrite` for the affected representation, character buffer or payload bytes and confirm original store PCs in replay. For complete value trees and typed complex projections, use method snapshots with `--field` and a verified `--key PATH=MEMBER` where applicable. Added and removed entries carry the captured value tree in `snapshotAfter` or `snapshotBefore`.
-
-Report gaps and drops as partial evidence. Lifecycle and ownership require verified boundaries, and unadmitted writers, unsafe reads, generated helper windows, and external writers can limit what the trace establishes. Follow the [runnable example and coverage limits in the native REPL guide](../../../docs/native-repl.md#trace-object-lifetimes-and-state-in-a-prebuilt-binary) for detailed commands and collection, union, and shared-library cases.
 
 ## Record and replay events
 

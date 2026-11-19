@@ -463,6 +463,9 @@ private:
                                  clang::InputKind(clang::Language::CXX));
     frontend.ProgramAction = clang::frontend::GeneratePCH;
     frontend.OutputFile = pch_path.string();
+    // The cache owns this private generation path until validation succeeds.
+    // Clang's temporary output would register LLVM's process signal handlers.
+    frontend.UseTemporary = false;
     invocation->getPreprocessorOpts().ImplicitPCHInclude.clear();
     invocation->getPreprocessorOpts().clearRemappedFiles();
     invocation->getHeaderSearchOpts().ModulesValidateSystemHeaders = true;

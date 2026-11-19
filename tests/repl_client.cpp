@@ -4,6 +4,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -122,16 +123,50 @@ void check_trace_statistics() {
 }
 
 class Service final : public api::Tracer::Service {
+  std::mutex bulk_mutex_;
+  std::string interrupted_batch_;
+
 public:
   std::atomic<bool> attached{false};
   std::atomic<bool> failed{false};
   std::atomic<int> attach_mode{0};
   std::atomic<unsigned> attach_calls{0};
+  std::atomic<bool> agent_source{false}, agent_bundle{false};
   std::atomic<unsigned> installed{0}, detached{0};
   std::atomic<bool> pair_created{false}, detached_s1{false}, detached_s2{false};
   std::function<void()> on_watch;
   std::atomic<int> watch_mode{0};
   std::atomic<unsigned> active_watches{0};
+
+  grpc::Status ApplyBulkTrace(grpc::ServerContext *context,
+                              const api::ApplyBulkTraceRequest *request,
+                              api::BulkTraceReport *response) override {
+    const auto remaining = context->deadline() - std::chrono::system_clock::now();
+    if (remaining <= std::chrono::seconds(3)) {
+      std::lock_guard lock(bulk_mutex_);
+      interrupted_batch_ = request->batch_id();
+      return {grpc::StatusCode::DEADLINE_EXCEEDED, "lost bulk reply"};
+    }
+    if (remaining < std::chrono::seconds(110))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "bulk apply used the ordinary RPC deadline"};
+    response->set_batch_id(request->batch_id());
+    response->set_complete(true);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RemoveBulkTrace(grpc::ServerContext *context,
+                               const api::RemoveBulkTraceRequest *request,
+                               api::BulkTraceReport *response) override {
+    std::lock_guard lock(bulk_mutex_);
+    if (request->session_id() != "s1" || interrupted_batch_.empty() ||
+        request->batch_id() != interrupted_batch_ ||
+        context->deadline() - std::chrono::system_clock::now() < std::chrono::seconds(110))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "wrong bulk cleanup request"};
+    interrupted_batch_.clear();
+    response->set_batch_id(request->batch_id());
+    response->set_complete(true);
+    return grpc::Status::OK;
+  }
 
   grpc::Status ListSessions(grpc::ServerContext *,
                             const api::ListSessionsRequest *,
@@ -157,6 +192,8 @@ public:
   grpc::Status Attach(grpc::ServerContext *, const api::AttachRequest *q,
                       api::Session *r) override {
     ++attach_calls;
+    agent_source = false;
+    agent_bundle = false;
     const int mode = attach_mode.load();
     if (mode == 3)
       std::this_thread::sleep_for(std::chrono::milliseconds(1250));
@@ -166,6 +203,7 @@ public:
       pair_created = true;
     r->set_id("s1");
     r->set_pid(q->pid());
+    r->set_executable("/test/application");
     r->set_state(api::Session::ATTACHED);
     if (mode == 1)
       return {grpc::StatusCode::INTERNAL, "retained attach failure"};
@@ -173,6 +211,43 @@ public:
       return {grpc::StatusCode::DEADLINE_EXCEEDED, "lost attach reply"};
     if (mode == 4)
       return {grpc::StatusCode::INTERNAL, "ambiguous concurrent attach"};
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AgentPlugin(grpc::ServerContext*, const api::AgentPluginRequest* q,
+                           api::AgentPluginResponse* r) override {
+    using Request = api::AgentPluginRequest;
+    if (!attached || q->session_id() != "s1" ||
+        (q->plugin_id() != "source" && q->plugin_id() != "bundle")) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "unexpected agent plugin target"};
+    }
+    auto& active = q->plugin_id() == "source" ? agent_source : agent_bundle;
+    if (q->operation() == Request::RUN) {
+      if (!active || q->command() != "tick") {
+        return {grpc::StatusCode::FAILED_PRECONDITION, "agent plugin was not activated"};
+      }
+      r->set_value(1);
+      return grpc::Status::OK;
+    }
+    if (q->expected_executable() != "/test/application") {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "expected executable was not forwarded"};
+    }
+    if (q->plugin_id() == "source") {
+      if (q->operation() != Request::LOAD || q->source() != "// automatic agent fixture\n") {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "source was not forwarded"};
+      }
+    } else if (q->operation() != Request::LOAD_PACKAGE || q->package().sources_size() != 1 ||
+               q->package().sources(0) != "src/plugin.cpp" ||
+               q->package().extra_flags_size() != 1 ||
+               q->package().extra_flags(0) != "-DTEST_VALUE=7" || q->package().files_size() != 1 ||
+               q->package().files(0).path() != "src/plugin.cpp" ||
+               q->package().files(0).contents() != "// automatic agent fixture\n") {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "package was not forwarded"};
+    }
+    if (active.exchange(true)) {
+      return {grpc::StatusCode::ALREADY_EXISTS, "agent plugin was activated twice"};
+    }
+    r->set_generation(1);
     return grpc::Status::OK;
   }
 
@@ -535,7 +610,7 @@ int main(int argc, char **argv) {
         require(live.running(), "collector remains active between REPL inputs");
         auto first_event = live | take(1) | first();
         require(first_event && first_event->sequence() == 3,
-                "adaptors inspect a background snapshot without blocking");
+                "a limit ends iteration without waiting for a further event");
         auto post_event = live | filter([](const auto &e) { return e.phase() == "POST"; }) | take(1) | first();
         require(post_event && post_event->sequence() == 4,
                 "event predicates compose with limits");
@@ -545,7 +620,7 @@ int main(int argc, char **argv) {
                 "background retention respects the shared count budget");
         unsigned count = 0;
         for (const auto& event : live) {
-          require(event.sequence() == ++count + 2, "snapshot range order");
+          require(event.sequence() == ++count + 2, "C++17 snapshot range order");
           live.stop();
         }
         require(count == 2 && !live.running() && live.snapshot().cancelled && live.error().empty(),
@@ -587,8 +662,7 @@ int main(int argc, char **argv) {
           (void)event;
           ++count;
         }
-        require(count == 0 && quiet.running(), "empty iteration does not wait");
-        wait_for([&] { return !quiet.running(); });
+        require(count == 0 && !quiet.running(), "iteration waits for the stream to end");
         require(quiet.snapshot().timed_out && quiet.error().empty(),
                 "quiet stream deadline is reported");
         // The finished range is still in scope but retained nothing, so it
@@ -614,6 +688,18 @@ int main(int argc, char **argv) {
                 "worker reports RPC errors without throwing on another input");
       }
       service.watch_mode = 3;
+      {
+        auto waiting = tracer.events_async(session);
+        std::thread cancel([] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          interrupted = true;
+        });
+        const bool empty = !(waiting | first());
+        cancel.join();
+        interrupted = false;
+        require(empty && waiting.running(), "Ctrl+C ends a waiting iteration, not the collector");
+      }
+      wait_for([&] { return service.active_watches == 0; });
       auto quiet = tracer.events_async(session);
       wait_for([&] { return service.active_watches == 1; });
       tracer.detach(session);
@@ -626,7 +712,6 @@ int main(int argc, char **argv) {
       require(!live.running(), "shutdown joins workers while handles survive");
     }
     service.watch_mode = 0;
-    server->Shutdown();
     EventBuffer limited(2, 4096);
     for (unsigned i = 0; i < 5; ++i) {
       api::TraceEvent e;
@@ -692,6 +777,30 @@ int main(int argc, char **argv) {
             "shared state decodes with its attached descriptor");
     char directory[] = "/tmp/tracer-repl-records.XXXXXX";
     require(::mkdtemp(directory), "recording directory");
+    {
+      const auto manifest = std::string(directory) + "/bulk.textproto";
+      std::ofstream(manifest) << "version: 1\nexact_selectors: \"multiply(int, int)\"\n";
+      const auto apply = parse_command("%trace apply --manifest \"" + manifest + "\"");
+      std::ostringstream output;
+      Controller default_client(settings, output);
+      default_client.attach(7);
+      default_client.execute(apply);
+      require(output.str().find("complete=true") != std::string::npos,
+              "bulk apply succeeds with its longer default deadline");
+
+      auto short_settings = settings;
+      short_settings.bulk_apply_timeout_seconds = 1;
+      Controller short_client(short_settings, output);
+      short_client.attach(7);
+      try {
+        short_client.execute(apply);
+        throw std::logic_error("accepted a failed bulk apply");
+      } catch (const std::runtime_error &error) {
+        require(std::string(error.what()) == "bulk trace apply: lost bulk reply | batch restored",
+                "bulk apply restores the same batch with a fresh deadline");
+      }
+    }
+    server->Shutdown();
     const auto path = std::string(directory) + "/events.pb";
     const int fd = create_recording(path);
     auto with_stack = limited.events().front()->message;
@@ -708,6 +817,8 @@ int main(int argc, char **argv) {
     last->set_module_offset(0x40);
     last->set_file("/app/main.cpp");
     last->set_line(42);
+    last->set_stack_pointer(0x8000);
+    last->set_application_frame(true);
     write_record(fd, with_stack);
     write_record(fd, limited.events().back()->message);
     ::close(fd);
@@ -728,6 +839,16 @@ int main(int argc, char **argv) {
     out.str("");
     offline.execute(parse_command("%events stack saved --index 1"));
     require(out.str() == "no stack captured\n", "missing stack has a clear response");
+    const auto saved = offline.batch("saved");
+    const auto frames = saved.at(0).stack();
+    require(frames.size() == 1025 && frames.front().pc == 0x1000 &&
+                frames.back().pc == 0x1400 && frames.back().stack_pointer == 0x8000 &&
+                frames.back().kind == "NATIVE" && frames.back().function == "last_frame()" &&
+                frames.back().module == "/app" && frames.back().module_offset == 0x40 &&
+                frames.back().file == "/app/main.cpp" && frames.back().line == 42 &&
+                frames.back().application_frame,
+            "Event::stack exposes every retained frame and its metadata in order");
+    require(saved.at(1).stack().empty(), "Event::stack is empty without a stack");
     try {
       create_recording(path);
       throw std::logic_error("overwrote recording");

@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "compiler_profile.hpp"
 
 #include <algorithm>
@@ -34,8 +35,8 @@ bool cpp_source(const fs::path &path) {
 }
 } // namespace
 
-DatabaseProfile compilation_database_profile(const std::string &requested,
-                                             const std::string &file) {
+DatabaseProfile compilation_database_profile(const std::string& requested, const std::string& file,
+                                             DatabaseSelection selection) {
   if (requested.empty() || file.empty())
     throw std::invalid_argument(
         "database and source file paths must be nonempty");
@@ -61,7 +62,11 @@ DatabaseProfile compilation_database_profile(const std::string &requested,
       std::find_if(commands.begin(), commands.end(), [&](const auto &command) {
         return command_file(command) == target;
       });
-  if (chosen == commands.end()) {
+  if (chosen == commands.end() && selection == DatabaseSelection::ExactOrUnique &&
+      commands.size() == 1) {
+    chosen = commands.begin();
+  }
+  if (chosen == commands.end() && selection == DatabaseSelection::SameDirectory) {
     for (auto it = commands.begin(); it != commands.end(); ++it) {
       const auto candidate = command_file(*it);
       if (!cpp_source(candidate) ||
@@ -71,10 +76,15 @@ DatabaseProfile compilation_database_profile(const std::string &requested,
         chosen = it;
     }
   }
-  if (chosen == commands.end())
+  if (chosen == commands.end()) {
+    if (selection != DatabaseSelection::SameDirectory) {
+      throw std::runtime_error("no unambiguous compilation database entry for " + target.string() +
+                               "; set translation_unit to an exact source path");
+    }
     throw std::runtime_error(
         "no exact entry or C++ source entry in the same directory: " +
         target.string());
+  }
   auto argv = clang::tooling::getClangStripDependencyFileAdjuster()(
       chosen->CommandLine, chosen->Filename);
   argv = clang::tooling::getClangStripOutputAdjuster()(argv, chosen->Filename);
@@ -128,6 +138,40 @@ DatabaseProfile compilation_database_profile(const std::string &requested,
     argument->render(parsed, rendered);
     for (const auto *value : rendered)
       result.arguments.emplace_back(value);
+  }
+  return result;
+}
+
+std::vector<std::string> resolve_plugin_flag_paths(const std::vector<std::string>& flags,
+                                                   const fs::path& directory) {
+  std::vector<const char*> argv;
+  for (const auto& flag : flags) {
+    argv.push_back(flag.c_str());
+  }
+  unsigned missing_index = 0, missing_count = 0;
+  const auto parsed = getDriverOptTable().ParseArgs(argv, missing_index, missing_count);
+  if (missing_count) {
+    throw std::invalid_argument("extra compiler flag is missing its value");
+  }
+  auto result = flags;
+  for (const auto* arg : parsed) {
+    const auto name = arg->getOption().getName();
+    if (arg->getNumValues() != 1 ||
+        (name != "I" && name != "F" && name != "isystem" && name != "iquote" &&
+         name != "idirafter" && name != "isysroot" && name != "sysroot" && name != "sysroot=")) {
+      continue;
+    }
+    const std::string value = arg->getValue();
+    if (fs::path(value).is_absolute()) {
+      continue;
+    }
+    auto& flag = result.at(arg->getIndex());
+    const auto path = (directory / value).lexically_normal().string();
+    if (flag == arg->getSpelling()) {
+      result.at(arg->getIndex() + 1) = path;
+    } else if (::tracer::compat::ends_with(flag, value)) {
+      flag.replace(flag.size() - value.size(), value.size(), path);
+    }
   }
   return result;
 }

@@ -19,7 +19,63 @@ int main() {
     }
     throw std::runtime_error("accepted malformed command: " + s);
   };
+  const auto live = parse_command("%live update \"source one.cpp\" source-two.cpp "
+                                  "--build inputs.textproto --retention-limit 3");
+  require(live.kind == CommandKind::live_update && live.arguments.size() == 2 &&
+          live.arguments.front() == "source one.cpp" && live.number("--retention-limit", 0) == 3);
+  require(parse_command("%live preview source.cpp").kind == CommandKind::live_preview);
+  require(parse_command("%live status").kind == CommandKind::live_status);
+  require(parse_command("%live watch source.cpp").kind == CommandKind::live_watch);
+  require(parse_command("%object prepare --type demo::State --code f --field value --output watch")
+              .option("--output") == "watch");
+  require(parse_command("%live revert 0").arguments.front() == "0");
+  require(parse_command("%live recover").kind == CommandKind::live_recover);
+  bad("%live recover 0");
   require(parse_command("%attach 12345").kind == CommandKind::attach);
+  const auto launch = parse_command(
+      "%launch ./app --arg \"--first\" --arg \"\" --env VAR=1 --env \"VAR=two words\" --timeout 5");
+  require(launch.kind == CommandKind::launch && launch.arguments.at(0) == "./app" &&
+          launch.options.at("--arg") == std::vector<std::string>{"--first", ""} &&
+          launch.options.at("--env") == std::vector<std::string>{"VAR=1", "VAR=two words"} &&
+          launch.number("--timeout", 0) == 5);
+  require(parse_command("%resume").arguments.empty());
+  require(parse_command("%terminate 123").kind == CommandKind::terminate);
+  const auto call = parse_command("%call app::sum --arg -3 --arg 1.25 --timeout 1");
+  require(call.kind == CommandKind::target_call && call.arguments[0] == "app::sum" &&
+          call.options.at("--arg") == std::vector<std::string>{"-3", "1.25"});
+  require(parse_command("%call-result --timeout 2").kind == CommandKind::target_call_result);
+  require(parse_command("%syscalls --count 64").kind == CommandKind::syscalls);
+  require(parse_command("%sample cpu --timeout 1").kind == CommandKind::sample_cpu);
+  bad("%sample cpu --timeout 61");
+  bad("%syscalls --count 8193");
+  require(parse_command("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 7")
+              .kind == CommandKind::instructions_start);
+  require(parse_command("%instructions stop").kind == CommandKind::instructions_stop);
+  const auto extended = parse_command("%instructions start --tid 23 --address 0x4000 --size 64 "
+      "--mapping m --registers --callback-library /tmp/observer.so --memory-address 0x8000 --memory-size 8");
+  require(extended.has("--registers") && extended.option("--callback-library") == "/tmp/observer.so" &&
+          extended.option("--memory-address") == "0x8000" && extended.number("--memory-size", 0) == 8);
+  require(parse_command("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read-write")
+              .kind == CommandKind::watchpoint);
+  bad("%watchpoint --tid 23 --address 0x4001 --size 8 --mapping m --access write");
+  bad("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --memory-address 0x8000");
+  bad("%instructions start --address 0x4000 --tid 23 --size 64");
+  bad("%instructions start --tid 0 --address 0x4000 --size 64 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 65537 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --timeout 61");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 8193");
+  const auto overrides = parse_command("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-result-override");
+  require(overrides.has("--allow-arg-overrides") && overrides.has("--allow-result-override"));
+  require(parse_command("%probe validate f --callback hook.cpp --allow-result-override")
+              .has("--allow-result-override"));
+  bad("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-arg-overrides");
+  bad("%call");
+  bad("%call-result --arg 1");
+  bad("%launch app --cwd here --cwd there");
+  bad("%launch app --timeout 0");
+  bad("%resume 0");
+  bad("%terminate 2147483648");
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
       "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind
           == CommandKind::prepare);
@@ -67,6 +123,14 @@ int main() {
               .has("--print-result"));
   require(parse_command("%probe validate f --callback hook.cpp --extra-args -DHOOK=1")
               .extra_compile_argument_inputs.size() == 1);
+  const auto original_with_flags = parse_command(
+      "%probe inject f --callback hook.cpp --extra-args -DHOOK=1 "
+      "--allow-call-original --trace-exceptions --stack-depth full");
+  require(original_with_flags.extra_compile_argument_inputs.size() == 1 &&
+          original_with_flags.extra_compile_argument_inputs.front().text == "-DHOOK=1");
+  require(original_with_flags.has("--allow-call-original") &&
+          original_with_flags.has("--trace-exceptions") &&
+          original_with_flags.number("--stack-depth", 0) == UINT32_MAX);
   bad("%probe prepare f --include api.hpp --output prepared --extra-args");
   bad("%probe validate f --callback hook.cpp --extra-args `unfinished");
   bad("%server start --extra-arg -DHOOK=1");
@@ -86,6 +150,24 @@ int main() {
   require(inject.option("--prepared-mode") == "require" && !inject.has("--prepared"));
   bad("%probe inject f --callback h --prepared-mode require --prepared \"\"");
   bad("%probe inject f --callback h --prepared d --prepared-mode typo");
+  // Followed-member limits: every option of the table parses at prepare and inject.
+  const auto limited_prepare = parse_command(
+      "%probe prepare f --include api.hpp --output prepared --no-automatic-members "
+      "--follow-depth 5 --follow-members unlimited --record-members 7 --nested-depth off "
+      "--string-bytes 6000 --vector-elements 10 --checked-reads 9 --snapshot-reserve 0 "
+      "--snapshot-arena 65536 --snapshot-slice 8192");
+  require(limited_prepare.has("--no-automatic-members") &&
+          limited_prepare.option("--follow-depth") == "5" &&
+          limited_prepare.option("--follow-members") == "unlimited" &&
+          limited_prepare.option("--nested-depth") == "off" &&
+          limited_prepare.option("--snapshot-slice") == "8192");
+  const auto limited_inject = parse_command(
+      "%probe inject f --prepared d --string-bytes 6000 --follow-depth 2 --snapshot-arena unlimited");
+  require(limited_inject.option("--string-bytes") == "6000" &&
+          limited_inject.option("--follow-depth") == "2" &&
+          limited_inject.option("--snapshot-arena") == "unlimited");
+  bad("%probe inject f --prepared d --follow-depth");
+  bad("%probe inject f --prepared d --follow-depth 2 --follow-depth 3");
   auto p = parse_command(
       "%probe inject \"Calculator::multiply(int, int) const\" --callback 'my "
       "callback.cpp' --stack-depth 16");
@@ -115,9 +197,26 @@ int main() {
   require(!parse_command("%events").has("--count"));
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");
+  const auto failures = parse_command(
+      "%collect --callback-errors only --count 4");
+  require(failures.option("--callback-errors") == "only");
+  const auto record_failures = parse_command(
+      "%record failures.pb --callback-errors exclude --count 2");
+  require(record_failures.option("--callback-errors") == "exclude");
+  const auto opened = parse_command(
+      "%events open capture.pb --as saved --callback-errors exclude");
+  require(opened.kind == CommandKind::event_open &&
+              opened.option("--callback-errors") == "exclude");
   require(parse_command("%help Event").arguments.at(0) == "Event");
   require(parse_command("%help api tracer_repl::Event").arguments ==
           std::vector<std::string>{"api", "tracer_repl::Event"});
+  const auto agent_reload = parse_command("%plugin agent reload a");
+  require(agent_reload.kind == CommandKind::agent_plugin_reload &&
+          agent_reload.arguments == std::vector<std::string>{"a"});
+  require(parse_command("%plugin agent reload a \"plugin source.cpp\"").arguments ==
+          std::vector<std::string>{"a", "plugin source.cpp"});
+  bad("%plugin agent reload");
+  bad("%plugin agent reload a first.cpp second.cpp");
   require(parse_command("%help %probe inject").arguments ==
           std::vector<std::string>{"probe", "inject"});
   bad("%help %");
@@ -192,6 +291,17 @@ int main() {
   bad("%symbols --limit 4294967296");
   require(parse_command("%threads").kind == CommandKind::threads);
   require(parse_command("%modules --details").has("--details"));
+  require(parse_command("%modules --filter libdemo.so").option("--filter") == "libdemo.so");
+  const auto module_filter = parse_command("%modules --details --filter 'lib with spaces'");
+  require(module_filter.kind == CommandKind::modules && module_filter.has("--details") &&
+          module_filter.option("--filter") == "lib with spaces");
+  require(parse_command("%modules --filter demo --details").has("--details"));
+  bad("%modules --filter");
+  bad("%modules --filter one --filter two");
+  require(parse_command("%modules --elf libdemo.so").option("--elf") == "libdemo.so");
+  require(parse_command("%modules --watch --count 2 --timeout 10").number("--count", 0) == 2);
+  bad("%modules --elf libdemo.so --filter demo");
+  bad("%modules --watch --filter demo");
   require(parse_command("%attach 42 --start-time 100").number("--start-time", 0) == 100);
   require(parse_command("%symbols --filter demo --addresses").has("--addresses"));
   require(address_number(parse_command("%symbols --address 0x100a --mapping s:token")

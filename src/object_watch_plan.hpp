@@ -44,10 +44,14 @@ struct Source {
   std::vector<clangtracer::v1::ObjectObservation::InlineLocation> inline_chain;
 };
 struct UnionCase {
-  enum class Type { signed_integer, unsigned_integer, real };
+  enum class Type { signed_integer, unsigned_integer, real, boolean, opaque };
   std::string member;
   Type type;
-  bool operator==(const UnionCase &) const = default;
+  unsigned width = 4;
+  bool operator==(const UnionCase &other) const {
+    return member == other.member && type == other.type && width == other.width;
+  }
+  bool operator!=(const UnionCase &other) const { return !(*this == other); }
 };
 struct Layout {
   enum class FieldType { int32, signed_integer, unsigned_integer, boolean, real };
@@ -58,7 +62,8 @@ struct Layout {
   bool atomic = false;
   bool opaque_union = false;
   std::optional<std::uint64_t> union_tag_offset;
-  std::map<std::uint32_t, UnionCase> union_cases;
+  std::map<std::uint64_t, UnionCase> union_cases;
+  std::string union_path;
   std::uint64_t vector_object = 0, key_offset = 0;
   bool logical_vector = false;
   bool logical_map = false;
@@ -99,7 +104,8 @@ public:
       std::uint32_t pid = 0);
 
   Plan(std::uint32_t pid, std::string executable,
-       const clangtracer::v1::ObjectWatchRequest &request);
+       const clangtracer::v1::ObjectWatchRequest &request,
+       bool verify_method_lifetimes = false);
   ~Plan();
 
   const std::string module;
@@ -116,11 +122,15 @@ public:
   std::set<std::pair<std::uint64_t, std::uint64_t>> complete_constructor_returns;
   std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
   bool virtual_destructor = false;
+  bool lifetimes_only = false;
+  std::string lifetime_coverage_diagnostic;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
   std::set<std::uint64_t> destruction_mutations;
   std::map<std::uint64_t, std::string> mutation_selectors;
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
+
+  bool follow_calls_eligible(const clangtracer::v1::ObjectWatchRequest &request) const;
 
   std::string_view code(std::uint64_t pc) const;
 #if defined(__x86_64__)
@@ -150,7 +160,8 @@ public:
   std::pair<std::uint64_t, std::size_t> containing_function(std::uint64_t pc) const;
   std::map<std::uint64_t, std::vector<std::uint64_t>>
   direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only = false,
-                   bool require_complete = true) const;
+                   bool require_complete = true, bool match_constructor_plt = false,
+                   std::set<std::uint64_t> *verified_plt_calls = nullptr) const;
   std::string runtime_scope_code(const std::string &path,
       std::uint64_t bias, std::uint64_t start, const std::array<std::uint8_t, 32> &sha256,
       std::size_t width,
@@ -165,6 +176,8 @@ struct ScalarSample {
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next);
+void set_union_write(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                     const UnionWriteState &before, const UnionWriteState &after);
 void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
                        const ValueStoreBytes *before, const ValueStoreBytes *after);
 void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,

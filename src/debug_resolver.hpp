@@ -20,6 +20,14 @@ std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,
                                   const llvm::object::ObjectFile &object,
                                   std::uint64_t entry, std::uint64_t size,
                                   bool allow_main_without_build_id = false);
+// Reuse one executable map after binding an anchor to the exact ELF build.
+struct LiveCodeMappings {
+  std::function<bool(std::uint64_t, std::uint64_t)> contains;
+  std::function<bool()> current;
+};
+LiveCodeMappings snapshot_live_code_mappings(
+    std::uint32_t pid, const std::string &path,
+    const llvm::object::ObjectFile &object, std::uint64_t bias);
 std::optional<std::string> find_matching_debug_file(
     const std::string &path, const llvm::object::ObjectFile &object);
 // Read the verified ELF range and require an exact match with live text.
@@ -33,6 +41,7 @@ struct DebugLookupOptions {
   std::uint64_t max_entries = 0; // Zero is unlimited.
   std::uint32_t max_depth = 0; // Zero is unlimited.
   std::function<bool()> is_cancelled = [] { return false; };
+  bool require_override_abi = false;
   bool allow_virtual_entry = false; // Only for inspecting or translating a resolved body.
 };
 
@@ -42,11 +51,14 @@ public:
 };
 
 std::vector<std::string> list_debug_modules(std::uint32_t pid);
-clangtracer::v1::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
-                                                               bool include_runtime = false);
+clangtracer::v1::ListModulesResponse list_debug_module_mappings(
+    std::uint32_t pid, const std::string &elf_path = {}, bool include_runtime = false);
 clangtracer::v1::PreviewBulkTraceResponse preview_bulk_trace(
     std::uint32_t pid, const clangtracer::v1::BulkTraceRules &rules,
     const std::function<bool()> &is_cancelled);
+// True when a mangled symbol names a constructor (C1/C2/C3) or destructor (D0/D1/D2) entry point.
+bool is_constructor_symbol(const std::string &linkage);
+bool is_destructor_symbol(const std::string &linkage);
 ResolvedCallable resolve_debug_callable(
     std::uint32_t pid, const std::string &selector,
     const DebugLookupOptions &options = {});

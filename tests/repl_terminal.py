@@ -85,6 +85,17 @@ def main():
         until(rb"tracer> ")
         send("%attach 7\r")
         until(rb"attached session=s1.*tracer\[7\]> ")
+        send("%quit \\\r")
+        until(rb"%quit \\\n")
+        send("\x03")
+        until(rb"(?m)^tracer\[7\]> ")
+        send("%help \\\r")
+        until(rb"%help \\\n")
+        send("probe \\\r")
+        until(rb"probe \\\n")
+        send("inject\r")
+        until(rb"Deployment options.*tracer\[7\]> ")
+
         send("%collect")
         until(rb"\[Tab: insert template\]")
         send("\t")
@@ -103,9 +114,9 @@ def main():
         until(rb'  #include "edit\xc3\xb6r headers/"')
         send('editor-t\t"\r')
         until(rb"\ntracer\[7\]> ")
-        send("concep\t")
-        until(rb"concept")
-        assert b"\x1b[0;96mconcept" in transcript
+        send("contin\t")
+        until(rb"continue")
+        assert b"\x1b[0;96mcontinue" in transcript
         send("\x15if\t")
         until(rb"if \(condition\) \{")
         send('terminal_header_value == 28\t\x1b[Zterminal_header_value == 27\t'
@@ -175,14 +186,18 @@ def main():
         assert b"\x1b[0;22;35m|" in transcript
         send("\x15")
         start = len(transcript)
-        send("%symbols --lim\t9")
-        until(rb"%symbols --limit 9")
+        send("%symbols \\\r")
+        until(rb"%symbols \\\n")
+        send("--lim\t9")
+        until(rb"--limit 9")
         command = bytes(transcript[start:])
         assert b"\x1b[0;96m%symbols" in command, command
         assert b"\x1b[0;22;33m--limit" in command, command
         assert b"\x1b[0;22;32m9" in command, command
+        send("\x03")
+        until(rb"(?m)^tracer\[7\]> ")
         start = len(transcript)
-        send('\x15const auto shade = "café";')
+        send('const auto shade = "café";')
         until(rb'const auto shade = "caf\xc3\xa9";')
         code = bytes(transcript[start:])
         assert b"\x1b[0;96mconst" in code, code

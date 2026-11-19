@@ -194,7 +194,9 @@ bool ContextJournal::append(const clangtracer::context::v1::ContextFrame &frame,
   return append(batch, position);
 }
 
-bool ContextJournal::append(const clangtracer::context::v1::ContextBatch &batch, std::uint64_t &position) {
+bool ContextJournal::append(const clangtracer::context::v1::ContextBatch &batch,
+                            std::uint64_t &position,
+                            std::size_t max_replay_bytes) {
   std::lock_guard lock(mutex_);
   if (!error_.empty()) return false;
   if (limits_.fail_operation && limits_.fail_operation("record_write")) return false;
@@ -209,7 +211,9 @@ bool ContextJournal::append(const clangtracer::context::v1::ContextBatch &batch,
   event->set_recording_position(next_pos);
   for (auto &state : *event->mutable_states()) state.clear_epoch_schema_id();
   std::string payload;
-  if (!committed_batch.SerializeToString(&payload) || payload.empty() || payload.size() > limits_.segment_limit - kHeaderSize) return false;
+  if (!committed_batch.SerializeToString(&payload) || payload.empty() ||
+      payload.size() > limits_.segment_limit - kHeaderSize ||
+      payload.size() > max_replay_bytes) return false;
   const std::uint64_t charge = kHeaderSize + payload.size();
   if (charge > limits_.data_budget || data_bytes_ > limits_.data_budget - charge) return false;
   if (!budget_->reserve(budget_key_, charge)) return false;
