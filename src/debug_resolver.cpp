@@ -973,39 +973,65 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
 
 // An entry detour executes for every folded name, including names outside the
 // selection. Compare the typed contract without function or parameter names.
-std::string callable_abi(DWARFDie die) {
+struct EntryAbi {
+  std::string contract;  // signature, arguments and result spelling
+  // Layout of the receiver and of an object result, when this description has the class in full.
+  std::optional<std::string> receiver, result;
+};
+
+EntryAbi callable_abi(DWARFDie die) {
   const auto decl = declaration(die);
   const auto shape = describe_callable(die, decl, {}, true);
   api::ProbeSpec abi;
   *abi.mutable_signature() = shape.signature;
   auto &info = *abi.mutable_debug_info();
+  // GCC describes a class in full only in some translation units; the others carry a
+  // declaration of it. The same function emitted from two of them has one contract, so layouts
+  // are compared only between descriptions that have them.
+  const auto complete = [](DWARFDie record) { return !number(record, dw::DW_AT_declaration); };
+  EntryAbi result;
   if (shape.receiver) {
-    describe_record(shape.receiver, info);
     info.set_receiver_volatile(shape.receiver_volatile);
+    if (complete(shape.receiver)) {
+      api::DebugInfo layout;
+      describe_record(shape.receiver, layout);
+      result.receiver = layout.SerializeAsString();
+    }
   }
   for (const auto &argument : shape.arguments)
     *info.add_arguments() = argument;
-  const auto result = read_type(type_of(decl));
-  info.set_result_cpp_type(result.spelling);
-  info.set_result_is_reference(result.reference);
-  info.set_result_is_object_value(result.value == api::OBJECT);
-  if (result.record)
-    describe_record(result.record, *info.mutable_result_object_type());
-  return abi.SerializeAsString();
+  const auto returned = read_type(type_of(decl));
+  info.set_result_cpp_type(returned.spelling);
+  info.set_result_is_reference(returned.reference);
+  info.set_result_is_object_value(returned.value == api::OBJECT);
+  if (returned.record && complete(returned.record)) {
+    api::DebugInfo layout;
+    describe_record(returned.record, layout);
+    result.result = layout.SerializeAsString();
+  }
+  result.contract = abi.SerializeAsString();
+  return result;
 }
 
 bool incompatible_entry_abis(const std::vector<DWARFDie> &entries,
                              const std::function<void()> &check_cancelled) {
   if (entries.size() < 2)
     return false;
-  std::optional<std::string> expected;
+  std::optional<EntryAbi> expected;
   for (const auto die : entries) {
     check_cancelled();
     try {
-      const auto abi = callable_abi(die);
-      if (expected && abi != *expected)
-        return true;
-      expected = abi;
+      auto abi = callable_abi(die);
+      if (expected) {
+        if (abi.contract != expected->contract ||
+            (abi.receiver && expected->receiver && *abi.receiver != *expected->receiver) ||
+            (abi.result && expected->result && *abi.result != *expected->result))
+          return true;
+        if (!expected->receiver) expected->receiver = abi.receiver;
+        if (!expected->result) expected->result = abi.result;
+      } else {
+        expected = std::move(abi);
+      }
     } catch (const std::exception &) {
       // A second concrete subprogram with an unsupported contract cannot safely
       // inherit the primary's ABI. ELF-only aliases have no such subprogram.

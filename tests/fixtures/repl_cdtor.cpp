@@ -24,6 +24,8 @@ Leaf::Leaf(int x) : VBase(x + 2), Mid(x + 1), l(x) {}
 Leaf::~Leaf() {}
 int Leaf::id() const { return l; }
 
+int Poly::tag() const { return p; }
+
 int run_once(int n) {
   int sum = 0;
   {
@@ -40,6 +42,7 @@ int run_once(int n) {
     Holder<std::unique_ptr<int>> holder(n);
     sum += holder.tag;
   }
+  sum += use_poly(n);
   {
     Leaf stack(n);
     sum += stack.id();

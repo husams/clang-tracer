@@ -170,6 +170,9 @@ def dwarf_phase(session):
     leaf_d0, _ = session.inject("_ZN5cdtor4LeafD0Ev")
     leaf_d1, _ = session.inject("_ZN5cdtor4LeafD1Ev")
     leaf_d2, _ = session.inject("_ZN5cdtor4LeafD2Ev")
+    # The implicit destructor of Poly is emitted by two translation units, one of which only
+    # has a declaration of the class: both descriptions are one contract.
+    poly_d1, _ = session.inject("_ZN5cdtor4PolyD2Ev")
 
     session.run_passes()
     n = PASSES
@@ -216,6 +219,8 @@ def dwarf_phase(session):
     # depends on the compiler (the complete destructor may call it).
     assert leaf_d2 not in (leaf_d0, leaf_d1)
 
+    assert len(post(poly_d1, n, "poly")) == n
+
     # Every probe pairs PRE with POST.
     for probe in (leaf_c1, mid_c2, leaf_d0):
         session.command(f"%collect --probe {probe} --phase PRE --count {n} --timeout 10")
@@ -240,11 +245,16 @@ def bulk_phase(session, bytes_at):
             summary = line.group(3)
             break
         rows.append((line.group(1), line.group(2), line.group(0)))
-    assert not [r for r in rows if r[0] != "DWARF_SUPPORTED"], rows
+    # Names of one shared body (C1/C2, D1/D2) are ALIAS rows behind one primary candidate; every
+    # entry point with its own code is a candidate.
+    aliases = [r for r in rows if r[0] == "ALIAS"]
+    assert aliases and all('reason="alias of _ZN5cdtor' in r[2] for r in aliases), rows
+    assert not [r for r in rows if r[0] not in ("DWARF_SUPPORTED", "ALIAS")], rows
+    rows = [r for r in rows if r[0] != "ALIAS"]
     counts = {}
     for _, selector, _ in rows:
         counts[selector] = counts.get(selector, 0) + 1
-    # C1/C2 and D1/D2 of a shared body are one candidate; distinct bodies are one each.
+    # One primary per shared body; distinct bodies are one each.
     assert counts[PLAIN_CTOR] == 1 and counts[PLAIN_DTOR] == 1 and counts[BOX_CTOR] == 1, counts
     assert counts[LEAF_CTOR] == 2 and counts["cdtor::Mid::Mid(int)"] == 2, counts
     assert counts["cdtor::Leaf::~Leaf()"] == 3 and counts["cdtor::Mid::~Mid()"] == 3, counts

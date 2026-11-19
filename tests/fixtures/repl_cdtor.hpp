@@ -48,6 +48,15 @@ struct Leaf : Mid {
   ~Leaf() override;
   int id() const override;
 };
+// A polymorphic class with an implicit destructor whose key function is defined in repl_cdtor.cpp.
+// repl_cdtor_user.cpp emits its own copy of the destructor from a translation unit that sees the
+// class only as a declaration of the debug information, so one address has several descriptions.
+struct Poly {
+  int p = 0;
+  virtual ~Poly() = default;
+  virtual int tag() const;
+};
+int use_poly(int n);
 // One pass through every construction and destruction path; returns a checksum.
 int run_once(int n);
 }  // namespace cdtor
