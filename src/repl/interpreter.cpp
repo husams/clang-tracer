@@ -8,6 +8,8 @@
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
+#include <clang/AST/ExprCXX.h>
+#include <clang/AST/Mangle.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
@@ -87,6 +89,52 @@ std::string api_header() {
   if (path.find_first_of("\"\\\r\n") != std::string::npos)
     throw std::runtime_error("unsupported character in facade header path");
   return path;
+}
+
+void resolve_temporary_destructors(clang::ASTContext &context,
+                                  const clang::TranslationUnitDecl &unit,
+                                  llvm::Module &module) {
+  std::unique_ptr<clang::MangleContext> mangler(context.createMangleContext());
+  if (mangler->getKind() != clang::MangleContext::MK_Itanium)
+    return;
+  std::set<const clang::Stmt *> visited;
+  const auto visit = [&](auto &&self, const clang::Stmt *statement) -> void {
+    if (!statement || !visited.insert(statement).second)
+      return;
+    if (const auto *temporary =
+            llvm::dyn_cast<clang::CXXBindTemporaryExpr>(statement)) {
+      const auto *destructor = temporary->getTemporary()->getDestructor();
+      // Clang's value-capture consumer forces the result destructor into
+      // CodeGen early. A temporary in a default argument can then retain a
+      // complete-destructor reference although only its base variant was
+      // emitted. Apply the same substitution as Itanium CodeGen, but only
+      // when the class has no virtual bases and that definition is present.
+      if (destructor->getParent()->getNumVBases() == 0) {
+        const auto name = [&](clang::CXXDtorType variant) {
+          std::string result;
+          llvm::raw_string_ostream output(result);
+          mangler->mangleName(clang::GlobalDecl(destructor, variant), output);
+          return result;
+        };
+        auto *complete = module.getFunction(name(clang::Dtor_Complete));
+        auto *base = module.getFunction(name(clang::Dtor_Base));
+        if (complete && complete->isDeclaration() && !complete->use_empty() &&
+            base && !base->isDeclaration() &&
+            complete->getFunctionType() == base->getFunctionType())
+          complete->replaceAllUsesWith(base);
+      }
+    }
+    // Default argument expressions are shared AST nodes, not children.
+    if (const auto *argument =
+            llvm::dyn_cast<clang::CXXDefaultArgExpr>(statement))
+      self(self, argument->getExpr());
+    for (const auto *child : statement->children())
+      self(self, child);
+  };
+  for (const auto *decl : unit.decls())
+    if (const auto *statement = llvm::dyn_cast<clang::TopLevelStmtDecl>(decl);
+        statement && statement->isSemiMissing())
+      visit(visit, statement->getStmt());
 }
 
 bool is_single_initializer(const clang::TranslationUnitDecl &unit,
@@ -816,6 +864,8 @@ bool CppEngine::evaluate(const std::string &source) {
   impl_->history += "\n#line 1\n" + source + "\n;\n";
   impl_->remember(input);
   if (parsed->TheModule) {
+    resolve_temporary_destructors(impl_->interpreter->getASTContext(),
+                                 *parsed->TUPart, *parsed->TheModule);
     const bool initializer = is_single_initializer(*parsed->TUPart, input);
     const bool unload = initializer && can_unload_initializer(*parsed->TheModule);
     const auto rollback_initializer = [&] {
