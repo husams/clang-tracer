@@ -588,13 +588,59 @@ last failed event send. The agent creates a private log file or appends to an
 existing private regular file owned by the target user. Logging is off by
 default.
 
+Set `CLANG_TRACER_AGENT_LOG_LEVEL` in the same environment to choose how much
+the agent records. The agent reads it once, together with the log path. It has
+no effect unless `CLANG_TRACER_AGENT_LOG` is set.
+
+| Level | Records written, in addition to the less verbose levels |
+| --- | --- |
+| `error` | Failed prepare or stop operations, failed hooks, callback messages logged as `Error`. |
+| `warning` | Degraded probes (`outcome=degraded`), dropped log records, callback messages logged as `Warning`. |
+| `info` (default) | Prepare and stop start and finish, hooks that ran, callback messages logged as `Info`. |
+| `debug` | Every prepare and stop stage with the facts it established, retryable stops, the patch state (`installed`, `not_installed`, `replaced`, `modified`, `unreadable`) and call counters of each probe once a second. |
+| `trace` | Hex dumps of the original and installed patch bytes, one record per dispatched PRE or POST hook, and the live bytes when a patch was modified by something other than a probe. |
+
+Values are case-insensitive: `error`, `warning` (or `warn`), `info`, `debug`,
+`trace`. An unset or empty value means `info`. An unrecognized value also
+means `info`, and the agent writes one `operation=log stage=level
+outcome=invalid` record. Every record has a `level=` field right after `pid=`.
+A failed prepare or stop record carries a `message=` with the error text.
+
+### Find out why a probe never fires
+
+Start the target with `CLANG_TRACER_AGENT_LOG_LEVEL=debug` (or `trace`), then
+add the probe. Read the records for the probe ID in order.
+
+1. Each prepare stage writes `outcome=started`, then `outcome=done` with its
+   facts. The last stage that started without a `done`, or a `failed` record
+   with its `message=`, is where installation went wrong.
+2. `stage=resolve_symbol` shows the address the agent resolved and whether it
+   came from debug info or `dlsym`. `stage=validate_patch` shows the mapping,
+   the patch address and size, and the patch backend.
+3. `operation=probe stage=patch` reports the live bytes at the patch address
+   about once a second. `outcome=installed` means the detour is in place.
+   `not_installed` means the original bytes are still there, so calls cannot
+   reach the wrapper. That is expected just before the server installs the
+   detour and just before it removes the probe, because the server restores
+   the entry before it asks the agent to stop. `replaced` (with `by_probe=`)
+   means a newer probe of the same entry, such as a reload, now owns the bytes.
+   `modified` means something else rewrote them.
+4. `operation=probe stage=runtime outcome=active` reports
+   `calls=` (times the wrapper was entered), `events_sent`, `event_drops` and
+   `callback_errors`. If `calls` stays at zero with the patch installed, the
+   application does not call that address. If `calls` grows but `events_sent`
+   does not, the hook failed or events were dropped.
+5. At `trace`, `operation=call outcome=dispatched` records each PRE and POST
+   hook the agent ran, with its call ID.
+
 Use `call.log("message")` or `call.log("message", tracer::LogLevel::Warning)`
 in an interceptor. Legacy callbacks can use `context.log(...)` on their
 `TraceContext`. Both return whether the message entered the bounded queue.
 The sender writes queued messages with their call ID and PRE or POST phase.
 Messages are capped at 192 bytes and control characters are replaced with
 `?`. Queued messages are best effort and may be lost if the target exits
-before the sender writes them.
+before the sender writes them. A message above the configured level is not
+queued, and the call returns false.
 
 With logging enabled, the agent also records each PRE and POST hook it runs.
 A hook record follows the messages logged by that hook.

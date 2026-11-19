@@ -872,7 +872,7 @@ clang-tracer<span class="w"> </span>trace<span class="w"> </span><span class="s2
 clang-tracer<span class="w"> </span>events<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PID</span><span class="s2">&quot;</span><span class="w"> </span>--count<span class="w"> </span><span class="m">1</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
 clang-tracer<span class="w"> </span>detach<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PID</span><span class="s2">&quot;</span>
 </code></pre></div>
-<p>Expect one entry event with callback value 42. To see the diagnostic, start the target with <code>CLANG_TRACER_AGENT_LOG=&quot;$PWD/agent.log&quot; ./target</code> before attaching. Stop the server and target when finished.</p>
+<p>Expect one entry event with callback value 42. To see the diagnostic, start the target with <code>CLANG_TRACER_AGENT_LOG=&quot;$PWD/agent.log&quot; ./target</code> before attaching. Add <code>CLANG_TRACER_AGENT_LOG_LEVEL=debug</code> to also log every install stage, the patch state and the call counters, which shows why a probe never fires. Stop the server and target when finished.</p>
 <h3 id="tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</h3>
 <p>The runtime ships the JIT example target when the REPL is enabled. Install the Development component for the runner and source files. Run the demo from the installed example directory.</p>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code><span class="nb">cd</span><span class="w"> </span>/usr/local/share/clang-tracer/examples/native-repl-jit
@@ -1875,7 +1875,7 @@ symbols exported by standard Linux runtime libraries in the target, including
 definitions interposed in its dynamic lookup scope.</p>
 <p><code>--payload-limit BYTES</code> sets the maximum serialized source and dependency
 snapshot sent to the target for a live operation. The default is 16 MiB.
-The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
+The REPL does not impose an additional outgoing RPC size ceiling. Apply can reuse
 the preview's plan for the same input and revision after rechecking the
 saved files and executable mappings. Set <code>CLANG_TRACER_LIVE_COMPILE_JOBS</code>
 in the server environment to choose how many translation units it compiles
@@ -2167,6 +2167,15 @@ them at each syscall boundary and compete with the injector for ptrace ownership
 <a href="https://docs.kernel.org/admin-guide/perf-security.html">Perf permissions</a> ·
 <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html">perf_event_open</a> ·
 <a href="https://man7.org/linux/man-pages/man2/ptrace.2.html">ptrace</a></p>
+<p>The syscall integration test accepts an optional CMake
+<code>TRACER_SYSCALL_TEST_LAUNCHER</code> path. <code>tests/perf_test_launcher.c</code> provides a Linux
+launcher that keeps the calling user's UID and carries only <code>CAP_PERFMON</code> into
+the test and its children. Install it root-owned, executable only by the intended
+user/group, with <code>cap_perfmon=ep</code>. That group also needs traversal of tracefs and
+read access to <code>events/raw_syscalls/{sys_enter,sys_exit}/{id,format}</code>; no trace
+control write access is needed. This allows ordinary CTest execution without
+sudo or lowering <code>kernel.perf_event_paranoid</code>. The default test command is
+unchanged when no launcher is configured.</p>
 <h3 id="repl--preview-a-bulk-trace">Preview a bulk trace</h3>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%trace<span class="w"> </span>preview<span class="w"> </span>--module<span class="w"> </span><span class="s1">&#39;libapp*&#39;</span><span class="w"> </span>--include<span class="w"> </span><span class="s1">&#39;app::*&#39;</span><span class="w"> </span>--exclude<span class="w"> </span><span class="s1">&#39;app::detail::*&#39;</span><span class="w"> </span>--save<span class="w"> </span>trace.textproto
 %trace<span class="w"> </span>preview<span class="w"> </span>--exact<span class="w"> </span><span class="s2">&quot;Calculator::multiply(int, int) const&quot;</span>
@@ -2210,8 +2219,21 @@ the same check when matching DWARF is available; packages remain usable without
 DWARF. This check conservatively requires matching complete typed descriptions,
 not merely identical instructions or register assignments.</p>
 <p>The capacity line reports retained probes and <code>limit=unlimited</code>. Probe storage
-grows as needed; allocation can still fail when process resources are exhausted. The preview runs
-without installing probes, stopping target threads or executing code inside
+grows as needed; allocation can still fail when process resources are exhausted.</p>
+<p>Sessions, snapshot-watch method lists, shared-context hook registrations,
+invocation bookkeeping, probe arguments, and named callback values use growing
+storage. Callback source, compiler metadata, plugins, and prepared packages have
+no separate application size ceiling; transport representation and allocation
+failures still apply. Native event and callback-log queues grow with pending
+work. Large native events use sealed file descriptors instead of truncating to
+the inline datagram threshold. Log messages are not shortened to 192 bytes.</p>
+<p>Existing configurable budgets and their defaults are unchanged: snapshot
+sizes/depths, history and REPL retention, shared-context transport memory,
+operation timeouts, and memory read/scan requests retain their settings.
+Growing queues may use more memory when consumers are slow. Allocation,
+transport, and callback failures still report through existing diagnostics.
+The native bootstrap is version 33; update the server and agent together.</p>
+<p>The preview runs without installing probes, stopping target threads or executing code inside
 the target. <code>--save</code> creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.</p>
 <h3 id="repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</h3>
@@ -2229,10 +2251,13 @@ one probe on the primary and reports the alias as <code>ALIASED</code> with that
 calls through any of the names produce events. The events carry the primary's
 selector, because the entry cannot tell which name the caller used.</p>
 <p>The REPL prints the batch ID before applying and reports the status of each
-entry. If an install fails, the server restores this batch's probes in
-reverse order. Use the same batch ID with <code>%trace remove</code> to retry entries
-reported as <code>RESTORE_PENDING</code> or to check a batch after an interrupted
-command. Removal is repeatable for a retained batch in its original session.
+entry. Apply has a 120-second default deadline. Starting the REPL with
+<code>--timeout SECONDS</code> overrides it. If installation fails or is cancelled, the
+server restores this batch's probes in reverse order. If apply loses its reply
+after a timeout or interruption, the REPL uses a separate deadline to confirm
+restoration or retry it. Use the same batch ID with <code>%trace remove</code> to retry
+any pending restoration. Removal is repeatable for a retained batch in its
+original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.</p>
 <h3 id="repl--observe-constructors-and-destructors">Observe constructors and destructors</h3>
@@ -2304,7 +2329,7 @@ read or scan. Run <code>%memory maps</code> again after any mapping or permissio
 The target keeps running during inspection, so bytes can change while
 they are copied. An unmap and remap with identical visible metadata between
 checks can produce the same snapshot.</p>
-<p>Scans accept 1 to 1048576 bytes and patterns of 1 to 256 bytes. Separate hex
+<p>Scans accept 1 to 1048576 bytes and nonempty patterns. Separate hex
 bytes with spaces. Use <code>??</code> for an entire wildcard byte, or <code>8?</code> or <code>?f</code>
 for a wildcard nibble. To choose individual bits, append a colon and a
 same-length hex mask, as in <code>&quot;13 37 : 1f ff&quot;</code>. A bit participates only
@@ -2941,8 +2966,8 @@ observer in place. Cancellation is checked up to the entry switch. Use
 the previous wrapper finish there, with both PRE and POST tagged by the
 previous probe ID. A successful reload reports the new ID and retained
 count. There is no fixed probe-count limit; retired wrappers stay
-resident for safe late arrivals, so repeated reloads consume memory. Remove the active generation to restore the
-original entry. Removing a superseded generation drains it while leaving the
+resident for safe late arrivals, so repeated reloads consume memory. Remove the
+active generation to restore the original entry. Removing a superseded generation drains it while leaving the
 successor in place. Detach drains all generations.</p>
 <p>Borrow target pointers and references only during the callback. Use owned
 snapshots for REPL inspection and replay.</p>
@@ -3161,7 +3186,7 @@ the stack on PRE and retain both phases for timing.</p>
 <p>Agent and server loss counters are cumulative samples from retained events.
 They and local buffer evictions are reported separately from incomplete calls.</p>
 <p>By default, <code>%record</code> uses four-byte little-endian lengths and Protobuf
-TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
+TraceEvent frames, bounded by the Protobuf representation rather than a separate 32 MiB policy. Framed recording and export
 create new files exclusively. <code>%record FILE --sqlite</code> creates or appends to a
 SQLite recording and deduplicates events by server instance and sequence.
 Replay rejects truncated headers/bodies and invalid messages. A failed
@@ -4053,6 +4078,10 @@ profile, target and CPU, resolved source and headers, and object integrity
 before linking an offer. It reports <code>REPL object</code> when it accepts the offer,
 <code>cache hit</code> when it uses its own cache, or <code>compiled</code> when it compiles the
 source in the target. The same commands handle all three cases.</p>
+<p>The C++17 build uses the same default language, SDK/sysroot, include and access
+options for REPL compilation and agent validation. Resource directory paths are
+canonicalized so installed paths also match. User compiler options remain part
+of the cache identity; incompatible profiles still fall back to target compilation.</p>
 <p>The same V1 command descriptor works in both runtimes. The agent supplies
 the SDK header and resolves other includes from its compiler environment.
 The target's cache is under
@@ -7484,7 +7513,7 @@ resulting package.</p>
 </tr>
 </tbody>
 </table>
-<p>Set <code>CLANG_TRACER_AGENT_LOG</code> in the target application's environment to enable per-session agent logs. See <a href="#developer--agent-callback-api">callback diagnostics</a>.</p>
+<p>Set <code>CLANG_TRACER_AGENT_LOG</code> in the target application's environment to enable per-session agent logs. Set <code>CLANG_TRACER_AGENT_LOG_LEVEL</code> to <code>error</code>, <code>warning</code>, <code>info</code> (default), <code>debug</code> or <code>trace</code> to choose the verbosity; use <code>debug</code> or <code>trace</code> to see why a probe never fires. See <a href="#developer--agent-callback-api">callback diagnostics</a>.</p>
 <h3 id="commands--native-command-line-client">Native command-line client</h3>
 <p>Use <code>--endpoint ENDPOINT</code> to select the server. The default is <code>CLANG_TRACER_ENDPOINT</code> or <code>127.0.0.1:50051</code>. <code>--help</code> and <code>-h</code> print usage. Direct commands support <code>--format text|protobuf</code> and <code>--output FILE</code> where applicable. Text is the default and output normally goes to stdout. The binary format uses a four-byte little-endian length before each Protobuf message. SQLite output has its own file option.</p>
 <table>
@@ -8069,6 +8098,45 @@ build, query, and prepare from the same index.</p>
 </code></pre></div>
 <p>For a reusable specialization and a concrete C++ template target, see <a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a>.</p>
 <p>Set <code>CLANG_TRACER_AGENT_LOG</code> to an absolute writable log path in the <strong>target's environment before launching it</strong>. The target owns the private log. Records include PID, probe ID, call ID and phase where applicable. Messages are capped at 192 bytes and delivered on a best-effort basis.</p>
+<p><code>CLANG_TRACER_AGENT_LOG_LEVEL</code> selects the verbosity. It is read once, with the log path, and has no effect unless <code>CLANG_TRACER_AGENT_LOG</code> is set. Values are case-insensitive:</p>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Writes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>error</code></td>
+<td>Failed prepare and stop operations (with <code>message=</code> holding the error text), failed hooks, <code>tracer::LogLevel::Error</code> messages.</td>
+</tr>
+<tr>
+<td><code>warning</code></td>
+<td>Also <code>operation=probe stage=runtime outcome=degraded</code>, <code>operation=log stage=queue outcome=dropped</code>, <code>Warning</code> messages.</td>
+</tr>
+<tr>
+<td><code>info</code> (default, also for an unset, empty or unrecognized value)</td>
+<td>Also the <code>started</code> records of <code>validate_request</code> and <code>compile_callback</code>, <code>ok</code> finishes, the stop <code>pending</code> record, <code>ok</code> hooks, <code>Info</code> messages.</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>Also a <code>started</code> record for every prepare and stop stage, an <code>outcome=done</code> record with the facts the stage established, <code>outcome=retry</code> for a retryable stop, and about once a second <code>operation=probe stage=patch</code> and <code>stage=runtime outcome=active</code> records when something changed.</td>
+</tr>
+<tr>
+<td><code>trace</code></td>
+<td>Also hex dumps of the original and installed patch bytes (<code>outcome=bytes</code>), the live bytes of a modified patch (not a replaced one), and <code>operation=call outcome=dispatched</code> for each PRE and POST hook.</td>
+</tr>
+</tbody>
+</table>
+<p>An unrecognized value selects <code>info</code> and writes one <code>operation=log stage=level outcome=invalid</code> record. Every record has <code>level=</code> right after <code>pid=</code>. The debug and trace records are for the case where a probe is added but never fires:</p>
+<ol>
+<li>Follow the prepare stages. A stage with <code>started</code> and no <code>done</code>, or a <code>failed</code> record, is where installation stopped. <code>resolve_symbol</code> and <code>validate_patch</code> list the resolved address, its source, the mapping, and the patch address, size and backend.</li>
+<li><code>stage=patch outcome=installed</code> means the live bytes at the patch address are the prepared detour. <code>not_installed</code> means they are still the original bytes. <code>replaced</code> (with <code>by_probe=&lt;id&gt;</code>) means a newer probe of the same entry, such as a reload, now owns them. <code>modified</code> means something else rewrote them, and trace also writes the live bytes. The agent only prepares the detour and the server writes it after prepare returns, so <code>not_installed</code> can appear briefly before <code>installed</code>. It can also appear just before a probe is removed, because the server restores the entry before it asks the agent to stop.</li>
+<li><code>stage=runtime outcome=active</code> reports <code>calls=</code> (wrapper entries), <code>events_sent</code>, <code>event_drops</code> and <code>callback_errors</code> whenever they change. No such record while the patch is installed means the application never reaches the wrapper.</li>
+<li>At <code>trace</code>, each PRE and POST hook the agent dispatches writes <code>operation=call outcome=dispatched</code> with its call ID.</li>
+</ol>
+<p>Debug and trace records for hooks and calls share the per-probe queue, so a hot function can overflow it and produce <code>outcome=dropped</code>. A message logged above the configured level is not queued, and <code>log(...)</code> returns false.</p>
 <p>With logging enabled, the agent also writes an <code>operation=hook</code> record for each PRE and POST hook it runs, after the messages logged by that hook. Its <code>outcome</code> is <code>ok</code>, or <code>failed</code> when the hook threw or could not run. Hook records and callback messages share one queue per probe. When it overflows, the agent writes <code>operation=log stage=queue outcome=dropped</code> with the number of lost records.</p>
 <h4 id="developer--shared-context-api">Shared context API</h4>
 <p>Declare payloads with <code>state&lt;Scope&gt;</code> or <code>shared_state&lt;Scope&gt;</code>. Declare hook dependencies with <code>State&lt;T&gt;</code> in the interceptor constructor. Shared state follows the engine's guarded access rules, while ordinary state requires synchronization by the callback author. Use the <a href="#context">shared context walkthrough</a> for package lineage, propagation and durable recording.</p>

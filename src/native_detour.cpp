@@ -118,7 +118,7 @@ bool allowed_instruction(const llvm::MCInst &inst,
       "LEA64r",
       "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
-      "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
+      "IMUL32rmi", "SHL32ri",   "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
       "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
       "AND64ri32", "XOR8i8",    "XOR8ri",    "NOP",
       "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};

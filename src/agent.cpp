@@ -1,3 +1,4 @@
+#include "cpp_type_spelling.hpp"
 #include "object_code_cache_identity.hpp"
 #include "agent_plugin_observers.hpp"
 #include "native_detour.hpp"
@@ -9,6 +10,7 @@
 #include <bits/cxxabi_forced.h>
 #include <chrono>
 #include <cctype>
+#include <cstdarg>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -88,6 +90,7 @@
 #include <unistd.h>
 
 #include "callback_bridge.hpp"
+#include "agent_log_level.hpp"
 #include "agent_runtime_profile.hpp"
 #include "callback_pch.hpp"
 #include "callback_source.hpp"
@@ -122,19 +125,57 @@ constexpr std::size_t kJumpBytes = tracer::native_detour::kJumpBytes;
 using tracer::native_detour::initialize_llvm;
 thread_local unsigned callback_depth = 0;
 
-const char *agent_log_path() noexcept {
-  // Capture startup configuration before the sender begins logging.
-  static const auto path = [] {
-    std::array<char, PATH_MAX> result{};
+namespace agent_log = tracer::agent_log;
+using agent_log::Level;
+
+// Failure text of a prepare or stop record is capped at this size.
+constexpr std::size_t kLogMessageSize = 192;
+
+// Startup configuration, captured before the sender begins logging.
+struct AgentLogConfig {
+  std::array<char, PATH_MAX> path{};
+  Level level = agent_log::kDefaultLevel;
+  // Highest level number written; -1 turns logging off. Callers compare a
+  // record's level against this one cached value.
+  int threshold = -1;
+  // Shown once in the log when the level text was not recognized.
+  bool level_invalid = false;
+  std::array<char, 32> invalid_text{};
+};
+
+const AgentLogConfig &agent_log_config() noexcept {
+  static const AgentLogConfig config = [] {
+    AgentLogConfig result;
     const char *configured = ::secure_getenv("CLANG_TRACER_AGENT_LOG");
     if (configured && configured[0] == '/') {
-      const auto size = ::strnlen(configured, result.size());
-      if (size < result.size())
-        std::memcpy(result.data(), configured, size);
+      const auto size = ::strnlen(configured, result.path.size());
+      if (size < result.path.size())
+        std::memcpy(result.path.data(), configured, size);
     }
+    const char *level_text = ::secure_getenv("CLANG_TRACER_AGENT_LOG_LEVEL");
+    const auto parsed = agent_log::parse_level(level_text);
+    result.level = parsed.level;
+    result.level_invalid = !parsed.valid;
+    if (result.level_invalid) {
+      const auto size = ::strnlen(level_text, result.invalid_text.size() - 1);
+      for (std::size_t i = 0; i < size; ++i) {
+        const auto byte = static_cast<unsigned char>(level_text[i]);
+        result.invalid_text[i] = byte < 32 || byte == 127 ? '?' : level_text[i];
+      }
+    }
+    if (result.path[0])
+      result.threshold = static_cast<int>(result.level);
     return result;
   }();
-  return path.data();
+  return config;
+}
+
+const char *agent_log_path() noexcept { return agent_log_config().path.data(); }
+
+// True when a record at this level would be written. Callers use it to skip
+// formatting work.
+bool agent_log_allows(Level level) noexcept {
+  return static_cast<int>(level) <= agent_log_config().threshold;
 }
 
 int open_agent_log() noexcept {
@@ -158,13 +199,12 @@ int open_agent_log() noexcept {
   return -1;
 }
 
-void log_agent(const char *operation, const char *stage,
-               std::uint64_t probe_id, const char *outcome, int error_number = 0,
-               std::uint64_t callback_errors = 0,
-               std::uint64_t event_drops = 0, std::uint64_t call_id = 0,
-               const char *message = nullptr) noexcept {
-  const int saved_errno = errno;
-  ++callback_depth;
+// Formats and appends one record without any level check.
+void write_agent_record(Level level, const char *operation, const char *stage,
+                        std::uint64_t probe_id, const char *outcome,
+                        int error_number, std::uint64_t callback_errors,
+                        std::uint64_t event_drops, std::uint64_t call_id,
+                        const char *message) noexcept {
   const int fd = open_agent_log();
   if (fd >= 0) {
     timespec now{};
@@ -173,10 +213,10 @@ void log_agent(const char *operation, const char *stage,
       std::string line(512 + (message ? std::strlen(message) : 0), '\0');
       const int size = std::snprintf(
           line.data(), line.size(),
-          "clang-tracer agent time=%lld.%09ld pid=%ld probe_id=%llu call_id=%llu "
+          "clang-tracer agent time=%lld.%09ld pid=%ld level=%s probe_id=%llu call_id=%llu "
           "operation=%s stage=%s outcome=%s errno=%d callback_errors=%llu "
           "event_drops=%llu%s%s\n",
-          static_cast<long long>(now.tv_sec), now.tv_nsec, static_cast<long>(::getpid()),
+          static_cast<long long>(now.tv_sec), now.tv_nsec, static_cast<long>(::getpid()), agent_log::level_name(level),
           static_cast<unsigned long long>(probe_id), static_cast<unsigned long long>(call_id),
           operation, stage, outcome, error_number, static_cast<unsigned long long>(callback_errors),
           static_cast<unsigned long long>(event_drops), message ? " message=" : "",
@@ -190,43 +230,181 @@ void log_agent(const char *operation, const char *stage,
     }
     (void)::syscall(SYS_close, fd);
   }
+}
+
+// Writes one record when the configured level admits it. This runs on borrowed
+// application threads: preserve errno and suppress recursive callbacks.
+void log_agent(Level level, const char *operation, const char *stage,
+               std::uint64_t probe_id, const char *outcome,
+               int error_number = 0, std::uint64_t callback_errors = 0,
+               std::uint64_t event_drops = 0, std::uint64_t call_id = 0,
+               const char *message = nullptr) noexcept {
+  if (!agent_log_allows(level))
+    return;
+  const int saved_errno = errno;
+  ++callback_depth;
+  const auto &config = agent_log_config();
+  static std::atomic_flag invalid_reported = ATOMIC_FLAG_INIT;
+  if (config.level_invalid &&
+      !invalid_reported.test_and_set(std::memory_order_relaxed)) {
+    char text[96];
+    std::snprintf(text, sizeof(text),
+                  "unrecognized CLANG_TRACER_AGENT_LOG_LEVEL '%s'; using info",
+                  config.invalid_text.data());
+    write_agent_record(Level::Warning, "log", "level", 0, "invalid", 0, 0, 0, 0,
+                       text);
+  }
+  write_agent_record(level, operation, stage, probe_id, outcome, error_number,
+                     callback_errors, event_drops, call_id, message);
   --callback_depth;
   errno = saved_errno;
 }
 
+// Copies message text with control characters replaced by '?', capped at
+// kLogMessageSize bytes. The destination holds kLogMessageSize + 1 bytes.
+void sanitize_log_message(char *destination, const char *source,
+                          std::size_t size) noexcept {
+  size = std::min(size, kLogMessageSize);
+  for (std::size_t i = 0; i < size; ++i) {
+    const auto byte = static_cast<unsigned char>(source[i]);
+    destination[i] = byte < 32 || byte == 127 ? '?' : source[i];
+  }
+  destination[size] = '\0';
+}
+
+// Writes "xx xx xx" for the bytes. The output holds three bytes per input byte.
+void format_hex(char *destination, const std::uint8_t *bytes,
+                std::size_t size) noexcept {
+  static constexpr char digits[] = "0123456789abcdef";
+  std::size_t at = 0;
+  for (std::size_t i = 0; i < size; ++i) {
+    if (i)
+      destination[at++] = ' ';
+    destination[at++] = digits[bytes[i] >> 4];
+    destination[at++] = digits[bytes[i] & 15];
+  }
+  destination[at] = '\0';
+}
+
+struct ErrnoGuard {
+  int value = errno;
+  ~ErrnoGuard() { errno = value; }
+};
+
 class AgentOperation {
 public:
   AgentOperation(const char *name, const tracer::Request *request) noexcept
-      : probe_id_(request && request->version == tracer::kBootstrapVersion
-                      ? request->probe_id
-                      : 0),
-        name_(name) {}
+      : request_(request && request->version == tracer::kBootstrapVersion
+                     ? request
+                     : nullptr),
+        probe_id_(request_ ? request_->probe_id : 0), name_(name) {}
 
+  // Enters a stage that the default level reports.
   void progress(const char *next_stage) noexcept {
+    complete_open_stage();
     stage = next_stage;
-    log_agent(name_, stage, probe_id_, "started");
+    open_ = true;
+    log_agent(Level::Info, name_, stage, probe_id_, "started");
+  }
+
+  // Enters a stage that only the debug level reports.
+  void enter(const char *next_stage) noexcept {
+    complete_open_stage();
+    stage = next_stage;
+    open_ = true;
+    log_agent(Level::Debug, name_, stage, probe_id_, "started");
+  }
+
+  // Facts about the stage that just succeeded, at debug level.
+  __attribute__((format(printf, 2, 3))) void detail(const char *format,
+                                                    ...) const noexcept {
+    open_ = false;
+    if (!agent_log_allows(Level::Debug))
+      return;
+    const ErrnoGuard guard;
+    char text[512];
+    std::va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    log_agent(Level::Debug, name_, stage, probe_id_, "done", 0, 0, 0, 0, text);
+  }
+
+  // A record at an explicit level and outcome, such as a byte dump.
+  __attribute__((format(printf, 4, 5))) void note(Level level,
+                                                  const char *outcome,
+                                                  const char *format,
+                                                  ...) const noexcept {
+    if (!agent_log_allows(level))
+      return;
+    const ErrnoGuard guard;
+    char text[512];
+    std::va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    log_agent(level, name_, stage, probe_id_, outcome, 0, 0, 0, 0, text);
   }
 
   void waiting(std::uint64_t callback_errors, std::uint64_t event_drops) const
       noexcept {
-    log_agent(name_, stage, probe_id_, "pending", 0, callback_errors,
-              event_drops);
+    log_agent(Level::Info, name_, stage, probe_id_, "pending", 0,
+              callback_errors, event_drops);
+  }
+
+  // The caller can retry. This is not a failure, so only debug reports it.
+  void retry(std::uint64_t callback_errors = 0,
+             std::uint64_t event_drops = 0) const noexcept {
+    if (!agent_log_allows(Level::Debug))
+      return;
+    char text[kLogMessageSize + 1];
+    error_text(text);
+    log_agent(Level::Debug, name_, stage, probe_id_, "retry", 0,
+              callback_errors, event_drops, 0, text[0] ? text : nullptr);
   }
 
   int finish(int status, int error_number = 0,
              std::uint64_t callback_errors = 0,
              std::uint64_t event_drops = 0) const noexcept {
-    log_agent(name_, stage, probe_id_, status == 0 ? "ok" : "failed",
-              error_number, callback_errors, event_drops);
+    if (status == 0) {
+      log_agent(Level::Info, name_, stage, probe_id_, "ok", error_number,
+                callback_errors, event_drops);
+    } else if (agent_log_allows(Level::Error)) {
+      char text[kLogMessageSize + 1];
+      error_text(text);
+      log_agent(Level::Error, name_, stage, probe_id_, "failed", error_number,
+                callback_errors, event_drops, 0, text[0] ? text : nullptr);
+    }
     return status;
   }
 
   const char *stage = "request";
 
 private:
+  // A stage left by moving to the next one succeeded, so it gets its done
+  // record unless detail() already wrote one.
+  void complete_open_stage() const noexcept {
+    if (!open_)
+      return;
+    open_ = false;
+    log_agent(Level::Debug, name_, stage, probe_id_, "done");
+  }
+
+  // The text the operation placed in the request's error field, if any.
+  void error_text(char (&text)[kLogMessageSize + 1]) const noexcept {
+    text[0] = '\0';
+    if (request_)
+      sanitize_log_message(
+          text, request_->error,
+          ::strnlen(request_->error, sizeof(request_->error)));
+  }
+
+  const tracer::Request *request_;
   const std::uint64_t probe_id_;
   const char *name_;
+  mutable bool open_ = false;
 };
+
 
 void report_agent_failures() noexcept;
 void write_agent_logs() noexcept;
@@ -235,9 +413,11 @@ struct CallbackLog {
   struct Entry {
     std::uint64_t call_id;
     tracer::TracePhase phase;
-    tracer::LogLevel level;
-    // Outcome of a hook the agent ran. Null for a callback's own message.
-    const char *hook_outcome;
+    Level level;
+    // Both name static strings: a hook outcome, a per-call dispatch record, or
+    // a callback message whose outcome is its callback log level.
+    const char *operation;
+    const char *outcome;
     std::string message;
   };
   // Producers try once. The sender releases this before writing any records.
@@ -285,6 +465,11 @@ struct Probe {
   // Only the event sender reads and updates the reported totals.
   std::uint64_t reported_callback_errors = 0;
   std::uint64_t reported_event_drops = 0;
+  // Last state and counters written by the debug-level runtime pass. Only the
+  // event sender reads and updates them.
+  int reported_patch_state = -1;
+  std::uint64_t reported_calls = 0;
+  std::uint64_t reported_events_sent = 0;
   CallbackLog log;
   std::atomic<std::uint64_t> call_ids{0};
   std::atomic<std::uint64_t> in_flight{0};
@@ -343,6 +528,11 @@ struct Agent {
   std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
   std::uint64_t next_context_hook = 0;
   const bool logging_enabled = agent_log_path()[0] != '\0';
+  // Same cached value as agent_log_allows, reachable from the loaded agent.
+  const int log_threshold = agent_log_config().threshold;
+  bool log_allows(Level level) const noexcept {
+    return static_cast<int>(level) <= log_threshold;
+  }
   tracer::EventTransport transport;
   std::shared_ptr<tracer::context_engine::PropagationLedger> propagation_ledger;
   std::unique_ptr<tracer::context_scheduler::ContextPthreadDetour>
@@ -531,6 +721,18 @@ std::mutex agent_mutex;
 std::atomic<Agent *> agent{nullptr};
 std::atomic<std::uint64_t> validation_report_sequence{0};
 
+const char *patch_backend_name(tracer::NativePatch backend) noexcept {
+  switch (backend) {
+  case tracer::NativePatch::Entry:
+    return "entry";
+  case tracer::NativePatch::CallSite:
+    return "call_site";
+  case tracer::NativePatch::Trap:
+    return "trap";
+  }
+  return "unknown";
+}
+
 const char *log_level_name(tracer::LogLevel level) noexcept {
   switch (level) {
   case tracer::LogLevel::Info:
@@ -543,10 +745,124 @@ const char *log_level_name(tracer::LogLevel level) noexcept {
   return "unknown";
 }
 
+// State of the bytes at a probe's patch address, relative to the two images the
+// agent prepared.
+enum class PatchState : int {
+  Installed,
+  NotInstalled,
+  Modified,
+  Replaced,
+  Unreadable
+};
+
+const char *patch_state_name(PatchState state) noexcept {
+  switch (state) {
+  case PatchState::Installed:
+    return "installed";
+  case PatchState::NotInstalled:
+    return "not_installed";
+  case PatchState::Modified:
+    return "modified";
+  case PatchState::Replaced:
+    return "replaced";
+  case PatchState::Unreadable:
+    return "unreadable";
+  }
+  return "unreadable";
+}
+
+// Compares the live bytes with the prepared detour and the original. The read
+// cannot fault, because the module can be unmapped concurrently.
+PatchState observe_patch(const tracer::Request &request,
+                         std::uint8_t (&live)[tracer::kMaxPatchBytes],
+                         std::size_t &size) noexcept {
+  size = request.patch_size;
+  if (!request.patch_address || size == 0 || size > tracer::kMaxPatchBytes)
+    return PatchState::Unreadable;
+  iovec local{live, size};
+  iovec remote{reinterpret_cast<void *>(request.patch_address), size};
+  if (tracer::linux_api::process_vm_readv(::getpid(), &local, 1, &remote, 1,
+                                          0) != static_cast<ssize_t>(size))
+    return PatchState::Unreadable;
+  if (std::memcmp(live, request.installed, size) == 0)
+    return PatchState::Installed;
+  if (std::memcmp(live, request.original, size) == 0)
+    return PatchState::NotInstalled;
+  return PatchState::Modified;
+}
+
+// Debug-level view of one probe: whether its detour is in place and whether
+// the wrapper is being entered. Writes only what changed since the last pass.
+void report_probe_activity(Agent &owner, Probe &probe) noexcept {
+  const auto id = probe.request.probe_id;
+  if (probe.active.load(std::memory_order_acquire)) {
+    std::uint8_t live[tracer::kMaxPatchBytes];
+    std::size_t size = 0;
+    auto state = observe_patch(probe.request, live, size);
+    std::uint64_t replaced_by = 0;
+    if (state == PatchState::Modified) {
+      // A newer probe of the same entry owns these bytes after a reload. Their
+      // request fields are immutable once the probe is published.
+      for (auto *slot = owner.published_slots.load(std::memory_order_acquire);
+           slot; slot = slot->next) {
+        const auto *other = slot->probe.load(std::memory_order_acquire);
+        if (other && other != &probe &&
+            other->request.patch_address == probe.request.patch_address &&
+            other->request.patch_size == probe.request.patch_size &&
+            std::memcmp(live, other->request.installed, size) == 0) {
+          state = PatchState::Replaced;
+          replaced_by = other->request.probe_id;
+          break;
+        }
+      }
+    }
+    if (static_cast<int>(state) != probe.reported_patch_state) {
+      probe.reported_patch_state = static_cast<int>(state);
+      char text[160];
+      int length = std::snprintf(
+          text, sizeof(text), "address=0x%llx size=%u",
+          static_cast<unsigned long long>(probe.request.patch_address),
+          probe.request.patch_size);
+      if (state == PatchState::Replaced && length > 0 &&
+          static_cast<std::size_t>(length) < sizeof(text))
+        std::snprintf(text + length, sizeof(text) - length, " by_probe=%llu",
+                      static_cast<unsigned long long>(replaced_by));
+      log_agent(Level::Debug, "probe", "patch", id, patch_state_name(state), 0,
+                0, 0, 0, text);
+      if (state == PatchState::Modified && owner.log_allows(Level::Trace)) {
+        char line[5 + tracer::kMaxPatchBytes * 3];
+        std::memcpy(line, "live=", 5);
+        format_hex(line + 5, live, size);
+        log_agent(Level::Trace, "probe", "patch_bytes", id, "live", 0, 0, 0, 0,
+                  line);
+      }
+    }
+  }
+  const auto calls = probe.call_ids.load(std::memory_order_relaxed);
+  const auto sent = probe.delivery.sent.load(std::memory_order_relaxed);
+  if (calls != probe.reported_calls || sent != probe.reported_events_sent) {
+    probe.reported_calls = calls;
+    probe.reported_events_sent = sent;
+    const auto drops = probe.delivery.dropped.load(std::memory_order_relaxed);
+    const auto errors = probe.callback_errors.load(std::memory_order_relaxed);
+    char text[160];
+    std::snprintf(text, sizeof(text),
+                  "calls=%llu events_sent=%llu event_drops=%llu "
+                  "callback_errors=%llu",
+                  static_cast<unsigned long long>(calls),
+                  static_cast<unsigned long long>(sent),
+                  static_cast<unsigned long long>(drops),
+                  static_cast<unsigned long long>(errors));
+    log_agent(Level::Debug, "probe", "runtime", id, "active", 0, errors, drops,
+              0, text);
+  }
+}
+
 void report_agent_failures() noexcept {
   auto *current = agent.load(std::memory_order_acquire);
   if (!current)
     return;
+  const bool activity = current->log_allows(Level::Debug);
   for (auto *slot = current->published_slots.load(std::memory_order_acquire);
        slot; slot = slot->next) {
     auto *probe = slot->probe.load(std::memory_order_acquire);
@@ -556,12 +872,15 @@ void report_agent_failures() noexcept {
     const auto drops = probe->delivery.dropped.load(std::memory_order_acquire);
     if (errors != probe->reported_callback_errors ||
         drops != probe->reported_event_drops) {
-      log_agent("probe", "runtime", probe->request.probe_id, "degraded",
+      log_agent(Level::Warning, "probe", "runtime", probe->request.probe_id,
+                "degraded",
                 probe->delivery.last_send_errno.load(std::memory_order_relaxed),
                 errors, drops);
       probe->reported_callback_errors = errors;
       probe->reported_event_drops = drops;
     }
+    if (activity)
+      report_probe_activity(*current, *probe);
   }
 }
 
@@ -590,12 +909,9 @@ void write_agent_logs() noexcept {
         const auto &entry = pending[i];
         const char *phase =
             entry.phase == tracer::TracePhase::Pre ? "pre" : "post";
-        if (entry.hook_outcome)
-          log_agent("hook", phase, probe->request.probe_id, entry.hook_outcome,
-                    0, 0, 0, entry.call_id);
-        else
-          log_agent("callback", phase, probe->request.probe_id, log_level_name(entry.level), 0, 0,
-                    0, entry.call_id, entry.message.c_str());
+        log_agent(entry.level, entry.operation, phase, probe->request.probe_id,
+                  entry.outcome, 0, 0, 0, entry.call_id,
+                  entry.message.empty() ? nullptr : entry.message.c_str());
       }
     }
     const auto dropped = log.dropped.load(std::memory_order_relaxed);
@@ -604,17 +920,20 @@ void write_agent_logs() noexcept {
       std::snprintf(lost, sizeof(lost), "%llu records lost",
                     static_cast<unsigned long long>(dropped -
                                                     log.reported_dropped));
-      log_agent("log", "queue", probe->request.probe_id, "dropped", 0, 0, 0, 0,
-                lost);
+      log_agent(Level::Warning, "log", "queue", probe->request.probe_id,
+                "dropped", 0, 0, 0, 0, lost);
       log.reported_dropped = dropped;
     }
   }
 }
 
-// Queues one record for the sender. A full or contended queue drops it.
+// Queues one record for the sender. A record above the configured level is not
+// queued and does not use a slot. Allocation failure or contention drops it.
 bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
-                       tracer::LogLevel level, const char *hook_outcome,
+                       Level level, const char *operation, const char *outcome,
                        const char *message, std::size_t size) noexcept {
+  if (!agent_log_allows(level))
+    return false;
   auto &log = probe.log;
   bool queued = false;
   if (!log.busy.test_and_set(std::memory_order_acquire)) {
@@ -623,9 +942,10 @@ bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
       entry.call_id = context.call_id;
       entry.phase = context.phase;
       entry.level = level;
-      entry.hook_outcome = hook_outcome;
-      entry.message.resize(size);
-      for (std::size_t i = 0; i < size; ++i) {
+      entry.operation = operation;
+      entry.outcome = outcome;
+      entry.message.resize(message ? size : 0);
+      for (std::size_t i = 0; i < entry.message.size(); ++i) {
         const auto byte = static_cast<unsigned char>(message[i]);
         entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
       }
@@ -647,9 +967,19 @@ bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
 void log_hook(Probe &probe, const tracer::TraceContext &context,
               bool succeeded) noexcept {
   auto *owner = agent.load(std::memory_order_acquire);
-  if (owner && owner->logging_enabled)
-    (void)enqueue_agent_log(probe, context, tracer::LogLevel::Info,
+  const auto level = succeeded ? Level::Info : Level::Error;
+  if (owner && owner->log_allows(level))
+    (void)enqueue_agent_log(probe, context, level, "hook",
                             succeeded ? "ok" : "failed", nullptr, 0);
+}
+
+// Trace level only: records that a phase is being dispatched to its hook. This
+// is the one check on the per-call path when the level is lower.
+void log_dispatch(Probe &probe, const tracer::TraceContext &context) noexcept {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (owner && owner->log_allows(Level::Trace))
+    (void)enqueue_agent_log(probe, context, Level::Trace, "call", "dispatched",
+                            nullptr, 0);
 }
 
 Probe *find_probe(std::uint64_t id) noexcept {
@@ -926,6 +1256,7 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
   token->cancel_disabled = true;
   copy_shared_value(token->raw, *raw);
+  log_dispatch(*token->probe, token->raw);
   token->raw.stack_capture = &shared_capture_stack;
   ++callback_depth;
   token->named.clear();
@@ -1228,24 +1559,8 @@ bool debug_identifier(llvm::StringRef text) {
 }
 
 std::string normalized_cpp_type(llvm::StringRef text) {
-  std::string result;
-  bool pending_space = false;
-  for (const unsigned char c : text) {
-    if (std::isspace(c)) {
-      pending_space = true;
-      continue;
-    }
-    const bool punctuation = c == ':' || c == '<' || c == '>' || c == ',' ||
-                             c == '*' || c == '&';
-    if (pending_space && !result.empty() && !punctuation &&
-        result.back() != ':' && result.back() != '<' &&
-        result.back() != ',' && result.back() != '*' &&
-        result.back() != '&')
-      result.push_back(' ');
-    result.push_back(static_cast<char>(c));
-    pending_space = false;
-  }
-  return result;
+  return tracer::normalized_cpp_type_spelling(
+      std::string_view(text.data(), text.size()));
 }
 
 bool standard_library_record_name(llvm::StringRef name) {
@@ -6220,6 +6535,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
 
   std::vector<std::uint64_t> staged_arguments;
   std::vector<unsigned char> staged_set;
+  log_dispatch(*p, invocation);
   try {
     if (staged) {
       staged_arguments.resize(ctx->argument_count);
@@ -6470,9 +6786,15 @@ bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
   auto *owner = ::agent.load(std::memory_order_acquire);
   if (!owner || !owner->logging_enabled || !context || !message || size == 0)
     return false;
+  // Messages above the configured level are filtered before they use a slot.
+  const auto record_level = level == tracer::LogLevel::Error  ? Level::Error
+                            : level == tracer::LogLevel::Warning ? Level::Warning
+                                                                 : Level::Info;
+  if (!owner->log_allows(record_level))
+    return false;
   auto *probe = find_probe(context->probe_id);
-  return probe &&
-         enqueue_agent_log(*probe, *context, level, nullptr, message, size);
+  return probe && enqueue_agent_log(*probe, *context, record_level, "callback",
+                                    log_level_name(level), message, size);
 }
 
 extern "C" {
@@ -6496,7 +6818,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
-    operation.stage = "initialize_agent";
+    operation.enter("initialize_agent");
     std::lock_guard<std::mutex> lock(agent_mutex);
     Agent *current = agent.load(std::memory_order_acquire);
     if (!current) {
@@ -6541,7 +6863,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     auto p = std::make_unique<Probe>();
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;
-    operation.stage = "read_probe_spec";
+    operation.enter("read_probe_spec");
     if (!read_probe_spec(p->request, p->signature_arguments, specification, error)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
@@ -6559,7 +6881,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
-    operation.stage = "resolve_symbol";
+    operation.enter("resolve_symbol");
     std::optional<VerifiedDebugEntry> verified_debug_entry;
     void *entry = nullptr;
     if (specification.has_debug_info()) {
@@ -6573,7 +6895,12 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "target symbol was not found in the process");
       return operation.finish(-1);
     }
-    operation.stage = "validate_patch";
+    operation.detail("entry=0x%llx source=%s symbol=%.160s",
+                     static_cast<unsigned long long>(
+                         reinterpret_cast<std::uintptr_t>(entry)),
+                     specification.has_debug_info() ? "debug_info" : "dlsym",
+                     request->symbol);
+    operation.enter("validate_patch");
     p->request.original_entry = reinterpret_cast<std::uintptr_t>(entry);
     p->request.patch_address = p->request.original_entry;
     std::strcpy(p->request.patch_reason, "verified_entry_window");
@@ -6647,7 +6974,20 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "safe patch window exceeds the verified function range");
       return operation.finish(-1);
     }
-    operation.stage = "create_trampoline";
+    operation.detail(
+        "entry=0x%llx mapping=0x%llx-0x%llx prot=%c%c%c patch_address=0x%llx "
+        "patch_size=%u backend=%s reason=%s replaced_probe=%llu decoded=%d",
+        static_cast<unsigned long long>(p->request.original_entry),
+        static_cast<unsigned long long>(map_lo),
+        static_cast<unsigned long long>(map_hi), prot & PROT_READ ? 'r' : '-',
+        prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-',
+        static_cast<unsigned long long>(p->request.patch_address),
+        p->request.patch_size, patch_backend_name(p->request.patch_backend),
+        p->request.patch_reason,
+        static_cast<unsigned long long>(p->request.replaced_probe_id),
+        entry_decoded ? 1 : 0);
+    operation.enter("create_trampoline");
+    bool getter_fallback = false;
     if (!entry_decoded || !tracer::native_detour::create_trampoline(
                               target_patch, p->trampoline, p->mapping_size, error)) {
       if (replaced || specification.native_backend() != "auto" ||
@@ -6656,6 +6996,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         return operation.finish(-1);
       }
       error.clear();
+      getter_fallback = true;
     }
     for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
@@ -6692,6 +7033,15 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "target patch overlaps an already hooked function");
       return operation.finish(-1);
     }
+    operation.detail(
+        "trampoline=0x%llx mapping_size=%zu getter_fallback=%d backend=%s "
+        "patch_address=0x%llx patch_size=%u reason=%s",
+        static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(p->trampoline)),
+        p->mapping_size, getter_fallback ? 1 : 0,
+        patch_backend_name(p->request.patch_backend),
+        static_cast<unsigned long long>(p->request.patch_address),
+        p->request.patch_size, p->request.patch_reason);
     operation.progress("compile_callback");
     const auto compile_started = std::chrono::steady_clock::now();
     if (!compile_probe(
@@ -6724,12 +7074,17 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       return operation.finish(-1);
     }
     p->reclaimable = specification.reclaimable();
-    operation.stage = "prepare_context";
+    operation.detail("wrapper=0x%llx relay=0x%llx jit_compile_ns=%llu",
+                     static_cast<unsigned long long>(
+                         reinterpret_cast<std::uintptr_t>(p->wrapper)),
+                     static_cast<unsigned long long>(p->request.relay_address),
+                     static_cast<unsigned long long>(p->request.jit_compile_ns));
+    operation.enter("prepare_context");
     if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
-    operation.stage = "create_event_socket";
+    operation.enter("create_event_socket");
     p->delivery.socket_fd =
         ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (p->delivery.socket_fd < 0) {
@@ -6737,7 +7092,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "could not create event socket");
       return operation.finish(-1, error_number);
     }
-    operation.stage = "connect_event_socket";
+    operation.enter("connect_event_socket");
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (std::strlen(request->event_socket) >= sizeof(addr.sun_path)) {
@@ -6752,7 +7107,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "could not connect event socket");
       return operation.finish(-1, error_number);
     }
-    operation.stage = "enable_context";
+    operation.detail("socket=%s", request->event_socket);
+    operation.enter("enable_context");
     if (p->request.context_required) {
       if (!a.pthread_detour || !a.pthread_detour->enable_propagation()) {
         set_error(request,
@@ -6762,7 +7118,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       p->scheduler_counted = true;
       ++a.context_probe_count;
     }
-    operation.stage = "publish_probe";
+    operation.enter("publish_probe");
     p->session_id = request->session_id;
     a.pid = ::getpid();
     a.transport.activate();
@@ -6780,6 +7136,29 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag |
                                       std::min<std::size_t>(a.retained, UINT32_MAX),
                                   std::memory_order_relaxed);
+    operation.detail("slot=%zu retained=%zu session=%s", a.retained - 1, a.retained,
+                     installed_probe->session_id.c_str());
+    if (agent_log_allows(Level::Trace)) {
+      const auto &published = installed_probe->request;
+      const auto dump = [&](const char *name, const std::uint8_t *bytes) {
+        // Each record carries at most 32 bytes so a long patch is never cut.
+        for (std::size_t offset = 0; offset < published.patch_size;
+             offset += 32) {
+          const auto count =
+              std::min<std::size_t>(32, published.patch_size - offset);
+          char hex[32 * 3 + 1];
+          format_hex(hex, bytes + offset, count);
+          if (offset)
+            operation.note(Level::Trace, "bytes", "%s+%zu=%s", name, offset, hex);
+          else
+            operation.note(Level::Trace, "bytes", "%s=%s", name, hex);
+        }
+      };
+      if (published.patch_size <= tracer::kMaxPatchBytes) {
+        dump("original", published.original);
+        dump("installed", published.installed);
+      }
+    }
     *request = installed_probe->request;
     return operation.finish(0);
   } catch (const std::exception &e) {
@@ -7008,7 +7387,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       set_error(request, "probe session id does not match");
       return operation.finish(-1);
     }
-    operation.stage = "verify_original_patch";
+    operation.enter("verify_original_patch");
     void *entry = reinterpret_cast<void *>(p->request.patch_address);
     std::uintptr_t lo = 0, hi = 0;
     int prot = 0;
@@ -7031,8 +7410,12 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     });
     if (!restored && !superseded) {
       set_error(request, "remove requires original bytes or a verified successor detour");
-      return -2;
+      return operation.finish(-2);
     }
+    operation.detail("restored=%d superseded=%d patch_address=0x%llx patch_size=%u",
+                     restored ? 1 : 0, superseded ? 1 : 0,
+                     static_cast<unsigned long long>(p->request.patch_address),
+                     p->request.patch_size);
     // Closing admission and testing for invocations must be one operation.
     // A delayed wrapper entrant after closure can still run its trampoline.
     std::uint64_t state = 0;
@@ -7040,9 +7423,10 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
         !(state & Probe::admission_closed)) {
       *request = p->request;
       set_error(request, "probe invocations are in flight; remove can be retried");
+      operation.retry();
       return 1;
     }
-    operation.stage = "drain";
+    operation.enter("drain");
     p->active.exchange(false, std::memory_order_seq_cst);
     if (p->scheduler_counted) {
       p->scheduler_counted = false;
@@ -7070,6 +7454,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
                          "remove can be retried");
       if (first_drain)
         operation.waiting(request->callback_errors, request->event_drops);
+      operation.retry(request->callback_errors, request->event_drops);
       return 1;
     }
     if (p->transport_active) {
@@ -7082,6 +7467,15 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     p->request.callback_errors =
         p->callback_errors.load(std::memory_order_relaxed);
     *request = p->request;
+    operation.detail(
+        "invocations_in_flight=%llu events_pending=%llu events_sent=%llu "
+        "event_drops=%llu callback_errors=%llu",
+        static_cast<unsigned long long>(p->invocations_in_flight()),
+        static_cast<unsigned long long>(
+            p->delivery.pending.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(request->events_sent),
+        static_cast<unsigned long long>(request->event_drops),
+        static_cast<unsigned long long>(request->callback_errors));
     return operation.finish(
         0, p->delivery.last_send_errno.load(std::memory_order_relaxed),
         request->callback_errors, request->event_drops);

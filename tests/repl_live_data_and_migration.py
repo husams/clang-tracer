@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 FLAGS = ["-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer"]
 
 
-def build_target(args, root, sources, headers, standard="c++23",
+def build_target(args, root, sources, headers, standard="c++17",
                  entry_flags=("-fpatchable-function-entry=16,0",)):
     target = root / "live-target"
     inputs = [*sources, *headers]
@@ -139,7 +139,17 @@ int main() {
 def live_data(args, folder):
     shutil.copytree(ROOT / "fixtures" / "live_data", folder)
     (folder / "main.cpp").write_text(DATA_MAIN)
-    target = build_target(args, folder, ["main.cpp", "model.cpp"], ["model.hpp"])
+    # Keep atomic shared-owner coverage when the compiler and library support
+    # it, while still exercising all C++17 data operations with older SDKs.
+    atomic_owners = subprocess.run(
+        [args.compiler, "-std=c++20", "-x", "c++", "-fsyntax-only", "-"],
+        input="#include <atomic>\n#include <memory>\nstd::atomic<std::shared_ptr<int>> owner;\n",
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).returncode == 0
+    # Data updates do not redirect target instructions. Avoid GCC 8's broken
+    # patchable-entry metadata for duplicate template COMDATs across TUs.
+    target = build_target(args, folder, ["main.cpp", "model.cpp"], ["model.hpp"],
+                          standard="c++20" if atomic_owners else "c++17", entry_flags=())
     with ExitStack() as cleanup:
         app, repl, app_line, result_line = attach(args, target, cleanup)
         atomic_owners = app_line(r"^atomic owners=([01])$")[1] == "1"

@@ -1296,8 +1296,14 @@ struct Watch::Impl {
         const auto width = end - candidate.address;
         std::size_t extension = 0;
 #if defined(__x86_64__)
-        if (!trial.empty() && width < 5 && end == pc + size)
+        if (!trial.empty() && width < 5 && end == pc + size) {
           extension = plan.redirect_padding(pc, candidate.address, end);
+          // GCC can end a virtual destructor with RET followed by one
+          // verified alignment byte: enough for a short jump to an entry
+          // relay, although not for a five-byte near jump.
+          if (!extension && destructor && !tail && width < 2)
+            extension = plan.redirect_padding(pc, candidate.address, end, 2);
+        }
 #endif
         if (trial.empty() || trial.back().pc != inst.address || overlaps_entry(trial) ||
             overlaps_fragment(trial.front().pc, end + extension))
@@ -1309,7 +1315,7 @@ struct Watch::Impl {
           wide_entry.clear();
           continue;
         }
-        if (!destructor || tail || width < 2 || (!terminal.empty() && !relay))
+        if (!destructor || tail || width + extension < 2 || (!terminal.empty() && !relay))
           continue;
         // A short jump can reach a second rel32 inside the already replaced
         // entry. The relocated entry executes the original bytes there.
@@ -1325,13 +1331,13 @@ struct Watch::Impl {
         if (entry_end > candidate.address || overlaps_fragment(start, entry_end) ||
             std::any_of(std::begin(returns), std::end(returns), [&](const auto &exit) {
               return exit.code.front().pc < entry_end;
-            }) || !check_interior(start, entry_end) || !check_interior(candidate.address, end))
+            }) || !check_interior(start, entry_end) || !check_interior(candidate.address, end + extension))
           continue;
         expanded.front().boundary_pc = pc;
         expanded.front().uncertain_construct = uncertain;
         wide_entry = std::move(expanded);
         terminal = std::move(trial);
-        padding = 0;
+        padding = extension;
         relay = next_relay;
       }
       if (terminal.empty()) {

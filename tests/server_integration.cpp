@@ -502,16 +502,118 @@ std::size_t verify_target_output(const std::filesystem::path &path) {
   return checked;
 }
 
+// Rank of an agent log level: a record is written when its rank is not above
+// the configured one. An empty name is the default, info.
+int agent_log_rank(const std::string &level) {
+  if (level.empty() || level == "info")
+    return 2;
+  if (level == "error")
+    return 0;
+  if (level == "warning")
+    return 1;
+  if (level == "debug")
+    return 3;
+  if (level == "trace")
+    return 4;
+  throw std::runtime_error("unknown agent log level: " + level);
+}
+
+// True when one log line holds every fragment.
+bool has_log_line(const std::string &lines,
+                  std::initializer_list<const char *> fragments) {
+  std::istringstream input(lines);
+  std::string line;
+  while (std::getline(input, line)) {
+    bool all = true;
+    for (const auto *fragment : fragments)
+      all = all && line.find(fragment) != std::string::npos;
+    if (all)
+      return true;
+  }
+  return false;
+}
+
+struct LogExpectation {
+  int rank;             // The lowest level that writes the record.
+  const char *fragment; // A substring of the record.
+};
+
+// Records in the order of the levels that introduce them.
+constexpr LogExpectation kPresentRecords[] = {
+    {0, "stage=compile_callback outcome=failed"},
+    {0, "stage=resolve_symbol outcome=failed"},
+    {0, "operation=hook stage=pre outcome=failed"},
+    {0, " level=error "},
+    {1, "stage=runtime outcome=degraded"},
+    {1, "message=class?callback\n"},
+    {1, " level=warning "},
+    {2, "stage=publish_probe outcome=ok"},
+    {2, "operation=stop stage=drain outcome=ok"},
+    {2, "message=legacy callback\n"},
+    {2, "operation=hook stage=pre outcome=ok"},
+    {2, " level=info "},
+    {3, "operation=prepare stage=read_probe_spec outcome=started"},
+    {3, "operation=prepare stage=validate_request outcome=done"},
+    {3, "operation=prepare stage=initialize_agent outcome=done"},
+    {3, "operation=prepare stage=read_probe_spec outcome=done"},
+    {3, "operation=prepare stage=prepare_context outcome=done"},
+    {3, "operation=prepare stage=create_event_socket outcome=done"},
+    {3, "operation=prepare stage=enable_context outcome=done"},
+    {3, "operation=prepare stage=resolve_symbol outcome=done"},
+    {3, "operation=prepare stage=validate_patch outcome=done"},
+    {3, "operation=prepare stage=create_trampoline outcome=done"},
+    {3, "operation=prepare stage=compile_callback outcome=done"},
+    {3, "operation=prepare stage=connect_event_socket outcome=started"},
+    {3, "operation=prepare stage=connect_event_socket outcome=done"},
+    {3, "operation=prepare stage=publish_probe outcome=started"},
+    {3, "operation=prepare stage=publish_probe outcome=done"},
+    {3, "operation=stop stage=verify_original_patch outcome=started"},
+    {3, "operation=stop stage=verify_original_patch outcome=done"},
+    {3, "operation=stop stage=drain outcome=started"},
+    {3, "operation=stop stage=drain outcome=done"},
+    {3, "operation=probe stage=patch outcome=installed"},
+    {3, "operation=probe stage=runtime outcome=active"},
+    {3, " level=debug "},
+    {4, "operation=call stage=pre outcome=dispatched"},
+    {4, "outcome=bytes"},
+    {4, "message=original="},
+    {4, "message=installed="},
+    {4, " level=trace "},
+};
+
+// Records that a level must not write. The rank is the lowest level that
+// writes the record.
+constexpr LogExpectation kAbsentRecords[] = {
+    {1, "stage=runtime outcome=degraded"},
+    {1, " level=warning "},
+    {2, "outcome=ok"},
+    {2, "outcome=started"},
+    {2, " level=info "},
+    {3, "operation=prepare stage=read_probe_spec outcome=started"},
+    {3, "outcome=done"},
+    {3, "outcome=active"},
+    {3, " level=debug "},
+    {4, "operation=call stage="},
+    {4, "outcome=bytes"},
+    {4, " level=trace "},
+};
+
 void run(const std::filesystem::path &server_path,
          const std::filesystem::path &agent_path,
          const std::filesystem::path &target_path,
-         const std::filesystem::path &output_dir, bool agent_logging) {
+         const std::filesystem::path &output_dir, bool agent_logging,
+         const std::string &agent_log_level) {
   std::filesystem::create_directories(output_dir);
   const auto agent_log = output_dir / "agent-diagnostics.log";
+  const int log_rank = agent_log_rank(agent_log_level);
   if (agent_logging) {
     std::filesystem::remove(agent_log);
     require(::setenv("CLANG_TRACER_AGENT_LOG", agent_log.c_str(), 1) == 0,
             "cannot configure agent diagnostics");
+    if (!agent_log_level.empty())
+      require(::setenv("CLANG_TRACER_AGENT_LOG_LEVEL", agent_log_level.c_str(),
+                       1) == 0,
+              "cannot configure agent diagnostic level");
   }
   std::ofstream report_file(output_dir / "report.txt", std::ios::trunc);
   require(static_cast<bool>(report_file), "cannot create report.txt");
@@ -904,28 +1006,53 @@ void run(const std::filesystem::path &server_path,
   report(report_file, "same live PID detached and reattached with a fresh "
                       "session and working hook");
   if (agent_logging) {
-    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    // The sender writes runtime records about once a second, so wait until
+    // every record this level should hold has arrived.
+    const auto all_present = [&](const std::string &lines) {
+      for (const auto &expected : kPresentRecords)
+        if (expected.rank <= log_rank &&
+            lines.find(expected.fragment) == std::string::npos)
+          return false;
+      return true;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + 12s;
     std::string lines;
     do {
       lines = read_file(agent_log);
-      if (lines.find("message=class?callback\n") != std::string::npos &&
-          lines.find("stage=runtime outcome=degraded") != std::string::npos &&
-          lines.find("operation=hook stage=pre outcome=failed") !=
-              std::string::npos)
+      if (all_present(lines))
         break;
       std::this_thread::sleep_for(50ms);
     } while (std::chrono::steady_clock::now() < deadline);
-    for (const auto *expected : {"stage=compile_callback outcome=failed",
-                                 "stage=resolve_symbol outcome=failed",
-                                 "stage=publish_probe outcome=ok",
-                                 "operation=stop stage=drain outcome=ok",
-                                 "stage=runtime outcome=degraded",
-                                 "message=legacy callback\n",
-                                 "message=class?callback\n",
-                                 "operation=hook stage=pre outcome=ok",
-                                 "operation=hook stage=pre outcome=failed"})
-      require(lines.find(expected) != std::string::npos,
-              std::string("missing agent diagnostic: ") + expected);
+    // Ignore a record the agent is still appending.
+    lines.resize(lines.rfind('\n') == std::string::npos
+                     ? 0
+                     : lines.rfind('\n') + 1);
+    for (const auto &expected : kPresentRecords)
+      if (expected.rank <= log_rank)
+        require(lines.find(expected.fragment) != std::string::npos,
+                std::string("missing agent diagnostic: ") + expected.fragment);
+    for (const auto &unexpected : kAbsentRecords)
+      if (log_rank < unexpected.rank)
+        require(lines.find(unexpected.fragment) == std::string::npos,
+                std::string("agent diagnostic above the log level: ") +
+                    unexpected.fragment);
+    // Every record names its level right after the PID.
+    {
+      std::istringstream input(lines);
+      std::string line;
+      while (std::getline(input, line)) {
+        const auto pid = line.find(" pid=");
+        const auto level = line.find(" level=");
+        const auto probe = line.find(" probe_id=");
+        require(pid != std::string::npos && level != std::string::npos &&
+                    probe != std::string::npos && pid < level && level < probe,
+                "agent diagnostic without a level after pid: " + line);
+      }
+    }
+    // A failed prepare says why, at every level.
+    require(has_log_line(lines, {"operation=prepare", "outcome=failed",
+                                 " level=error ", " message="}),
+            "failed prepare record has no message");
   }
 
   api::WatchEventsRequest continue_request;
@@ -998,6 +1125,7 @@ int main(int argc, char **argv) {
     std::filesystem::path target;
     std::filesystem::path output_dir;
     bool agent_logging = false;
+    std::string agent_log_level;
     for (int i = 1; i < argc; ++i) {
       const std::string key = argv[i];
       if (key == "--agent-logging") {
@@ -1016,6 +1144,9 @@ int main(int argc, char **argv) {
         target = value;
       } else if (key == "--output-dir") {
         output_dir = value;
+      } else if (key == "--agent-log-level") {
+        agent_log_level = value;
+        agent_logging = true;
       } else {
         throw std::runtime_error("unknown option: " + key);
       }
@@ -1023,8 +1154,8 @@ int main(int argc, char **argv) {
     require(!server.empty() && !agent.empty() && !target.empty() &&
                 !output_dir.empty(),
             "usage: server-integration --server PATH --agent PATH --target "
-            "PATH --output-dir DIR [--agent-logging]");
-    run(server, agent, target, output_dir, agent_logging);
+            "PATH --output-dir DIR [--agent-logging] [--agent-log-level LEVEL]");
+    run(server, agent, target, output_dir, agent_logging, agent_log_level);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "server integration failed: " << error.what() << '\n';

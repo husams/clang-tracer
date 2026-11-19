@@ -243,7 +243,7 @@ def main() -> int:
             require(template is not None, f"compile database has no command for {args.source}")
             negative_source = temp_dir / "unavailable-donor.cpp"
             compiler = (template.get("arguments") or shlex.split(template["command"]))[0]
-            command = [compiler, "-std=c++20", "-x", "c++", "-fsyntax-only",
+            command = [compiler, "-std=c++17", "-x", "c++", "-fsyntax-only",
                        str(negative_source)]
             entry = {"directory": str(repo), "file": str(negative_source),
                      "arguments": command}

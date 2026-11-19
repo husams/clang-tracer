@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(clang_tracer LANGUAGES C CXX)
+include(cmake/TracerGcc8Fixtures.cmake)
 option(TRACER_BUILD_REPL "Build the native C++17 interactive client" ON)
 option(TRACER_REPL_ONLY "Build only the portable C++17 REPL client and its tests" OFF)
 if(TRACER_REPL_ONLY)
@@ -306,6 +307,17 @@ if(BUILD_TESTING)
   target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
+  add_executable(cpp-type-spelling-tests tests/cpp_type_spelling_tests.cpp)
+  target_include_directories(cpp-type-spelling-tests PRIVATE src)
+  set_target_properties(cpp-type-spelling-tests PROPERTIES CXX_STANDARD 17)
+  target_compile_options(cpp-type-spelling-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME cpp_type_spelling_identity COMMAND cpp-type-spelling-tests)
+  set_tests_properties(cpp_type_spelling_identity PROPERTIES TIMEOUT 30)
+  add_executable(agent-log-level-tests tests/agent_log_level_tests.cpp)
+  target_include_directories(agent-log-level-tests PRIVATE src)
+  target_compile_options(agent-log-level-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME agent_log_level_parse COMMAND agent-log-level-tests)
+  set_tests_properties(agent_log_level_parse PROPERTIES TIMEOUT 30)
 
   add_library(live-test-jit STATIC src/live_compile.cpp src/live_jit.cpp)
   target_include_directories(live-test-jit SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -465,6 +477,22 @@ if(BUILD_TESTING)
       --agent-logging
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/pie-test-results)
   set_tests_properties(grpc_native_pie_integration PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_agent_log_trace
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --agent-log-level trace
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/agent-log-trace-results)
+  set_tests_properties(grpc_native_agent_log_trace PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_agent_log_error
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --agent-log-level error
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/agent-log-error-results)
+  set_tests_properties(grpc_native_agent_log_error PROPERTIES TIMEOUT 120)
   add_test(NAME grpc_client_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_integration.py
       --server $<TARGET_FILE:clang-tracer-server>
