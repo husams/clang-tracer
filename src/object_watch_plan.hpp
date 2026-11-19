@@ -137,7 +137,7 @@ public:
   bool writer_address_taken(std::uint64_t pc) const;
   bool writer_exported(std::uint64_t pc) const;
   std::size_t redirect_padding(std::uint64_t function_start, std::uint64_t patch,
-                               std::uint64_t end) const;
+                               std::uint64_t end, std::size_t redirect_size = 5) const;
 #endif
   bool is_delete_target(std::uint64_t pc) const;
   std::uint64_t constructor_tail_target(std::uint64_t pc) const;

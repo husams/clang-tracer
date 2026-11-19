@@ -433,8 +433,8 @@ public:
 };
 """)
 
-        debug_flag = "-gdwarf-5"
-        compile_args = [str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fPIC", "-fno-inline",
+        debug_flags = ["-gdwarf-5", "-gz=none"]
+        compile_args = [str(args.cxx), "-std=c++17", *debug_flags, "-O0", "-fPIC", "-fno-inline",
                         "-fpatchable-function-entry=8",
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
                         "-c", str(source), "-o", str(build / "counter.o")]
@@ -531,13 +531,13 @@ public:
                                            stdout=subprocess.PIPE).stdout.lower()
         clang = "clang" in compiler_version
         line_table_flag = "-gline-tables-only" if clang else "-g1"
-        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, line_table_flag, "-O2", "-fPIC",
+        subprocess.run([str(args.cxx), "-std=c++17", *debug_flags, line_table_flag, "-O2", "-fPIC",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", "-c", str(hidden_source),
                         "-o", str(hidden_object)], cwd=build, check=True)
         nodebug_flags = ["-fno-standalone-debug", "-gsimple-template-names"] if clang else []
         # Clang can emit a complete FILE record in optimized debug info.
-        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fPIC", *nodebug_flags,
+        subprocess.run([str(args.cxx), "-std=c++17", *debug_flags, "-O0", "-fPIC", *nodebug_flags,
                         f"-I{generated}", f"-I{root}", "-c", str(nodebug_source),
                         "-o", str(nodebug_object)], cwd=build, check=True)
         subprocess.run([*compile_args[:-4], "-gdwarf-4", "-fdebug-types-section",
@@ -546,12 +546,12 @@ public:
                         str(build / "counter.o"),
                         str(hidden_object), str(nodebug_object), str(unit_object), "-o", str(library)],
                        cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fno-inline",
+        subprocess.run([str(args.cxx), "-std=c++17", *debug_flags, "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8",
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
                         str(driver), "-L", str(build), "-Wl,-rpath," + str(build),
                         "-Wl,--build-id=sha1", "-lcounter", "-o", str(target)], cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fno-inline",
+        subprocess.run([str(args.cxx), "-std=c++17", *debug_flags, "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", str(driver), str(build / "counter.o"),
                         str(hidden_object), str(nodebug_object), str(unit_object),

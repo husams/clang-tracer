@@ -1065,6 +1065,7 @@ function(tracer_add_native_repl)
       add_executable(repl-shared-shapes-target tests/fixtures/shared_shapes/driver.cpp)
       set_target_properties(repl-shared-shapes-library repl-shared-shapes-target
         PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      tracer_gcc8_patchable_fixture(repl-shared-shapes-library)
       target_compile_options(repl-shared-shapes-library PRIVATE
         -g -O2 -fno-optimize-sibling-calls -fcf-protection=none)
       target_compile_options(repl-shared-shapes-target PRIVATE
@@ -1109,6 +1110,7 @@ function(tracer_add_native_repl)
           tests/fixtures/object_shared_writer)
         target_include_directories(repl-object-shared-writer-target PRIVATE
           tests/fixtures/object_shared_writer)
+        tracer_gcc8_patchable_fixture(repl-object-shared-writer-library)
         target_compile_options(repl-object-shared-writer-library PRIVATE
           -g -O1 -fPIC -fsemantic-interposition -fno-inline -fno-optimize-sibling-calls
           -fpatchable-function-entry=5,0)

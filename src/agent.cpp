@@ -1,3 +1,4 @@
+#include "cpp_type_spelling.hpp"
 #include "object_code_cache_identity.hpp"
 #include "agent_plugin_observers.hpp"
 #include "native_detour.hpp"
@@ -1558,24 +1559,8 @@ bool debug_identifier(llvm::StringRef text) {
 }
 
 std::string normalized_cpp_type(llvm::StringRef text) {
-  std::string result;
-  bool pending_space = false;
-  for (const unsigned char c : text) {
-    if (std::isspace(c)) {
-      pending_space = true;
-      continue;
-    }
-    const bool punctuation = c == ':' || c == '<' || c == '>' || c == ',' ||
-                             c == '*' || c == '&';
-    if (pending_space && !result.empty() && !punctuation &&
-        result.back() != ':' && result.back() != '<' &&
-        result.back() != ',' && result.back() != '*' &&
-        result.back() != '&')
-      result.push_back(' ');
-    result.push_back(static_cast<char>(c));
-    pending_space = false;
-  }
-  return result;
+  return tracer::normalized_cpp_type_spelling(
+      std::string_view(text.data(), text.size()));
 }
 
 bool standard_library_record_name(llvm::StringRef name) {

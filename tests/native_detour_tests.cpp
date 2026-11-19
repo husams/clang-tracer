@@ -223,6 +223,30 @@ void stack_compare() {
           "copied stack compare did not preserve the condition flags");
 }
 
+void gcc_shift_entry() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  Mapping original(page);
+  // GCC 8.5 lowers multiplication by five to a shift inside the entry window.
+  const std::array<std::uint8_t, 28> code{
+      0x55, 0x48, 0x89, 0xe5, 0x89, 0x7d, 0xec, 0x8b, 0x55, 0xec,
+      0x89, 0xd0, 0xc1, 0xe0, 0x02, 0x01, 0xd0, 0x83, 0xc0, 0x03,
+      0x89, 0x45, 0xfc, 0x8b, 0x45, 0xfc, 0x5d, 0xc3};
+  std::memcpy(original.address, code.data(), code.size());
+  require(::mprotect(original.address, page, PROT_READ | PROT_EXEC) == 0,
+          "could not make shift fixture executable");
+  nd::Patch patch;
+  std::string error;
+  require(nd::decode(code, reinterpret_cast<std::uintptr_t>(original.address),
+                     patch, error) && patch.size == 15 && patch.relocations.empty(),
+          "GCC register shift was not admitted as a copy-only instruction");
+  Trampoline trampoline;
+  require(nd::create_trampoline(patch, trampoline.address, trampoline.size, error),
+          "could not create the register shift trampoline");
+  const auto call = reinterpret_cast<int (*)(int)>(trampoline.address);
+  require(call(7) == 38 && call(-4) == -17,
+          "relocated register shift changed the result");
+}
+
 void rejection_cases() {
   for (const auto &start : std::vector<std::vector<std::uint8_t>>{
            {0xe8, 0, 0, 0, 0},
@@ -390,6 +414,7 @@ int main() {
     execute_cases(false);
     execute_cases(true);
     stack_compare();
+    gcc_shift_entry();
     rejection_cases();
     short_entry_relay();
     displacement_limits();

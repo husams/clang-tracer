@@ -1,3 +1,4 @@
+#include "cpp_type_spelling.hpp"
 #include "tracer/compat.hpp"
 #include "object_watch_plan.hpp"
 #include "object_code_cache_protocol.hpp"
@@ -190,7 +191,7 @@ bool standard_library_type(DWARFDie die, unsigned depth = 0) {
       saw_arguments = true;
     }
     if (!saw_arguments && name(scope).find('<') != std::string::npos)
-      return false;
+      return ::tracer::standard_library_type_spelling(qualified(scope));
   }
   return false;
 }
@@ -2155,6 +2156,30 @@ struct Plan::Image {
   void describe(std::uint64_t pc, const Source &source,
                 clangtracer::v1::ObjectObservation &event) const;
 
+  std::uint64_t debug_entry(const Range &range) const {
+    if (dwarf->getDIEsForAddress(range.first).FunctionDIE)
+      return range.first;
+#if defined(__x86_64__)
+    // GCC may omit patchable entry NOPs from a subprogram's DWARF range.
+    // Skip only decoded NOPs inside the exact ELF symbol, never real code.
+    for (const auto &[start, section] : text) {
+      if (range.first < start || range.first - start >= section.size())
+        continue;
+      const auto bytes = section.substr(range.first - start, range.second);
+      for (std::size_t offset = 0; offset < bytes.size();) {
+        const auto width = native_entry::nop_prefix(range.first + offset, bytes.substr(offset), 1);
+        if (!width)
+          break;
+        offset += width;
+        if (offset < bytes.size() && dwarf->getDIEsForAddress(range.first + offset).FunctionDIE)
+          return range.first + offset;
+      }
+      break;
+    }
+#endif
+    return range.first;
+  }
+
   std::string_view code(std::uint64_t pc) const {
     if (bias && pc >= *bias) {
       const auto address = pc - *bias;
@@ -2702,9 +2727,21 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   }
   // Standalone shared code can reach the field through an alias without
   // defining the record. The executable establishes its lifetime and layout.
-  if (standalone_shared && request.follow_calls() && !shared_lifetime)
-    layout = inspect_layout(*lifetime.dwarf, request, nullptr, *lifetime.dwarf);
-  else
+  if (standalone_shared && request.follow_calls() && !shared_lifetime) {
+    std::set<llvm::DWARFUnit *> units;
+    for (const auto &symbol : lifetime.symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC ||
+          !::tracer::compat::starts_with(symbol.demangled, concrete + "::" + leaf + "("))
+        continue;
+      const auto site = lifetime.dwarf->getDIEsForAddress(symbol.range.first);
+      if (site.CompileUnit)
+        units.insert(site.CompileUnit);
+    }
+    // Bind layout to the lifetime implementation, rather than treating the
+    // same header emitted by other executable TUs as competing definitions.
+    auto *unit = units.size() == 1 ? *units.begin() : nullptr;
+    layout = inspect_layout(*lifetime.dwarf, request, unit, *lifetime.dwarf);
+  } else
     layout = inspect_layout(*image_->dwarf, request, layout_unit, *lifetime.dwarf);
   if (layout.value_write.active()) {
     const bool union_storage = layout.value_write.kind == ValueWriteKind::union_storage;
@@ -2865,11 +2902,19 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       };
       if (std::any_of(std::begin(boundary_image.symbols), std::end(boundary_image.symbols), missing_complete)) {
         std::set<DWARFDie> seen;
-        auto *unit = &boundary_image == image_.get() ? layout_unit : nullptr;
-        if (!has_virtual_bases(find_record(*boundary_image.dwarf, concrete, unit), seen))
-          for (const auto &symbol : boundary_image.symbols)
-            if (missing_complete(symbol))
-              ranges.insert(symbol.range);
+        for (const auto &symbol : boundary_image.symbols) {
+          if (!missing_complete(symbol))
+            continue;
+          // The constructor's own CU identifies its class definition even
+          // when a selected writer DSO and the executable both emit the type.
+          const auto site = boundary_image.dwarf->getDIEsForAddress(symbol.range.first);
+          llvm::DWARFUnit *unit = site.CompileUnit;
+          if (!unit && &boundary_image == image_.get())
+            unit = layout_unit;
+          seen.clear();
+          if (!has_virtual_bases(find_record(*boundary_image.dwarf, concrete, unit), seen))
+            ranges.insert(symbol.range);
+        }
       }
     }
     if ((required && ranges.empty()) || (role != Boundary::construct && ranges.size() > 1))
@@ -2889,7 +2934,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto receiver = role == Boundary::snapshot ? request.base_type() : owner;
     const auto name = selector.empty() ? receiver + "::" + default_name : selector;
     const auto range = lifetime.function(0, name, false, true);
-    auto function = lifetime.dwarf->getDIEsForAddress(range.first).FunctionDIE;
+    const auto debug_entry = lifetime.debug_entry(range);
+    auto function = lifetime.dwarf->getDIEsForAddress(debug_entry).FunctionDIE;
     while (function && function.getTag() != dw::DW_TAG_subprogram)
       function = function.getParent();
     const auto referenced_type = [](DWARFDie die) {
@@ -2905,7 +2951,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     };
     const auto result = referenced_type(function);
     const auto result_is_base = refers_to(result, request.base_type());
-    bool valid = writer_receiver(function, range.first, receiver, role != Boundary::snapshot);
+    bool valid = writer_receiver(function, debug_entry, receiver, role != Boundary::snapshot);
     const auto convention = function.findRecursively({dw::DW_AT_calling_convention});
     valid &= !convention || convention->getAsUnsignedConstant() == dw::DW_CC_normal;
     if (role == Boundary::get)
@@ -3625,11 +3671,11 @@ bool Plan::writer_exported(std::uint64_t pc) const {
 }
 
 std::size_t Plan::redirect_padding(std::uint64_t function_start, std::uint64_t patch,
-                                  std::uint64_t end) const {
+                                  std::uint64_t end, std::size_t redirect_size) const {
   const auto *image = image_for(function_start);
-  if (!image || image_for(end) != image || end - patch >= 5)
+  if (!image || image_for(end) != image || end - patch >= redirect_size)
     return 0;
-  const auto minimum = 5 - (end - patch);
+  const auto minimum = redirect_size - (end - patch);
   const auto elf_end = end - *image->bias;
   auto available = std::min<std::size_t>(image->code(end).size(), minimum + 14);
   // Include labels and zero-sized symbols, which aren't in Image::symbols.
@@ -3915,7 +3961,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
   if (!allow_rebind && file_sha256 != prepared.module_sha256())
     throw std::runtime_error("snapshot adapter requires preparation for this ELF image");
   const auto range = image.function(0, prepared.symbol());
-  const auto location = image.dwarf->getDIEsForAddress(range.first);
+  const auto location = image.dwarf->getDIEsForAddress(image.debug_entry(range));
   verify_receiver_storage(*image.dwarf, location.CompileUnit, prepared);
   if (allow_rebind && file_sha256 != prepared.module_sha256())
     client::verify_rebound_method_signature(location.FunctionDIE, prepared);

@@ -178,14 +178,14 @@ struct Box {
             exception_db = root / "exception-commands.json"
             exception_db.write_text(json.dumps([{
                 "directory": str(root), "file": str(exception_source),
-                "arguments": [args.compiler, "-std=c++20", "-c", str(exception_source)],
+                "arguments": [args.compiler, "-std=c++17", "-c", str(exception_source)],
             }]))
             exception_package = root / "exception-package"
             resolved = prepare(exception_header, exception_package,
                                '"exception_fixture::Box::get() const"',
                                exception_db, exception_source)
             assert resolved.returncode == 0, resolved.stderr
-            subprocess.run([args.compiler, "-std=c++20", "-fsyntax-only", "-x", "c++", "-"],
+            subprocess.run([args.compiler, "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
                            input=f'''#include "{exception_package / "generated/adapter.cpp"}"
 #include <type_traits>
 static_assert(std::is_nothrow_move_constructible_v<exception_fixture::Item<3>>);

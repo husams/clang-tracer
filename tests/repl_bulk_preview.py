@@ -17,7 +17,7 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
         root = Path(directory)
         target = root / "cpp-name-fixture"
         link_split_fixture(compiler, names_source, root, target.name, "target.debug",
-                           ["-std=c++20", "-O0", "-fPIE", "-fno-omit-frame-pointer",
+                           ["-std=c++17", "-O0", "-fPIE", "-fno-omit-frame-pointer",
                             "-fcf-protection=none"], ["-pie"])
 
         def start(*args):

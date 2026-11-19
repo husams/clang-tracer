@@ -171,6 +171,7 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
                                                   "short int",
                                                   "unsigned short",
                                                   "unsigned short int",
+                                                  "short unsigned int",
                                                   "int",
                                                   "unsigned int",
                                                   "long",
@@ -188,6 +189,16 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
   if (!supported.count(t.spelling)) {
     throw std::runtime_error("unsupported debug builtin: " + t.spelling);
   }
+  // GCC spells these DWARF builtins differently from Clang and the demangler.
+  // Use one spelling in selectors and declarations without changing the ABI.
+  static const std::map<std::string, std::string> builtin_names = {
+      {"short int", "short"}, {"unsigned short int", "unsigned short"},
+      {"short unsigned int", "unsigned short"}, {"long int", "long"},
+      {"long unsigned int", "unsigned long"}, {"unsigned long int", "unsigned long"},
+      {"long long int", "long long"}, {"long long unsigned int", "unsigned long long"},
+      {"unsigned long long int", "unsigned long long"}};
+  if (const auto found = builtin_names.find(t.spelling); found != builtin_names.end())
+    t.spelling = found->second;
   const auto enc = number(d, dw::DW_AT_encoding);
   if (enc == dw::DW_ATE_boolean && t.size == 1) {
     t.value = api::BOOL;
