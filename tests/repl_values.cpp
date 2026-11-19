@@ -315,6 +315,14 @@ void complex_values() {
   auto *integer_root = file->add_message_type();
   integer_root->set_name("Integer");
   field(integer_root, "value", 1, FD::TYPE_SINT32);
+  auto *optional_record = file->add_message_type();
+  optional_record->set_name("OptionalRecord");
+  field(optional_record, "value", 1, FD::TYPE_MESSAGE, false,
+        ".repl.test.Record");
+  auto *optional_root = file->add_message_type();
+  optional_root->set_name("OptionalRoot");
+  field(optional_root, "value", 1, FD::TYPE_MESSAGE, false,
+        ".repl.test.OptionalRecord");
   google::protobuf::DescriptorPool pool;
   require(pool.BuildFile(*file), "build owned snapshot test schema");
   google::protobuf::DynamicMessageFactory factory(&pool);
@@ -425,6 +433,65 @@ void complex_values() {
   rejects<std::out_of_range>(
       [&] { event.argument_snapshot(0).field("missing"); },
       "missing fields are explicit");
+
+  std::unique_ptr<google::protobuf::Message> optional_body(
+      factory.GetPrototype(pool.FindMessageTypeByName("repl.test.OptionalRoot"))
+          ->New());
+  auto *wrapper = optional_body->GetReflection()->MutableMessage(
+      optional_body.get(), optional_body->GetDescriptor()->field(0));
+  wrapper->GetReflection()
+      ->MutableMessage(wrapper, wrapper->GetDescriptor()->field(0))
+      ->CopyFrom(*value);
+  api::TraceEvent optional_message;
+  auto *optional_snapshot = optional_message.add_arguments()->mutable_snapshot();
+  *optional_snapshot = *captured;
+  optional_snapshot->set_cpp_type("std::optional<repl_fixture::Record>");
+  optional_snapshot->set_root_type("repl.test.OptionalRoot");
+  optional_snapshot->set_payload(optional_body->SerializeAsString());
+  optional_snapshot->clear_container_roles();
+  optional_snapshot->add_container_roles("1=optional");
+  optional_snapshot->add_container_roles("1/value.4=vector");
+  for (const auto phase : {api::PRE, api::POST}) {
+    optional_message.set_phase(phase);
+    const auto optional_event = snapshot(optional_message);
+    const auto record = optional_event.argument_as<std::optional<repl_fixture::Record>>(0);
+    require(record && record->id == 37 && record->label == bytes &&
+                record->location.code == 12 &&
+                record->location.name == "owned-nested" &&
+                record->samples == std::vector<int>({2, 4}),
+            "engaged optional PRE/POST arguments retain nested fields");
+    const auto raw = optional_event.argument_snapshot(0);
+    require(raw.cpp_type() == "std::optional<repl_fixture::Record>" &&
+                !raw.matches_record_type("repl_fixture::Record") &&
+                raw.field("location").field("name").as<std::string>() == "owned-nested",
+            "optional conversion leaves the snapshot API intact");
+    rejects<std::invalid_argument>(
+        [&] { optional_event.argument_as<std::optional<repl_fixture::Location>>(0); },
+        "an optional cannot decode as a different record type");
+    rejects<std::invalid_argument>(
+        [&] { optional_event.argument_as<repl_fixture::Record>(0); },
+        "a raw optional retains its wrapper identity");
+  }
+  optional_snapshot->set_cpp_type("std::optional<WrongType>");
+  rejects<std::invalid_argument>(
+      [&] { snapshot(optional_message).argument_as<std::optional<repl_fixture::Record>>(0); },
+      "incorrect optional payload identity is rejected");
+  optional_snapshot->set_cpp_type("::std::optional< repl_fixture::Record >");
+  require(snapshot(optional_message)
+                  .argument_as<std::optional<repl_fixture::Record>>(0)->id == 37,
+          "qualified optional spellings retain contained record identity");
+  optional_snapshot->set_cpp_type("std::optional<repl_fixture::Record>");
+  optional_body->Clear();
+  optional_snapshot->set_payload(optional_body->SerializeAsString());
+  for (const auto phase : {api::PRE, api::POST}) {
+    optional_message.set_phase(phase);
+    require(!snapshot(optional_message).argument_as<std::optional<repl_fixture::Record>>(0),
+            "disengaged optional PRE/POST arguments remain empty");
+  }
+  optional_snapshot->set_payload(std::string("\x0a\x01\x0a", 3));
+  rejects<std::runtime_error>(
+      [&] { snapshot(optional_message).argument_as<std::optional<repl_fixture::Record>>(0); },
+      "malformed optional payloads cannot fabricate empty values");
   captured->set_cpp_type("WrongType");
   rejects<std::invalid_argument>(
       [&] { snapshot(message).argument_as<repl_fixture::Record>(0); },
