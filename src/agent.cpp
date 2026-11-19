@@ -320,19 +320,24 @@ public:
 
   // Enters a stage that the default level reports.
   void progress(const char *next_stage) noexcept {
+    complete_open_stage();
     stage = next_stage;
+    open_ = true;
     log_agent(Level::Info, name_, stage, probe_id_, "started");
   }
 
   // Enters a stage that only the debug level reports.
   void enter(const char *next_stage) noexcept {
+    complete_open_stage();
     stage = next_stage;
+    open_ = true;
     log_agent(Level::Debug, name_, stage, probe_id_, "started");
   }
 
   // Facts about the stage that just succeeded, at debug level.
   __attribute__((format(printf, 2, 3))) void detail(const char *format,
                                                     ...) const noexcept {
+    open_ = false;
     if (!agent_log_allows(Level::Debug))
       return;
     const ErrnoGuard guard;
@@ -395,6 +400,15 @@ public:
   const char *stage = "request";
 
 private:
+  // A stage left by moving to the next one succeeded, so it gets its done
+  // record unless detail() already wrote one.
+  void complete_open_stage() const noexcept {
+    if (!open_)
+      return;
+    open_ = false;
+    log_agent(Level::Debug, name_, stage, probe_id_, "done");
+  }
+
   // The text the operation placed in the request's error field, if any.
   void error_text(char (&text)[kLogMessageSize + 1]) const noexcept {
     text[0] = '\0';
@@ -407,6 +421,7 @@ private:
   const tracer::Request *request_;
   const std::uint64_t probe_id_;
   const char *name_;
+  mutable bool open_ = false;
 };
 
 
