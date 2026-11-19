@@ -6,6 +6,8 @@
 #include "meter.hpp"
 #include "types.hpp"
 
+std::int64_t receiver_header::Meter::static_total = 0;
+
 std::int64_t receiver_header::Meter::charge(std::int64_t cents) {
   if (!frozen) {
     total_cents += cents;
@@ -37,9 +39,13 @@ int main() {
     }
     if (command == 'c') {
       const auto result = meter.charge(40);
+      if (meter.total() != result)
+        return 2;
       std::printf("charged total=%ld charges=%u result=%ld\n",
-                  static_cast<long>(meter.total_cents), meter.charges,
+                  static_cast<long>(meter.charge()), meter.charges,
                   static_cast<long>(result));
+    } else if (command == 'b') {
+      std::printf("bumped result=%ld\n", static_cast<long>(meter.bump(1)));
     } else if (command == 'q') {
       const auto result = receiver_header::quote({40});
       std::printf("quoted cents=%ld\n", result.cents);

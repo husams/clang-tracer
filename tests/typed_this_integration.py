@@ -204,7 +204,7 @@ def main() -> int:
                     expected = re.search(r"read.only|const|assignment of read-only", diagnostic, re.I)
                 elif label == "invoke":
                     expected = re.search(r"cannot call methods on.*receiver|no member named 'multiply'|"
-                                         r"cannot call or take the address of imported receiver methods",
+                                         r"cannot call or take the address of the probed method",
                                          diagnostic, re.I)
                 elif label == "aggregate":
                     expected = re.search(r"cannot construct objects of the imported receiver type|"
