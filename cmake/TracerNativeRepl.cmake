@@ -217,6 +217,7 @@ function(tracer_add_native_repl)
   if(NOT LLVM_ENABLE_RTTI)
     set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp"
       "${_repl}/controller.cpp" "${_repl}/local_perf.cpp" "${_repl}/plugins.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_cpp.cpp"
       "${_src}/native_plugins.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(FILES ${_repl_facade_headers} DESTINATION "${_repl_facade_directory}" COMPONENT Runtime)
