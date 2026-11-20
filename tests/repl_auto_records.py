@@ -142,6 +142,15 @@ EventValue address_value{EventValue::Object{{"city",EventValue{std::string("Pari
 EventValue order_value{EventValue::Object{{"address",address_value},{"history",EventValue{EventValue::Array{address_value}}}}, "application::Order"};
 auto order = order_value.as<application::Order>();
 if(order.address.city!="Paris" || order.history.at(0).postal_code!=75001 || application::Address::version!=7) throw std::runtime_error("generated record conversion failed");
+EventValue optional_order{order_value.data(), "std::optional<application::Order>"};
+auto decoded_optional = optional_order.as<std::optional<application::Order>>();
+if(!decoded_optional || decoded_optional->address.city!="Paris" || decoded_optional->history.at(0).postal_code!=75001) throw std::runtime_error("generated optional record conversion failed");
+if(optional_order.cpp_type()!="std::optional<application::Order>" || optional_order.matches_record_type("application::Order")) throw std::runtime_error("optional conversion changed snapshot identity");
+EventValue empty_optional{std::monostate{}, "std::optional<application::Order>"};
+if(empty_optional.as<std::optional<application::Order>>()) throw std::runtime_error("disengaged optional record became engaged");
+bool optional_mismatch = false;
+try { optional_order.as<std::optional<application::Address>>(); } catch(const std::invalid_argument&) { optional_mismatch = true; }
+if(!optional_mismatch) throw std::runtime_error("wrong optional record type was accepted");
 std::cout << "automatic-nested-records-ok" << std::endl;
 '''
 

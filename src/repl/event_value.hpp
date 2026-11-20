@@ -484,6 +484,24 @@ template <class T> struct EventCodec<std::optional<T>> {
   static std::optional<T> decode(const EventValue &value) {
     if (value.is_null())
       return std::nullopt;
+    // Root snapshots retain the optional's C++ type while exposing its value
+    // directly. Decode with the contained type, keeping the original snapshot
+    // and the record codec's identity check intact. Nested optional fields
+    // already carry their contained value's type.
+    std::string_view type = value.cpp_type();
+    if (type.substr(0, 2) == "::")
+      type.remove_prefix(2);
+    constexpr std::string_view prefix = "std::optional<";
+    if (type.substr(0, prefix.size()) == prefix && type.back() == '>') {
+      type.remove_prefix(prefix.size());
+      type.remove_suffix(1);
+      while (!type.empty() && type.front() == ' ')
+        type.remove_prefix(1);
+      while (!type.empty() && type.back() == ' ')
+        type.remove_suffix(1);
+      return EventValue{value.data(), std::string(type), value.descriptor_type(),
+                        value.container_role()}.template as<T>();
+    }
     return value.template as<T>();
   }
 };
