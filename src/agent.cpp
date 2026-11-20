@@ -69,6 +69,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -5325,6 +5326,109 @@ bool compile_shared_probe(Probe &p,
   return true;
 }
 
+// The agent's version script keeps BoundedProtoWriter's out-of-line members
+// local, so dlsym cannot resolve them for generated snapshot code. Answer only
+// those lookups, per interpreter, and only for the exact signature the agent
+// implements: a declaration with other parameter types stays unresolved, so
+// the JIT linker still reports it instead of calling an incompatible member.
+// Nothing is exported from the agent.
+class HiddenSnapshotSymbols final : public llvm::orc::DefinitionGenerator {
+public:
+  llvm::Error tryToGenerate(llvm::orc::LookupState &, llvm::orc::LookupKind,
+                            llvm::orc::JITDylib &dylib,
+                            llvm::orc::JITDylibLookupFlags,
+                            const llvm::orc::SymbolLookupSet &names) override {
+    using Writer = tracer::context_engine::BoundedProtoWriter;
+    const Entry members[] = {
+        entry("finish", &Writer::finish),
+        entry("u64", &Writer::u64),
+        entry("s64", &Writer::s64),
+        entry("boolean", &Writer::boolean),
+        entry("f32", &Writer::f32),
+        entry("f64", &Writer::f64),
+        entry("string", &Writer::string),
+        entry("begin_message", &Writer::begin_message),
+        entry("end_message", &Writer::end_message),
+        entry("container_items", &Writer::container_items),
+    };
+    llvm::orc::SymbolMap found;
+    for (const auto &requested : names) {
+      const auto &name = requested.first;
+      const std::string demangled = llvm::demangle(std::string(*name));
+      for (const auto &member : members)
+        if (demangled == member.signature) {
+          found[name] = llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(member.address),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+          break;
+        }
+    }
+    if (found.empty())
+      return llvm::Error::success();
+    return dylib.define(llvm::orc::absoluteSymbols(std::move(found)));
+  }
+
+private:
+  struct Entry {
+    std::string signature; // demangled, parameter types included
+    void *address;
+  };
+
+  // The Itanium spelling of each parameter type of the members above. The
+  // agent is built without RTTI, so the spellings are written out.
+  template <class T> static std::string mangled_type() {
+    if constexpr (std::is_lvalue_reference_v<T>)
+      return "R" + mangled_type<std::remove_reference_t<T>>();
+    else if constexpr (std::is_same_v<T, bool>)
+      return "b";
+    else if constexpr (std::is_same_v<T, float>)
+      return "f";
+    else if constexpr (std::is_same_v<T, double>)
+      return "d";
+    else if constexpr (std::is_same_v<T, unsigned int>)
+      return "j";
+    else if constexpr (std::is_same_v<T, unsigned long>)
+      return "m";
+    else if constexpr (std::is_same_v<T, long>)
+      return "l";
+    else if constexpr (std::is_same_v<T, std::string_view>)
+#ifdef _LIBCPP_VERSION
+      return "NSt3__117basic_string_viewIcNS_11char_traitsIcEEEE";
+#else
+      return "St17basic_string_viewIcSt11char_traitsIcEE";
+#endif
+    else
+      static_assert(!sizeof(T), "unmapped BoundedProtoWriter parameter type");
+  }
+
+  template <class... Args> static std::string parameters() {
+    std::string mangled = "_Z1f";
+    if constexpr (sizeof...(Args) == 0)
+      mangled += 'v';
+    else
+      ((mangled += mangled_type<Args>()), ...);
+    const std::string demangled = llvm::demangle(mangled);
+    return demangled.substr(demangled.find('('));
+  }
+
+  template <class R, class... Args>
+  static Entry entry(llvm::StringRef method,
+                     R (tracer::context_engine::BoundedProtoWriter::*member)(
+                         Args...) noexcept) {
+    return {"tracer::context_engine::BoundedProtoWriter::" + method.str() +
+                parameters<Args...>(),
+            address(member)};
+  }
+
+  // Non-virtual Itanium member pointers keep the entry address in word one.
+  template <class Member> static void *address(Member member) {
+    static_assert(sizeof(Member) == 2 * sizeof(void *));
+    std::uintptr_t words[2];
+    std::memcpy(words, &member, sizeof(words));
+    return reinterpret_cast<void *>(words[0]);
+  }
+};
+
 bool bind_probe_symbols(clang::Interpreter &interpreter,
                         const clangtracer::v1::ProbeSpec &spec,
                         std::string &error) {
@@ -5427,6 +5531,7 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
     error = llvm::toString(std::move(failure));
     return false;
   }
+  jit->getMainJITDylib().addGenerator(std::make_unique<HiddenSnapshotSymbols>());
   return true;
 }
 

@@ -1315,6 +1315,16 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:prepared-history-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/concrete/history.hpp")
       set_tests_properties(native_repl_prepared_history PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_hidden_helper_symbols
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_hidden_helper_symbols.sh"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:prepared-injectors-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/calculator.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hidden_writer_callback.cpp"
+          "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hidden_writer_mismatch_callback.cpp")
+      set_tests_properties(native_repl_hidden_helper_symbols PROPERTIES TIMEOUT 180)
       add_test(NAME native_repl_sqlite_types
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_sqlite_types.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer>

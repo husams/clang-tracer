@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +44,11 @@ struct CaptureLimits {
 // A sticky failure invalidates the entire capture, including earlier fields.
 class BoundedProtoWriter final {
 public:
-  explicit BoundedProtoWriter(::tracer::compat::span<std::byte>, CaptureLimits = {}) noexcept;
+  // Inline so generated JIT code needs no hidden constructor symbol.
+  explicit BoundedProtoWriter(::tracer::compat::span<std::byte> storage,
+                              CaptureLimits limits = {}) noexcept
+      : storage_(storage.first(std::min(storage.size(), limits.bytes))),
+        limits_(limits) {}
   BoundedProtoWriter(const BoundedProtoWriter &) = delete;
   BoundedProtoWriter &operator=(const BoundedProtoWriter &) = delete;
   BoundedProtoWriter(BoundedProtoWriter &&) = delete;

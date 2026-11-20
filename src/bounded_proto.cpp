@@ -39,10 +39,6 @@ unsigned encode_varint(std::uint64_t value, std::byte *output) noexcept {
 }
 } // namespace
 
-BoundedProtoWriter::BoundedProtoWriter(::tracer::compat::span<std::byte> storage,
-                                       CaptureLimits limits) noexcept
-    : storage_(storage.first(std::min(storage.size(), limits.bytes)))
-    , limits_(limits) {}
 bool BoundedProtoWriter::fail(CaptureStatus status) noexcept {
   if (status_ == CaptureStatus::ok)
     status_ = status;
