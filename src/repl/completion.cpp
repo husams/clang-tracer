@@ -224,6 +224,17 @@ public:
         diagnostics.Report(statement->getEndLoc(), id);
         return false;
       }
+      // Clang's array value capture synthesizes placement new[], which can
+      // fail only in the live printing consumer. Reject it in the isolated
+      // checker so declarations and side effects in this cell never execute.
+      if (expr->getType()->isArrayType()) {
+        auto &diagnostics = statement->getASTContext().getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(
+            clang::DiagnosticsEngine::Error,
+            "array expressions cannot be printed; add ';' or use explicit output");
+        diagnostics.Report(expr->getBeginLoc(), id);
+        return false;
+      }
       if (expr && expr->getType()->isVoidType())
         missing_ = true;
     }

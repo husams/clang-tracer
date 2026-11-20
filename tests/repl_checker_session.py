@@ -127,6 +127,17 @@ def main():
                 "missing_semicolon()", history + (b"void missing_semicolon() {}",)
             )
             assert status == 2, "missing void semicolon was not classified separately"
+            for source in ('"banking"', 'L"banking"', 'int numbers[2] = {}; numbers'):
+                status, diagnostic = checker.request(source, history)
+                assert status == 1 and b"array expressions cannot be printed" in diagnostic, (source, status, diagnostic)
+                legacy = subprocess.run(
+                    [args.checker, "check", "0", *compiler_args],
+                    input=source, text=True, capture_output=True, timeout=20,
+                )
+                assert legacy.returncode == 1 and "array expressions cannot be printed" in legacy.stderr, (legacy.stdout, legacy.stderr)
+            assert checker.request('"banking";', history)[0] == 0
+            assert checker.request("int numbers[2] = {}; numbers;", history)[0] == 0
+            assert checker.request("static_assert(kept == 1);", history)[0] == 0
             for source in (
                 "int values[1] = {}; for (const auto& value : values) (void)value",
                 "int values[1] = {}; for (int i = 0; i < 1; ++i) (void)i",
