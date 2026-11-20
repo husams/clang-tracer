@@ -61,36 +61,11 @@ std::string canonical_with_template_arguments(clang::QualType type) {
   return canonical(type);
 }
 
-std::string normalize_std(std::string s) {
+std::string without_std_inline_namespace(std::string s) {
   for (const std::string prefix : {"std::__1::", "std::__cxx11::"}) {
     std::size_t p = 0;
     while ((p = s.find(prefix, p)) != std::string::npos) {
       s.replace(p, prefix.size(), "std::");
-    }
-  }
-  for (const std::string tag : {"class ", "struct ", "enum "}) {
-    std::size_t p = 0;
-    while ((p = s.find(tag, p)) != std::string::npos) {
-      s.erase(p, tag.size());
-    }
-  }
-  std::size_t p = 0;
-  while ((p = s.find("> >", p)) != std::string::npos) {
-    s.replace(p, 3, ">>");
-  }
-  p = 0;
-  while ((p = s.find("std::string", p)) != std::string::npos) {
-    s.replace(p, 11, "std::basic_string<char>");
-    p += 23;
-  }
-  p = 0;
-  while ((p = s.find("std::basic_string", p)) != std::string::npos) {
-    const auto after = p + 17;
-    if (after >= s.size() || (s[after] != '<' && s[after] != '_')) {
-      s.insert(after, "<char>");
-      p = after + 6;
-    } else {
-      p = after;
     }
   }
   return s;
@@ -127,12 +102,14 @@ bool physical_standard_library_header(clang::ASTContext &ast,
 }
 
 const clang::ClassTemplateSpecializationDecl *spec(clang::QualType t) {
+  if (t.isNull())
+    return nullptr;
   return llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
       t.getNonReferenceType()->getAsCXXRecordDecl());
 }
 
 std::string template_name(const clang::ClassTemplateSpecializationDecl *s) {
-  return s ? normalize_std(
+  return s ? without_std_inline_namespace(
                  s->getSpecializedTemplate()->getQualifiedNameAsString())
            : "";
 }
@@ -410,7 +387,7 @@ struct Builder {
     }
     if (snapshot && tn.empty()) {
       const auto *record = t->getAsCXXRecordDecl();
-      const auto standard = record ? normalize_std(record->getQualifiedNameAsString())
+      const auto standard = record ? without_std_inline_namespace(record->getQualifiedNameAsString())
                                    : std::string{};
       if ((standard == "std::monostate" || standard == "std::any") &&
           physical_standard_library_header(ast, record->getLocation())) {
@@ -460,10 +437,15 @@ struct Builder {
       out.message = std::move(record);
       return out;
     }
-    if (snapshot && tn == "std::basic_string_view") {
+    if (tn == "std::basic_string_view") {
+      if (!snapshot) {
+        error = "unsupported shared state member " + name +
+                ": std::string_view refers to borrowed storage";
+        return out;
+      }
       const auto character = arg(s, 0);
       const auto *traits = spec(arg(s, 1));
-      if (!character->isCharType() || !traits ||
+      if (character.isNull() || !character->isCharType() || !traits ||
           template_name(traits) != "std::char_traits" ||
           !system_default_specialization(traits)) {
         error = "unsupported string_view specialization: " + name;
@@ -472,7 +454,7 @@ struct Builder {
       out.kind = SchemaKind::string;
       return out;
     }
-    if (tn.rfind("std::basic_string", 0) == 0) {
+    if (tn == "std::basic_string") {
       const auto traits = spec(arg(s, 1));
       const auto allocator = spec(arg(s, 2));
       if (!system_default_specialization(s) ||

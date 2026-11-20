@@ -41,7 +41,9 @@ struct Runtime {
   int ended = 0;
   int events = 0;
   bool callback_failed = false;
-  bool throw_on_begin = false;
+  bool fail_on_begin = false;
+  tracer::context_facade::Status create_status = 0;
+  tracer::context_facade::Status init_status = 0;
   tracer::context_facade::Status get_status = 0;
   tracer::context_facade::Status access_status = 0;
   tracer::context_facade::Status end_status = 0;
@@ -59,23 +61,25 @@ HookFrame::HookFrame(Runtime &runtime, const void *call,
 }
 
 Runtime &runtime(void *opaque) { return *static_cast<Runtime *>(opaque); }
-void *native_context(void *opaque) { return opaque; }
-void *frame_enter(void *opaque) {
+void *native_context(void *opaque) noexcept { return opaque; }
+void *frame_enter(void *opaque) noexcept {
   auto &r = runtime(opaque);
   ++r.frames;
   return &r;
 }
 void frame_exit(void *opaque, void *) noexcept { --runtime(opaque).frames; }
-void create_or_attach(void *opaque, void *, std::uint64_t) {
+tracer::context_facade::Status create_or_attach(void *opaque, void *,
+                                                std::uint64_t) noexcept {
   ++runtime(opaque).created;
+  return runtime(opaque).create_status;
 }
 void *hook_begin(void *opaque, const void *call,
                  const tracer::TraceContext *trace,
                  const tracer::context_facade::RequestDescriptor *, std::size_t,
-                 bool, bool) {
+                 bool, bool) noexcept {
   auto &r = runtime(opaque);
-  if (r.throw_on_begin)
-    throw std::runtime_error("acquisition");
+  if (r.fail_on_begin)
+    return nullptr;
   ++r.hooks;
   auto *frame = new (r.hook_buffer) HookFrame(r, call, trace);
   return frame;
@@ -89,7 +93,7 @@ void hook_end(void *opaque, void *token, bool failed) noexcept {
 void *access_begin(void *opaque,
                    const tracer::context_facade::RequestDescriptor *,
                    std::size_t, tracer::context_facade::AccessKind,
-                   tracer::context_facade::Status *status) {
+                   tracer::context_facade::Status *status) noexcept {
   if (status)
     *status = runtime(opaque).access_status;
   if (runtime(opaque).access_status)
@@ -105,8 +109,10 @@ tracer::context_facade::Status get(void *opaque, std::uint64_t,
   *result = &runtime(opaque).value;
   return runtime(opaque).get_status;
 }
-void init_scope(void *opaque, std::uint64_t, std::uint64_t, const void *) {
+tracer::context_facade::Status init_scope(void *opaque, std::uint64_t,
+                                         std::uint64_t, const void *) noexcept {
   ++runtime(opaque).initialized;
+  return runtime(opaque).init_status;
 }
 tracer::context_facade::Status end_scope(void *opaque, std::uint64_t) noexcept {
   const auto status = runtime(opaque).end_status;
@@ -122,7 +128,7 @@ bool event(void *opaque, const tracer::TraceContext *, std::string_view,
 std::uint64_t thread_id(void *) noexcept { return 42; }
 
 const tracer::context_facade::NativeFunctionTable table{
-    1,          native_context, frame_enter,  frame_exit, create_or_attach,
+    tracer::context_facade::NativeFunctionTable::version, native_context, frame_enter,  frame_exit, create_or_attach,
     hook_begin, hook_end,       access_begin, access_end, get,
     init_scope, end_scope,      event,        thread_id};
 } // namespace
@@ -150,12 +156,17 @@ void verify_context_facade() {
       tracer::context_execution::Mode::Tracking);
   if (!tracking.entered())
     throw std::runtime_error("could not enter native tracking test mode");
+  auto old_table = table;
+  old_table.abi_version = 1;
+  if (valid(old_table))
+    throw std::runtime_error("accepted the old throwing context table");
   Runtime r;
   bind_generation(&table, &r);
   auto &context = current_context();
   if (&context != &current_context())
     throw std::runtime_error("Context facade is not stateless");
-  tracer::Call call(tracer::TraceContext{});
+  tracer::TraceContext trace{};
+  tracer::Call call(trace);
   if (&call.context() != &context)
     throw std::runtime_error(
         "Call::context did not return the stateless facade");
@@ -196,15 +207,23 @@ void verify_context_facade() {
   if (!r.callback_failed || r.hook_exits != 3 || !hook_failure_propagated)
     throw std::runtime_error(
         "callback failure did not signal the generated hook wrapper");
-  r.throw_on_begin = true;
+  r.fail_on_begin = true;
   bool acquisition_propagated = false;
   try {
     run_direct_hook<FacadeState>(call, false, [] {});
-  } catch (const std::runtime_error &) {
+  } catch (const HookFailure &) {
     acquisition_propagated = true;
   }
-  r.throw_on_begin = false;
-  if (!acquisition_propagated)
+  bool short_acquisition_propagated = false;
+  bool unacquired_callback_ran = false;
+  try {
+    run_short_hook(call, false, [&] { unacquired_callback_ran = true; });
+  } catch (const HookFailure &) {
+    short_acquisition_propagated = true;
+  }
+  r.fail_on_begin = false;
+  if (!acquisition_propagated || !short_acquisition_propagated ||
+      unacquired_callback_ran)
     throw std::runtime_error("hook acquisition failure was swallowed");
 
   with_state<FacadeState>([](FacadeState &state) { ++state.value; });
@@ -245,6 +264,28 @@ void verify_context_facade() {
   if (r.frames != 0 || r.created != 1 || r.initialized != 1 || r.ended != 1)
     throw std::runtime_error(
         "lifecycle facade did not restore transactionally");
+
+  r.create_status = 11;
+  bool construction_failed = false;
+  try {
+    InvocationFrame frame(current_context());
+    frame.push_create_or_attach<FacadeState>();
+  } catch (const ContextError &error) {
+    construction_failed = error.code == 11;
+  }
+  r.create_status = 0;
+  if (!construction_failed || r.frames)
+    throw std::runtime_error("construction status lost or frame leaked");
+  r.init_status = 12;
+  bool initialization_failed = false;
+  try {
+    init_scope<PayloadScope>();
+  } catch (const ContextError &error) {
+    initialization_failed = error.code == 12;
+  }
+  r.init_status = 0;
+  if (!initialization_failed)
+    throw std::runtime_error("initialization status discarded");
 
   Runtime nested_runtime;
   {

@@ -210,6 +210,9 @@ void report_native_status(context_engine::ErrorCode code,
   case context_engine::ErrorCode::no_active_hook:
     reason = Reason::no_active_hook;
     break;
+  case context_engine::ErrorCode::construction_failed:
+    reason = Reason::constructor_failure;
+    break;
   case context_engine::ErrorCode::lifecycle_access:
     reason = Reason::lifecycle_access;
     break;
@@ -219,6 +222,26 @@ void report_native_status(context_engine::ErrorCode code,
   context_execution::runtime_diagnostics().record(
       context_execution::Severity::warning, reason, phase,
       context_execution::Action::callback_skipped, trace ? trace->call_id : 0);
+}
+
+// Catch in the native runtime that threw the exception. The callback module
+// has its own C++ runtime and must receive a plain status instead.
+template <class Operation>
+context_facade::Status native_status(Operation &&operation,
+                                     context_execution::Phase phase) noexcept {
+  context_engine::ErrorCode code;
+  try {
+    operation();
+    return 0;
+  } catch (const context_engine::Error &error) {
+    code = error.code();
+  } catch (...) {
+    code = context_engine::ErrorCode::capacity;
+  }
+  report_native_status(code, phase,
+      tls_root_call ? context_facade::NativeHookContextFactory::trace(*tls_root_call)
+                    : nullptr);
+  return static_cast<context_facade::Status>(code);
 }
 
 std::string_view capture_status_name(context_engine::CaptureStatus status) noexcept {
@@ -387,17 +410,47 @@ exchange_active_context(context_engine::Context *next) noexcept {
 }
 
 const context_facade::NativeFunctionTable SharedSourceRuntime::table_{
-    1,
+    context_facade::NativeFunctionTable::version,
     &SharedSourceRuntime::native_current_context,
-    &SharedSourceRuntime::native_frame_enter,
+    [](void *runtime) noexcept -> void * {
+      void *token = nullptr;
+      native_status([&] { token = native_frame_enter(runtime); },
+                    context_execution::Phase::construction);
+      return token;
+    },
     &SharedSourceRuntime::native_frame_exit,
-    &SharedSourceRuntime::native_create_or_attach,
-    &SharedSourceRuntime::native_hook_begin,
+    [](void *runtime, void *frame, context_facade::StateId state) noexcept {
+      return native_status([&] { native_create_or_attach(runtime, frame, state); },
+                           context_execution::Phase::construction);
+    },
+    [](void *runtime, const void *call, const TraceContext *trace,
+       const context_facade::RequestDescriptor *requests, std::size_t count,
+       bool all_visible, bool direct) noexcept -> void * {
+      void *token = nullptr;
+      native_status([&] {
+        token = native_hook_begin(runtime, call, trace, requests, count,
+                                  all_visible, direct);
+      }, context_execution::Phase::access);
+      return token;
+    },
     &SharedSourceRuntime::native_hook_end,
-    &SharedSourceRuntime::native_access_begin,
+    [](void *runtime, const context_facade::RequestDescriptor *requests,
+       std::size_t count, context_facade::AccessKind kind,
+       context_facade::Status *status) noexcept -> void * {
+      void *token = nullptr;
+      const auto failure = native_status([&] {
+        token = native_access_begin(runtime, requests, count, kind, status);
+      }, context_execution::Phase::access);
+      if (failure && status) *status = failure;
+      return token;
+    },
     &SharedSourceRuntime::native_access_end,
     &SharedSourceRuntime::native_get,
-    &SharedSourceRuntime::native_init_scope,
+    [](void *runtime, context_facade::ScopeId scope,
+       context_facade::StateId payload, const void *source) noexcept {
+      return native_status([&] { native_init_scope(runtime, scope, payload, source); },
+                           context_execution::Phase::construction);
+    },
     &SharedSourceRuntime::native_end_scope,
     &SharedSourceRuntime::native_event,
     &SharedSourceRuntime::native_thread_id};
@@ -731,9 +784,6 @@ void *SharedSourceRuntime::native_access_begin(
   if (access.active || (count && !descriptors)) {
     if (borrowing)
       return reject(context_engine::ErrorCode::active_access);
-    report_native_status(context_engine::ErrorCode::active_access,
-                         context_execution::Phase::access,
-                         slots().hook.active ? slots().hook.trace : nullptr);
     engine_error(context_engine::ErrorCode::active_access);
   }
   access.runtime = &runtime;
@@ -753,9 +803,6 @@ void *SharedSourceRuntime::native_access_begin(
     if (request.registration->identity != descriptors[i].scope_id) {
       if (borrowing)
         return reject(context_engine::ErrorCode::incompatible_registration);
-      report_native_status(context_engine::ErrorCode::incompatible_registration,
-                           context_execution::Phase::access,
-                           slots().hook.active ? slots().hook.trace : nullptr);
       engine_error(context_engine::ErrorCode::incompatible_registration);
     }
     access.requests.push_back(std::move(request));
@@ -778,9 +825,6 @@ void *SharedSourceRuntime::native_access_begin(
   try {
     access.lease = new (access.lease_storage) context_execution::AccessLease();
     if (!access.lease->entered()) {
-      report_native_status(context_engine::ErrorCode::lifecycle_access,
-                           context_execution::Phase::access,
-                           slots().hook.active ? slots().hook.trace : nullptr);
       engine_error(context_engine::ErrorCode::lifecycle_access);
     }
     access.access = new (access.access_storage) context_engine::HookAccess(

@@ -52,7 +52,10 @@ the state before the hook and can inject `T&` into a hook parameter. Use
 `state<Scope>` identifies ordinary scoped state. Synchronization for ordinary
 state remains the callback author's responsibility. Shared state access follows
 the engine's guarded access rules; do not retain references beyond the hook or
-visitor call.
+visitor call. A shared state must own its string data. Declare a
+`std::string` member for text that another hook or a later event will read.
+Preparation rejects a `std::string_view` member, including one nested in a
+record or container.
 
 Generated owner construction can initialize a payload from the source hook's
 root call with `T(const tracer::ScopeInit&)`; `init.root_call()` exposes that

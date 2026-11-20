@@ -641,6 +641,11 @@ void verify_context_nested_live() {
           "unchanged nested fixture failed native activation: " +
               generation.error);
 
+  request.file_name = "shared-context-inner.cc";
+  const auto inner = tracer::activate_context_source(request, registry);
+  require(inner && inner.generation->scopes() == generation.generation->scopes(),
+          "independently compiled callbacks did not share the owner: " + inner.error);
+
   CaptureSink sink;
   tracer::context_engine::ContextCapturePool pool;
   tracer::context_runtime::EventMetadata metadata;
@@ -651,6 +656,9 @@ void verify_context_nested_live() {
   metadata.capture_hook_id = 1;
   tracer::context_runtime::SharedSourceRuntime runtime(
       generation.generation->scopes(), pool, metadata, &capture_batch, &sink);
+  metadata.probe_id.assign(16, 'q');
+  tracer::context_runtime::SharedSourceRuntime inner_runtime(
+      inner.generation->scopes(), pool, metadata, &capture_batch, &sink);
   tracer::TraceContext trace{};
   trace.call_id = 73;
   tracer::Call call(trace);
@@ -662,6 +670,42 @@ void verify_context_nested_live() {
   const auto destroy =
       reinterpret_cast<Destroy>(generation.generation->destroy_entry());
   alignas(64) std::array<std::byte, 4096> object{};
+  {
+    // The owner requires a root call. Its native error must return through
+    // the private constructor wrapper and release the partially built frame.
+    auto root_request = request;
+    root_request.file_name = "root-required.cc";
+    root_request.source = R"cpp(
+struct RootScope {};
+struct RootState : shared_state<RootScope> {
+  explicit RootState(const tracer::ScopeInit&) : value(1) {}
+  int value;
+};
+struct Interceptor {
+  Interceptor(State<RootState>);
+  void pre(const Call&, RootState& state) { throw state.value; }
+};)cpp";
+    const auto required = tracer::activate_context_source(root_request, registry);
+    require(static_cast<bool>(required), "root-dependent callback failed admission: " +
+                                        required.error);
+    const auto &code = *required.generation;
+    tracer::context_runtime::SharedSourceRuntime root_runtime(
+        code.scopes(), pool, metadata, &capture_batch, &sink);
+    const auto create = reinterpret_cast<Entry>(code.construct_entry());
+    {
+      tracer::context_runtime::SharedSourceRuntime::Invocation missing_root(root_runtime);
+      require(missing_root.entered() && !guarded_entry(code, create, object.data(), &trace),
+              "missing root call did not fail private construction");
+    }
+    tracer::context_runtime::SharedSourceRuntime::Invocation retry(root_runtime, &call);
+    require(retry.entered() && guarded_entry(code, create, object.data(), &trace),
+            "could not construct a fresh frame after the failed constructor");
+    require(!guarded_entry(code, reinterpret_cast<Entry>(code.pre_entry()), object.data(),
+                           &trace) &&
+                guarded_destroy(code, reinterpret_cast<Destroy>(code.destroy_entry()),
+                                object.data()) && sink.batches.empty(),
+            "throwing callback failed to release its frame cleanly");
+  }
   {
     tracer::context_runtime::SharedSourceRuntime::Invocation invocation(runtime,
                                                                         &call);
@@ -676,19 +720,40 @@ void verify_context_nested_live() {
       tracer::context_execution::OriginalDispatch original_dispatch;
       require(original_dispatch.entered(),
               "nested fixture did not enter original dispatch");
+      auto nested_trace = trace;
+      ++nested_trace.call_id;
+      tracer::Call nested_call(nested_trace);
+      tracer::context_runtime::SharedSourceRuntime::Invocation nested(
+          inner_runtime, &nested_call);
+      alignas(64) std::array<std::byte, 4096> nested_object{};
+      const auto &code = *inner.generation;
+      auto invoke = [&](std::uintptr_t entry) {
+        return guarded_entry(code, reinterpret_cast<Entry>(entry),
+                             nested_object.data(), &nested_trace);
+      };
+      require(nested.entered() && invoke(code.construct_entry()) &&
+                  invoke(code.pre_entry()),
+              "second callback failed to attach to the outer state");
+      nested_trace.phase = tracer::TracePhase::Post;
+      require(invoke(code.post_entry()) &&
+                  guarded_destroy(code, reinterpret_cast<Destroy>(code.destroy_entry()),
+                                  nested_object.data()),
+              "second callback failed to publish or clean up");
     }
     trace.phase = tracer::TracePhase::Post;
     require(
         guarded_entry(*generation.generation, post, object.data(), &trace) &&
-            sink.batches.size() == 1 &&
-            sink.batches[0].event().name() == "request.completed" &&
-            sink.batches[0].event().states_size() == 1,
+            sink.batches.size() == 2 &&
+            std::all_of(sink.batches.begin(), sink.batches.end(), [](const auto &batch) {
+              return batch.event().name() == "request.completed" &&
+                     batch.event().states_size() == 1;
+            }),
         "unchanged nested fixture failed POST capture");
     require(guarded_destroy(*generation.generation, destroy, object.data()),
             "unchanged nested fixture failed private destruction");
   }
 
-  const auto &batch = sink.batches.front();
+  const auto &batch = sink.batches.back();
   const auto &wire_state = batch.event().states(0);
   const auto schema = std::find_if(
       generation.generation->schemas().begin(),
@@ -729,7 +794,7 @@ void verify_context_nested_live() {
               services->is_repeated() &&
               root->GetReflection()->GetString(*root, request_id) ==
                   "request-42" &&
-              root->GetReflection()->FieldSize(*root, items) == 1,
+              root->GetReflection()->FieldSize(*root, items) == 2,
           "nested fixture root fields did not roundtrip");
   const auto &item = root->GetReflection()->GetRepeatedMessage(*root, items, 0);
   const auto *sku = item.GetDescriptor()->FindFieldByName("sku");
@@ -751,8 +816,8 @@ void verify_context_nested_live() {
   const auto *durations =
       stats.GetDescriptor()->FindFieldByName("durations_ms");
   require(calls && durations && durations->is_repeated() &&
-              stats.GetReflection()->GetUInt64(stats, calls) == 1 &&
-              stats.GetReflection()->FieldSize(stats, durations) == 1 &&
+              stats.GetReflection()->GetUInt64(stats, calls) == 2 &&
+              stats.GetReflection()->FieldSize(stats, durations) == 2 &&
               stats.GetReflection()->GetRepeatedDouble(stats, durations, 0) ==
                   12.5,
           "nested fixture mapped stats did not roundtrip");

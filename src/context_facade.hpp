@@ -49,28 +49,29 @@ enum class AccessKind : std::uint8_t { independent };
 
 // Function pointers are installed by the native agent for one pinned code
 // generation. No owner object, std::any, shared_ptr, or payload crosses this
-// table. Functions may throw engine errors except where marked noexcept.
+// table. Failures cross this boundary as status codes or null tokens.
 struct NativeFunctionTable final {
-  std::uint32_t abi_version = 1;
-  Opaque (*current_context)(Opaque generation_runtime) = nullptr;
-  Opaque (*frame_enter)(Opaque generation_runtime) = nullptr;
+  static constexpr std::uint32_t version = 2;
+  std::uint32_t abi_version = version;
+  Opaque (*current_context)(Opaque generation_runtime) noexcept = nullptr;
+  Opaque (*frame_enter)(Opaque generation_runtime) noexcept = nullptr;
   void (*frame_exit)(Opaque generation_runtime, Opaque frame) noexcept = nullptr;
-  void (*create_or_attach)(Opaque generation_runtime, Opaque frame,
-                           StateId state) = nullptr;
+  Status (*create_or_attach)(Opaque generation_runtime, Opaque frame,
+                             StateId state) noexcept = nullptr;
   Opaque (*hook_begin)(Opaque generation_runtime, const void *call,
                        const TraceContext *trace_context,
                        const RequestDescriptor *requests, std::size_t count,
-                       bool all_visible_events, bool direct) = nullptr;
+                       bool all_visible_events, bool direct) noexcept = nullptr;
   void (*hook_end)(Opaque generation_runtime, Opaque hook,
                    bool callback_failed) noexcept = nullptr;
   Opaque (*access_begin)(Opaque generation_runtime,
                          const RequestDescriptor *requests, std::size_t count,
-                         AccessKind kind, Status *status) = nullptr;
+                         AccessKind kind, Status *status) noexcept = nullptr;
   void (*access_end)(Opaque generation_runtime, Opaque access) noexcept = nullptr;
   Status (*get)(Opaque generation_runtime, StateId state,
                 void **result) noexcept = nullptr;
-  void (*init_scope)(Opaque generation_runtime, ScopeId scope, StateId payload,
-                     const void *source) = nullptr;
+  Status (*init_scope)(Opaque generation_runtime, ScopeId scope, StateId payload,
+                       const void *source) noexcept = nullptr;
   Status (*end_scope)(Opaque generation_runtime, ScopeId scope) noexcept = nullptr;
   bool (*event)(Opaque generation_runtime, const TraceContext *trace_context,
                 std::string_view name, std::size_t max_items) noexcept = nullptr;
@@ -217,8 +218,9 @@ public:
   template <class T> void push_create_or_attach() {
     if (!token_)
       throw ContextError{1U};
-    binding_.table->create_or_attach(
+    const auto status = binding_.table->create_or_attach(
         binding_.runtime, token_, StateTraits<T>::descriptor.state_id);
+    if (status) throw ContextError{status};
   }
   void pop_all_and_restore() noexcept {
     if (!token_) return;
@@ -243,6 +245,7 @@ void run_direct_hook(const tracer::Call &call, bool all_visible_events,
   const auto token = binding.table->hook_begin(
       binding.runtime, &call, NativeHookContextFactory::trace(call),
       descriptors, count, all_visible_events, true);
+  if (!token) throw HookFailure{};
   bool failed = false;
   try {
     std::invoke(std::forward<Callback>(callback));
@@ -262,6 +265,7 @@ void run_short_hook(const tracer::Call &call, bool all_visible_events,
   const auto token = binding.table->hook_begin(
       binding.runtime, &call, NativeHookContextFactory::trace(call),
       nullptr, 0, all_visible_events, false);
+  if (!token) throw HookFailure{};
   bool failed = false;
   try {
     std::invoke(std::forward<Callback>(callback));
@@ -280,15 +284,18 @@ void run_short_hook(const tracer::Call &call, Callback &&callback) {
 template <class Scope> void init_scope() {
   const auto *binding = active_generation();
   if (!binding) throw ContextError{1U};
-  binding->table->init_scope(binding->runtime, ScopeTraits<Scope>::id, 0, nullptr);
+  const auto status = binding->table->init_scope(
+      binding->runtime, ScopeTraits<Scope>::id, 0, nullptr);
+  if (status) throw ContextError{status};
 }
 template <class Scope, class Payload> void init_scope(Payload &&payload) {
   const auto *binding = active_generation();
   if (!binding) throw ContextError{1U};
-  binding->table->init_scope(
+  const auto status = binding->table->init_scope(
       binding->runtime, ScopeTraits<Scope>::id,
       PayloadTraits<Scope, ::tracer::compat::remove_cvref_t<Payload>>::descriptor.state_id,
       static_cast<const void*>(std::addressof(payload)));
+  if (status) throw ContextError{status};
 }
 template <class Scope> void end_scope() {
   const auto *binding = active_generation();

@@ -126,6 +126,34 @@ struct Outer { Box<int> count; Box<double> ratio; };
   family.source_lineage_id[0] = 1;
   family.cpp_state_type = "demo::RequestState";
   family.cpp_scope_type = "demo::RequestScope";
+  auto view_ast = clang::tooling::buildASTFromCodeWithArgs(R"cpp(
+#include "tracer/context.hpp"
+#include <string_view>
+#include <vector>
+struct ViewScope {};
+struct DirectView : tracer::shared_state<ViewScope> { std::string_view text; };
+struct Nested { std::string_view text; };
+struct NestedView : tracer::shared_state<ViewScope> { Nested nested; };
+struct ViewList : tracer::shared_state<ViewScope> { std::vector<std::string_view> texts; };
+)cpp", arguments, "string-view-state.cc");
+  if (!view_ast || view_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("string_view fixture failed to parse");
+  auto &view_context = view_ast->getASTContext();
+  for (const char *name : {"DirectView", "NestedView", "ViewList"}) {
+    SchemaRecordFinder finder;
+    finder.name = name;
+    finder.TraverseDecl(view_context.getTranslationUnitDecl());
+    assert(finder.record);
+    StateFamilyKey view_family{family.source_lineage_id, name, "ViewScope"};
+    const auto rejected = build_state_schema(view_context, *finder.record, view_family);
+    if (rejected || rejected.error.find("std::string_view") == std::string::npos)
+      throw std::runtime_error("expected borrowed state diagnostic: " + rejected.error);
+    const auto snapshot = build_payload_schema(view_context,
+        clang::QualType(finder.record->getTypeForDecl(), 0), view_family, {},
+        CodecAccess::snapshot_members);
+    if (!snapshot)
+      throw std::runtime_error("string_view snapshot failed: " + snapshot.error);
+  }
   auto schema = build_state_schema(ast->getASTContext(), *state, family);
   if (!schema)
     throw std::runtime_error("automatic schema discovery failed: " +

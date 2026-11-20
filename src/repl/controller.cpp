@@ -1645,6 +1645,10 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - resolve_started).count();
   spec.set_callback_source(source);
+  // The server verifies file-backed source before assigning its package identity.
+  if (options.has("--callback"))
+    spec.set_callback_package_path(std::filesystem::absolute(
+        probe_path(options, options.option("--callback"))).string());
   spec.set_stack_depth(
       static_cast<unsigned>(options.number("--stack-depth", 0)));
   spec.set_include_internal_stack_frames(
@@ -4007,7 +4011,9 @@ void Facade::detach(const SessionHandle &session) {
 std::uint64_t Facade::inject(const SessionHandle &session,
                              const std::string &selector,
                              const std::string &file) {
-  return controller_->inject(session, selector, read_source(file), Command{});
+  Command options;
+  options.options["--callback"] = {file};
+  return controller_->inject(session, selector, read_source(file), options);
 }
 
 Collection Facade::collect(const SessionHandle &session, std::uint64_t count,
@@ -4040,7 +4046,8 @@ std::uint64_t Facade::inject(const SessionHandle &session,
                             const std::string &selector, const std::string &file,
                             const std::string &prepared, const std::string &mode) {
   Command options;
-  options.options = {{"--prepared", {prepared}}, {"--prepared-mode", {mode}}};
+  options.options = {{"--prepared", {prepared}}, {"--prepared-mode", {mode}},
+                     {"--callback", {file}}};
   return controller_->inject(session, selector, read_source(file), options);
 }
 
