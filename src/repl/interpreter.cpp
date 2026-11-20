@@ -7,9 +7,11 @@
 #include "../prepared_header_search.hpp"
 
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Attr.h>
 #include <clang/AST/Decl.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/Mangle.h>
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
@@ -28,6 +30,7 @@
 #endif
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
@@ -91,50 +94,122 @@ std::string api_header() {
   return path;
 }
 
-void resolve_temporary_destructors(clang::ASTContext &context,
-                                  const clang::TranslationUnitDecl &unit,
-                                  llvm::Module &module) {
-  std::unique_ptr<clang::MangleContext> mangler(context.createMangleContext());
-  if (mangler->getKind() != clang::MangleContext::MK_Itanium)
-    return;
-  std::set<const clang::Stmt *> visited;
-  const auto visit = [&](auto &&self, const clang::Stmt *statement) -> void {
-    if (!statement || !visited.insert(statement).second)
+class ReferencedDestructors : public clang::RecursiveASTVisitor<ReferencedDestructors> {
+  clang::ASTContext& context_;
+
+  void add(clang::QualType type) {
+    if (type.isNull() || type->isDependentType()) {
       return;
-    if (const auto *temporary =
-            llvm::dyn_cast<clang::CXXBindTemporaryExpr>(statement)) {
-      const auto *destructor = temporary->getTemporary()->getDestructor();
-      // Clang's value-capture consumer forces the result destructor into
-      // CodeGen early. A temporary in a default argument can then retain a
-      // complete-destructor reference although only its base variant was
-      // emitted. Apply the same substitution as Itanium CodeGen, but only
-      // when the class has no virtual bases and that definition is present.
-      if (destructor->getParent()->getNumVBases() == 0) {
-        const auto name = [&](clang::CXXDtorType variant) {
-          std::string result;
-          llvm::raw_string_ostream output(result);
-          mangler->mangleName(clang::GlobalDecl(destructor, variant), output);
-          return result;
-        };
-        auto *complete = module.getFunction(name(clang::Dtor_Complete));
-        auto *base = module.getFunction(name(clang::Dtor_Base));
-        if (complete && complete->isDeclaration() && !complete->use_empty() &&
-            base && !base->isDeclaration() &&
-            complete->getFunctionType() == base->getFunctionType())
-          complete->replaceAllUsesWith(base);
+    }
+    type = context_.getBaseElementType(type.getNonReferenceType());
+    if (auto* record = type->getAsCXXRecordDecl();
+        record && record->hasDefinition() && !record->isDependentContext()) {
+      if (auto* destructor = record->getDestructor()) {
+        declarations.insert(destructor);
       }
     }
-    // Default argument expressions are shared AST nodes, not children.
-    if (const auto *argument =
-            llvm::dyn_cast<clang::CXXDefaultArgExpr>(statement))
-      self(self, argument->getExpr());
-    for (const auto *child : statement->children())
-      self(self, child);
+  }
+
+public:
+  explicit ReferencedDestructors(clang::ASTContext& context)
+      : context_(context) {}
+
+  std::set<clang::CXXDestructorDecl*> declarations;
+
+  bool shouldVisitImplicitCode() const { return true; }
+
+  bool VisitExpr(clang::Expr* expression) {
+    add(expression->getType());
+    return true;
+  }
+
+  bool VisitValueDecl(clang::ValueDecl* declaration) {
+    // By-value parameters need cleanup even without a bound temporary or
+    // a reference to the parameter in the function body.
+    add(declaration->getType());
+    return true;
+  }
+};
+
+llvm::Expected<unsigned> resolve_referenced_destructors(clang::Interpreter& interpreter,
+                                                        clang::PartialTranslationUnit& input) {
+  auto& context = interpreter.getASTContext();
+  std::unique_ptr<clang::MangleContext> mangler(context.createMangleContext());
+  if (mangler->getKind() != clang::MangleContext::MK_Itanium) {
+    return 0;
+  }
+  ReferencedDestructors found(context);
+  found.TraverseDecl(input.TUPart);
+
+  struct Names {
+    std::string complete, base;
   };
-  for (const auto *decl : unit.decls())
-    if (const auto *statement = llvm::dyn_cast<clang::TopLevelStmtDecl>(decl);
-        statement && statement->isSemiMissing())
-      visit(visit, statement->getStmt());
+
+  std::vector<Names> references;
+  const auto name = [&](const clang::CXXDestructorDecl* destructor, clang::CXXDtorType variant) {
+    std::string result;
+    llvm::raw_string_ostream output(result);
+    mangler->mangleName(clang::GlobalDecl(destructor, variant), output);
+    return result;
+  };
+  bool emitted = false;
+  for (auto* destructor : found.declarations) {
+    if (destructor->getParent()->getNumVBases()) {
+      continue;
+    }
+    Names names{name(destructor, clang::Dtor_Complete), name(destructor, clang::Dtor_Base)};
+    auto* complete = input.TheModule->getFunction(names.complete);
+    if (!complete || !complete->isDeclaration() || complete->use_empty()) {
+      continue;
+    }
+    auto* base = input.TheModule->getNamedValue(names.base);
+    references.push_back(std::move(names));
+    if (base && !base->isDeclarationForLinker()) {
+      continue;
+    }
+    // Member calls and by-value parameters can need a destructor whose base
+    // variant was never emitted. Request its inline definition from Clang;
+    // avoid re-emitting strong out-of-line definitions from earlier inputs.
+    auto* definition =
+        llvm::dyn_cast_or_null<clang::CXXDestructorDecl>(destructor->getDefinition());
+    if (definition && definition->isInlined()) {
+      if (!definition->hasAttr<clang::UsedAttr>()) {
+        definition->addAttr(clang::UsedAttr::CreateImplicit(context));
+      }
+      if (!interpreter.getCompilerInstance()->getASTConsumer().HandleTopLevelDecl(
+              clang::DeclGroupRef(definition))) {
+        return llvm::createStringError("cannot emit C++ destructor definition");
+      }
+      emitted = true;
+    }
+  }
+  if (emitted) {
+    // Parse has already released this input's module. Finalize the requested
+    // definitions in a blank input. Their initialization must precede the
+    // user's input if an inline definition introduced a static variable.
+    auto definitions = interpreter.Parse("");
+    if (!definitions) {
+      return definitions.takeError();
+    }
+    if (definitions->TheModule) {
+      auto combined = std::move(definitions->TheModule);
+      if (llvm::Linker::linkModules(*combined, std::move(input.TheModule))) {
+        return llvm::createStringError("cannot link C++ destructor definitions");
+      }
+      input.TheModule = std::move(combined);
+    }
+  }
+  for (const auto& names : references) {
+    auto* complete = input.TheModule->getFunction(names.complete);
+    auto* base = input.TheModule->getNamedValue(names.base);
+    // Itanium complete/base destruction is equivalent without virtual bases.
+    // Keep existing complete definitions and require a real emitted body.
+    if (complete && complete->isDeclaration() && !complete->use_empty() && base &&
+        !base->isDeclarationForLinker() && complete->getValueType() == base->getValueType()) {
+      complete->replaceAllUsesWith(base);
+    }
+  }
+  return emitted ? 1 : 0;
 }
 
 bool is_single_initializer(const clang::TranslationUnitDecl &unit,
@@ -864,8 +939,13 @@ bool CppEngine::evaluate(const std::string &source) {
   impl_->history += "\n#line 1\n" + source + "\n;\n";
   impl_->remember(input);
   if (parsed->TheModule) {
-    resolve_temporary_destructors(impl_->interpreter->getASTContext(),
-                                 *parsed->TUPart, *parsed->TheModule);
+    auto extra_cells = resolve_referenced_destructors(*impl_->interpreter, *parsed);
+    if (!extra_cells) {
+      impl_->synchronized = false;
+      return report(extra_cells.takeError());
+    }
+    for (unsigned index = 0; index < *extra_cells; ++index)
+      impl_->remember("");
     const bool initializer = is_single_initializer(*parsed->TUPart, input);
     const bool unload = initializer && can_unload_initializer(*parsed->TheModule);
     const auto rollback_initializer = [&] {
@@ -877,7 +957,7 @@ bool CppEngine::evaluate(const std::string &source) {
                         "use %cpp reset to recover\n";
         return;
       }
-      if (auto error = impl_->interpreter->Undo()) {
+      if (auto error = impl_->interpreter->Undo(1 + *extra_cells)) {
         impl_->synchronized = false;
         llvm::logAllUnhandledErrors(std::move(error), llvm::errs(),
                                     "C++ input rollback: ");
@@ -886,8 +966,9 @@ bool CppEngine::evaluate(const std::string &source) {
       impl_->history.resize(history_size);
       impl_->check_history.resize(check_history_size);
       // Undo removes the declaration, but Clang still advances the input
-      // number. Replay a blank cell in the syntax-only checker.
-      impl_->remember("");
+      // number. Replay the same number of blank cells in the checker.
+      for (unsigned index = 0; index < 1 + *extra_cells; ++index)
+        impl_->remember("");
     };
     llvm::Error error = llvm::Error::success();
     try {
