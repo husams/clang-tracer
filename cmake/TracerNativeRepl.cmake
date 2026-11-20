@@ -1320,7 +1320,8 @@ function(tracer_add_native_repl)
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/calculator.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hidden_writer_callback.cpp"
           "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+          "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hidden_writer_mismatch_callback.cpp")
       set_tests_properties(native_repl_hidden_helper_symbols PROPERTIES TIMEOUT 180)
       add_test(NAME native_repl_sqlite_types
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_sqlite_types.sh"

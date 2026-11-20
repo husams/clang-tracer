@@ -12,6 +12,7 @@ callback=$6
 compdb=$7
 source_dir=$8
 include_dir=$9
+mismatch=${10}
 unset CLANG_TRACER_ENDPOINT
 
 run=$(mktemp -d)
@@ -20,6 +21,7 @@ cd "$run"
 ln -s "$(dirname -- "$header")" demo
 cp "$callback" callback.cpp
 ln -s "$(realpath -- "$compdb")" compile_commands.json
+export HIDDEN_WRITER_OUT="$run/encoded.log"
 "$target" >target.log 2>&1 &
 target_pid=$!
 cleanup() {
@@ -42,4 +44,26 @@ tracer.detach(session);
 %quit
 REPL
 grep -q '^HIDDEN_HELPER_RESULTS=1$' smoke.log
+# u64(1,7) s64(2,-3) boolean(3,true) f32(4,1.5) f64(5,2.5) string(6,"hidden") empty message(7);
+# every call succeeded (9 bits), 4 items selected, 30 bytes, status ok
+expected="0807 1005 1801 250000c03f 290000000000000440 320668696464656e 3a00"
+expected="${expected// /} 30 4 511 0"
+test "$(wc -l <encoded.log)" -ge 4
+test "$(sort -u encoded.log)" = "$expected"
 ! grep -q 'Symbols not found' smoke.log
+
+# A declaration whose parameter types differ from the agent's member must stay unresolved.
+cp "$mismatch" mismatch.cpp
+mismatch_options=(--callback mismatch.cpp)
+if "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast >mismatch.log 2>&1 <<REPL
+%probe validate "prepared_demo::compute(int)" ${mismatch_options[*]} --prepared prepared
+%quit
+REPL
+then
+  cat mismatch.log
+  echo "mismatched BoundedProtoWriter::string signature was bound"
+  exit 1
+fi
+cat mismatch.log
+grep -q 'Symbols not found' mismatch.log
+grep -q '6stringEjPKc' mismatch.log
