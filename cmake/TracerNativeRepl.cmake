@@ -217,6 +217,7 @@ function(tracer_add_native_repl)
   if(NOT LLVM_ENABLE_RTTI)
     set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp"
       "${_repl}/controller.cpp" "${_repl}/local_perf.cpp" "${_repl}/plugins.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_cpp.cpp"
       "${_src}/native_plugins.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(FILES ${_repl_facade_headers} DESTINATION "${_repl_facade_directory}" COMPONENT Runtime)
@@ -272,6 +273,10 @@ function(tracer_add_native_repl)
     add_test(NAME native_repl_cpp COMMAND repl-cpp-tests)
     set_tests_properties(native_repl_cpp PROPERTIES TIMEOUT 60)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME native_repl_temporary_vectors
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_temporary_vectors.py"
+        $<TARGET_FILE:clang-tracer-repl>)
+    set_tests_properties(native_repl_temporary_vectors PROPERTIES TIMEOUT 180)
     add_test(NAME native_repl_plugins
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_plugins.py"
         $<TARGET_FILE:clang-tracer-repl> "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
