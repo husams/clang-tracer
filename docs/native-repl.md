@@ -1412,6 +1412,19 @@ use it (`(void)context;`). To relax that specific policy for a probe, append
 database options. Generated interpreter initialization does not change the
 callback's warning policy.
 
+With a receiver header, callbacks may call accessible receiver methods such as
+getters, including another overload of the probed method's name. Direct calls
+and address-taking of the exact probed method are rejected. Receiver method
+bodies in the header are treated as application implementation code, including
+out-of-class definitions. Other classes and free functions in that receiver
+header are application code too. Callback source and separately included helper
+files are checked; rejected method references report their file, line and column.
+If another receiver method calls the probed method while a hook is running, the
+application call executes with the existing
+thread-local suppression of nested callbacks and events. Its side effects still
+occur. Receiver construction, allocation, destruction and static data member
+guards continue to apply to callback code.
+
 ### Probe working directory
 
 Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.

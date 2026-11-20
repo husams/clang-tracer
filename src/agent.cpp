@@ -4430,7 +4430,8 @@ public:
       // Skip imported receiver method bodies while checking callback and
       // included helper code for ODR uses of the selected target.
       visitor_ = std::make_unique<ForbiddenReceiverUseVisitor>(
-          selected_imported_record, importer.declarations, imported_targets);
+          selected_imported_record, importer.declarations, imported_targets,
+          spec_->symbol());
     }
     if (validation_error_->empty() && !shape_.error.empty()) {
       *validation_error_ = shape_.error;
@@ -4443,6 +4444,19 @@ public:
     }
   }
 
+  static std::string validate_probed_method_uses(
+      clang::ASTContext &context, const std::string &record_name,
+      const std::string &symbol) {
+    auto *record = find_callback_record(context, record_name);
+    if (!record)
+      return {};
+    const std::unordered_set<const clang::Decl *> imported;
+    const std::vector<clang::CXXRecordDecl *> targets;
+    ForbiddenReceiverUseVisitor visitor(record, imported, targets, symbol, true);
+    visitor.TraverseDecl(context.getTranslationUnitDecl());
+    return visitor.error();
+  }
+
 private:
   class ForbiddenReceiverUseVisitor final
       : public clang::RecursiveASTVisitor<ForbiddenReceiverUseVisitor> {
@@ -4450,19 +4464,59 @@ private:
     ForbiddenReceiverUseVisitor(
         clang::CXXRecordDecl *target,
         const std::unordered_set<const clang::Decl *> &imported,
-        const std::vector<clang::CXXRecordDecl *> &targets)
-        : imported_(imported) {
+        const std::vector<clang::CXXRecordDecl *> &targets,
+        std::string target_symbol, bool methods_only = false)
+        : source_manager_(target->getASTContext().getSourceManager()),
+          imported_(imported), target_symbol_(std::move(target_symbol)),
+          methods_only_(methods_only) {
       targets_.insert(target->getCanonicalDecl());
       for (auto *t : targets)
         targets_.insert(t->getCanonicalDecl());
+      const auto location =
+          source_manager_.getExpansionLoc(target->getLocation());
+      if (location.isValid() && !source_manager_.isWrittenInMainFile(location))
+        receiver_header_file_ = source_manager_.getFileID(location);
     }
     bool is_target(const clang::CXXRecordDecl *record) const {
       return record && targets_.count(record->getCanonicalDecl());
     }
 
+    bool is_guarded_object(const clang::CXXRecordDecl *record) const {
+      return !methods_only_ && is_target(record);
+    }
+
+    bool is_probed_method(const clang::CXXMethodDecl *method) const {
+      return method && !llvm::isa<clang::CXXConstructorDecl>(method) &&
+             !llvm::isa<clang::CXXDestructorDecl>(method) &&
+             !method->isDependentContext() &&
+             !method->getType()->isDependentType() &&
+             mangle_function(method, method->getASTContext()) == target_symbol_;
+    }
+
     bool shouldVisitTemplateInstantiations() const { return true; }
 
     bool shouldVisitImplicitCode() const { return true; }
+
+    bool TraverseDecl(clang::Decl *declaration) {
+      // Other classes and free functions in the receiver header are also
+      // application code, not callback helpers. Keep checking callback code
+      // and helpers from other files, including their direct method references.
+      if (declaration && receiver_header_file_.isValid()) {
+        const auto location =
+            source_manager_.getExpansionLoc(declaration->getLocation());
+        if (location.isValid() &&
+            source_manager_.getFileID(location) == receiver_header_file_)
+          return true;
+      }
+      // Out-of-class definitions belong to the receiver implementation too.
+      // Calls from these bodies run under the existing callback-depth guard.
+      if (const auto *method =
+              llvm::dyn_cast_or_null<clang::CXXMethodDecl>(declaration);
+          method && is_target(method->getParent()))
+        return true;
+      return clang::RecursiveASTVisitor<
+          ForbiddenReceiverUseVisitor>::TraverseDecl(declaration);
+    }
 
     bool TraverseCXXRecordDecl(clang::CXXRecordDecl *record) {
       if (record && is_target(record)) {
@@ -4497,25 +4551,18 @@ private:
               llvm::dyn_cast<clang::MemberExpr>(expression->getCallee())) {
         if (const auto *method =
                 llvm::dyn_cast<clang::CXXMethodDecl>(member->getMemberDecl());
-            method && is_target(method->getParent())) {
-          error_ = "callback cannot call methods on the imported receiver";
+            is_probed_method(method)) {
+          reject_probed_method(expression);
         }
       }
       return true;
     }
 
     bool VisitMemberExpr(clang::MemberExpr *expression) {
-      if (imported_.count(expression->getMemberDecl()->getCanonicalDecl()) !=
-              0 &&
-          llvm::isa<clang::CXXMethodDecl>(expression->getMemberDecl())) {
-        error_ = "callback cannot call or take the address of imported target "
-                 "methods";
-      }
       if (const auto *method =
               llvm::dyn_cast<clang::CXXMethodDecl>(expression->getMemberDecl());
-          method && is_target(method->getParent())) {
-        error_ = "callback cannot call or take the address of imported "
-                 "receiver methods";
+          is_probed_method(method)) {
+        reject_probed_method(expression);
       }
       return true;
     }
@@ -4525,8 +4572,9 @@ private:
         if (const auto *function =
                 llvm::dyn_cast<clang::FunctionDecl>(expression->getDecl());
             function && function->getDefinition()) {
-          error_ = "callback cannot call or take the address of imported "
-                   "target functions";
+          if (!llvm::isa<clang::CXXMethodDecl>(function))
+            error_ = "callback cannot call or take the address of imported "
+                     "target functions";
         } else if (const auto *variable =
                        llvm::dyn_cast<clang::VarDecl>(expression->getDecl());
                    variable && variable->hasGlobalStorage()) {
@@ -4535,13 +4583,12 @@ private:
       }
       if (const auto *method =
               llvm::dyn_cast<clang::CXXMethodDecl>(expression->getDecl());
-          method && is_target(method->getParent())) {
-        error_ = "callback cannot call or take the address of imported "
-                 "receiver methods";
+          is_probed_method(method)) {
+        reject_probed_method(expression);
       } else if (const auto *variable =
                      llvm::dyn_cast<clang::VarDecl>(expression->getDecl());
                  variable && variable->getDeclContext()->isRecord() &&
-                 is_target(llvm::dyn_cast<clang::CXXRecordDecl>(
+                 is_guarded_object(llvm::dyn_cast<clang::CXXRecordDecl>(
                      variable->getDeclContext()))) {
         error_ =
             "callback cannot odr-use imported receiver static data members";
@@ -4551,7 +4598,7 @@ private:
 
     bool VisitCXXConstructExpr(clang::CXXConstructExpr *expression) {
       if (auto *record = expression->getType()->getAsCXXRecordDecl();
-          record && is_target(record)) {
+          record && is_guarded_object(record)) {
         error_ =
             "callback cannot construct objects of the imported receiver type";
       }
@@ -4560,7 +4607,7 @@ private:
 
     bool VisitInitListExpr(clang::InitListExpr *expression) {
       if (auto *record = expression->getType()->getAsCXXRecordDecl();
-          record && is_target(record)) {
+          record && is_guarded_object(record)) {
         error_ =
             "callback cannot construct objects of the imported receiver type";
       }
@@ -4569,7 +4616,7 @@ private:
 
     bool VisitCXXNewExpr(clang::CXXNewExpr *expression) {
       if (auto *record = expression->getAllocatedType()->getAsCXXRecordDecl();
-          record && is_target(record)) {
+          record && is_guarded_object(record)) {
         error_ =
             "callback cannot allocate objects of the imported receiver type";
       }
@@ -4581,7 +4628,7 @@ private:
       if (argument_type->isPointerType()) {
         if (auto *record =
                 argument_type->getPointeeType()->getAsCXXRecordDecl();
-            record && is_target(record)) {
+            record && is_guarded_object(record)) {
           error_ =
               "callback cannot destroy objects of the imported receiver type";
         }
@@ -4592,8 +4639,24 @@ private:
     const std::string &error() const { return error_; }
 
   private:
+    void reject_probed_method(const clang::Expr *expression) {
+      if (!error_.empty())
+        return;
+      error_ = "callback cannot call or take the address of the probed method";
+      const auto location = source_manager_.getPresumedLoc(
+          source_manager_.getExpansionLoc(expression->getExprLoc()));
+      if (location.isValid())
+        error_ += " at " + std::string(location.getFilename()) + ":" +
+                  std::to_string(location.getLine()) + ":" +
+                  std::to_string(location.getColumn());
+    }
+
     std::unordered_set<const clang::CXXRecordDecl *> targets_;
+    clang::SourceManager &source_manager_;
+    clang::FileID receiver_header_file_;
     const std::unordered_set<const clang::Decl *> &imported_;
+    std::string target_symbol_;
+    bool methods_only_;
     std::string error_;
   };
 
@@ -6065,6 +6128,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         baseline_error = "callback source failed Clang syntax validation";
       }
     }
+  }
+
+  // Header references such as &Meter::charge can parse without self() and
+  // therefore bypass the receiver-import fallback. Check method references
+  // there too, without changing the existing object-use admission paths.
+  if (baseline_preflight_succeeded && callback_header_receiver) {
+    error = ReceiverImportAction::validate_probed_method_uses(
+        user_ast->getASTContext(), specification.receiver().record_name(),
+        specification.symbol());
+    if (!error.empty())
+      return false;
   }
 
   if (baseline_preflight_succeeded && report && !followed_members_disabled) {
