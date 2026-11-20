@@ -493,6 +493,10 @@ if(BUILD_TESTING)
       --agent-log-level error
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/agent-log-error-results)
   set_tests_properties(grpc_native_agent_log_error PROPERTIES TIMEOUT 120)
+  add_test(NAME cli_numeric_diagnostics
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_numbers.py
+      $<TARGET_FILE:clang-tracer>)
+  set_tests_properties(cli_numeric_diagnostics PROPERTIES TIMEOUT 30)
   add_test(NAME grpc_client_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_integration.py
       --server $<TARGET_FILE:clang-tracer-server>

@@ -96,7 +96,12 @@ std::uint64_t parse_number(const std::string &text, std::string_view name,
     throw std::runtime_error("invalid number for " + std::string(name));
   }
   std::size_t consumed = 0;
-  const auto value = std::stoull(text, &consumed);
+  std::uint64_t value = 0;
+  try {
+    value = std::stoull(text, &consumed);
+  } catch (const std::out_of_range &) {
+    throw std::runtime_error("invalid number for " + std::string(name));
+  }
   if (consumed != text.size() || (!allow_zero && value == 0) ||
       value > maximum) {
     throw std::runtime_error(std::string(name) + " must be between " +

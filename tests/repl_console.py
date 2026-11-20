@@ -10,6 +10,37 @@ import tempfile
 import time
 
 
+def check_event_indexes(console, fixture, root):
+    empty = root / "empty.pb"
+    empty.touch()
+    saved = root / "bounds.db"
+    subprocess.run([fixture, "--write-replay-db", str(saved)], check=True, timeout=10)
+    setup = f'%events open "{empty}" --as empty\n%events open "{saved}" --as saved\n'
+    valid = "".join(f"%events {view} saved --index {index}\n"
+                    for view in ("show", "stack") for index in (0, 3))
+    result = subprocess.run([console, "--fail-fast"], input=setup + valid + "%quit\n",
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0 and not result.stderr, (result.stdout, result.stderr)
+    assert "cursor=1 session=s1 " in result.stdout, result.stdout
+    assert "cursor=11 session=s2 " in result.stdout, result.stdout
+    assert result.stdout.count("no stack captured\n") == 2, result.stdout
+    for collection, indexes in (("empty", (0, 2**64 - 1)),
+                                ("saved", (4, 2**64 - 1))):
+        for view in ("show", "stack"):
+            for index in indexes:
+                command = f"%events {view} {collection} --index {index}\n"
+                for options in ([], ["--fail-fast"]):
+                    result = subprocess.run(
+                        [console, *options], input=setup + command + "%status\n%quit\n",
+                        text=True, capture_output=True, timeout=10)
+                    assert result.returncode == 1, (command, options, result)
+                    assert result.stderr == (
+                        "error: event index is outside the retained collection\n"
+                    ), (command, options, result.stderr)
+                    assert ("ready=unconnected" in result.stdout) == (not options), (
+                        command, options, result.stdout)
+
+
 def main():
     console, fixture = map(os.path.abspath, sys.argv[1:3])
     with socket.socket() as listener:
@@ -20,6 +51,7 @@ def main():
         assert server.stdout.readline().strip() == "ready"
         with tempfile.TemporaryDirectory(prefix="tracer-repl-console-") as directory:
             root = Path(directory)
+            check_event_indexes(console, fixture, root)
             continued_help = "%help \\\r\n  probe \\ \t\r\n  inject\r\n"
             continued = subprocess.run(
                 [console, "--fail-fast"], input=continued_help + "%quit\n",
