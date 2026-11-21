@@ -664,34 +664,48 @@ cannot be observed.
 ## Probe virtual methods
 
 A virtual method with a body (a base implementation or an override) is a concrete
-function at its own address. `%probe inject`, the module index and prepared
-packages accept it like a non-virtual method, and the probe fires for calls through
-a base reference or pointer because the vtable slot points at the patched entry.
-An override that is reached through an adjusting or covariant-return thunk is
-called through a separate thunk symbol with no debug information of its own; the
-thunk is not probed, and selecting it by linkage name says so.
+function at its own address. `%symbols`, `%trace preview`, `%probe inject`, the
+module index and prepared packages treat it like a non-virtual method, and the
+probe fires for calls through a base reference or pointer because the vtable slot
+points at the patched entry. An override that is reached through an adjusting or
+covariant-return thunk is called through a separate thunk symbol with no debug
+information of its own; the thunk is not probed, and selecting it by linkage name
+says so.
 
-A pure virtual declaration has no executable body, so there is no entry to patch.
-Selecting one reports `no concrete implementation entry` and names the declaration:
+What decides is whether the module defines a body, not whether the method is
+marked pure. A pure virtual method that is defined (`virtual int rank() const = 0;`
+with `int Shape::rank() const { ... }`, or a pure virtual destructor, which always
+has a body) is an ordinary callable on every route. A virtual declaration that
+nothing defines has no entry to patch, and selecting it reports `no concrete
+implementation entry` with the declaration's name:
 
-- on the DWARF route (name the module, for example `--module libdemo`, so the
-  debug information is read) and in the module index, where such a declaration is
-  listed with kind `declaration` and diagnostic `no_concrete_entry`;
-- with `--include`/`--compdb`, where the error also lists the concrete overrides
-  the supplied headers define. Only those headers are searched, never the loaded
-  modules. None is chosen for you: prepare the override you want by its full
-  selector, one package per override.
+- on the DWARF route, when the module is named (for example `--module libdemo`)
+  so that its debug information is read;
+- in the module index, where such a declaration is listed with kind `declaration`
+  and diagnostic `no_concrete_entry`. A function with the same name wins a lookup
+  by bare name;
+- with `--include`/`--compdb` and `--module`: preparation is refused and the error
+  lists the concrete overrides the supplied headers define. Only those headers are
+  searched, never the loaded modules. None is chosen for you: prepare the override
+  you want by its full selector, one package per override. Without `--module`
+  nothing says whether a body exists, so the package is written with a note that
+  lists the same overrides, and installing it fails where no module defines the
+  method.
 
 `%object-probe` accepts a polymorphic receiver, including its non-virtual
-methods. A class that nothing in the debug information derives from keeps the
-complete-object proof from its constructor callers. A polymorphic class with
-derived classes cannot prove that a constructor or destructor call is for a
-complete object, because a derived class runs the same entries for its base
-subobject. Start still succeeds and reports `object identities remain
-provisional`; the lifetime sites are listed as provisional instead of
-complete-object entries. The deleting destructor of an abstract class is a trap
-that can never run, so it is not a lifetime entry. A non-polymorphic class with
-derived classes is still refused.
+methods. Derived classes are looked for in the debug information of the selected
+module and of the main executable. A class with none there keeps the
+complete-object proof from its constructor callers: a construction counts as a
+complete object only when it is called from a verified ordinary caller, so a base
+subobject built by a derived class in another module is reported as
+`LIFETIME_UNCERTAIN`, not as a created object. A polymorphic class with derived
+classes there cannot prove that a constructor or destructor call is for a complete
+object, because a derived class runs the same entries for its base subobject.
+Start still succeeds and reports `object identities remain provisional`; the
+lifetime sites are listed as provisional instead of complete-object entries.
+Clang emits the deleting destructor of an abstract class as a bare trap that
+nothing can run; that one is not a lifetime entry. GCC emits a real one, which is.
+A non-polymorphic class with derived classes is still refused.
 
 ## Read and scan mapped memory
 

@@ -2573,14 +2573,19 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D1Ev"))
         destructors.insert(symbol.range);
       else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev")) {
-        // The deleting destructor of an abstract class cannot run: Clang emits it as a trap
-        // (ud2) because no complete object of the class exists. There is no entry to watch.
+        // Clang emits the deleting destructor of an abstract class as a trap: no complete
+        // object of the class exists, so nothing can run it and there is no entry to watch.
+        // Only a body that can do nothing but trap qualifies: straight-line code that ends in
+        // ud2, with no call, branch or return. A real deleting destructor that merely has a
+        // trap on one path stays a lifetime entry.
         const auto pc = lifetime_image->bind(pid, symbol.range);
         const auto body = native_entry::scan(pc, lifetime_image->code(pc).substr(0, symbol.range.second));
-        const bool unreachable = !body.decode_failed &&
-            std::any_of(body.instructions.begin(), body.instructions.end(),
-                        [](const auto &inst) { return inst.text == "ud2"; });
-        if (!unreachable)
+        const bool only_traps = !body.decode_failed && body.diagnostic.empty() &&
+            !body.instructions.empty() && body.instructions.back().text == "ud2" &&
+            std::all_of(body.instructions.begin(), body.instructions.end(), [](const auto &inst) {
+              return inst.flow == native_entry::Flow::ordinary;
+            });
+        if (!only_traps)
           deleting_destructors.insert(symbol.range);
       }
       else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D2Ev"))

@@ -933,6 +933,16 @@ function(tracer_add_native_repl)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_virtual.cpp"
           "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_virtual PROPERTIES TIMEOUT 600)
+      # The same scenarios on a GCC-built fixture (skipped, exit 77, without a GCC): GCC describes
+      # pure methods, destructor declarations and split bodies differently from Clang.
+      add_test(NAME native_repl_virtual_gcc
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_virtual.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-virtual-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_virtual.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_virtual.cpp"
+          "${CMAKE_CXX_COMPILER}" "${_unnamed_receiver_gcc}")
+      set_tests_properties(native_repl_virtual_gcc PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
       add_executable(repl-variadic-target tests/fixtures/repl_variadic.cpp)
       set_target_properties(repl-variadic-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-variadic-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer

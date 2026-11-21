@@ -403,6 +403,12 @@ ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
   std::vector<ModuleSymbol> rows;
   while (step(stmt.get())) rows.push_back(decode(column(stmt.get(), 0), symbol));
   if (rows.empty()) throw std::invalid_argument("unknown symbol: " + name);
+  // A bodyless declaration (kind "declaration") only answers when nothing with code matches:
+  // a bare name shared by a defined overload and a pure one selects the defined overload.
+  if (std::any_of(rows.begin(), rows.end(), [](const ModuleSymbol &row) { return row.kind != "declaration"; }))
+    rows.erase(std::remove_if(rows.begin(), rows.end(),
+                              [](const ModuleSymbol &row) { return row.kind == "declaration"; }),
+               rows.end());
   if (rows.size() > 1) {
     const bool aliases = std::all_of(rows.begin(), rows.end(), [&](const ModuleSymbol &row) {
       return row.address != 0 && row.address == rows.front().address &&
