@@ -44,7 +44,11 @@ def main():
                 env=dict(os.environ, XDG_DATA_HOME=str(root / "data"),
                          XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(root / "cache")),
             )
-            assert result.returncode == 0 and not result.stderr, result
+            # gRPC itself reports this on hosts where sched_getcpu() is unavailable (the SDK
+            # loader on a newer kernel); it says nothing about the console.
+            stderr = "".join(line for line in result.stderr.splitlines(True)
+                             if "cpu_linux.cc" not in line or "Error determining current CPU" not in line)
+            assert result.returncode == 0 and not stderr.strip(), result
             for name in ("source", "bundle"):
                 assert result.stdout.count(f"agent {name} generation 1 active (compiled)") == 2, result.stdout
             assert result.stdout.count("agent source.tick = 1") == 2, result.stdout
