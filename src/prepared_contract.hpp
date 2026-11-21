@@ -101,6 +101,27 @@ inline std::vector<std::string> toolchain_arguments(
   return result;
 }
 
+// A toolchain profile that names no --target leaves the agent's JIT on the
+// process triple. Clang finds the GCC installation by triple, so a toolchain
+// whose libLLVM host triple differs from its default target (x86_64-unknown-linux-gnu
+// against x86_64-1a-linux-gnu) would select the system GCC instead of the donor's.
+// Pin the triple the package was prepared for.
+inline void add_implied_target_option(clangtracer::v1::PreparedInjector &package) {
+  if (package.adapter_toolchain_options().empty() || package.adapter_toolchain_options_size() >= 32)
+    return;
+  for (const auto &option : package.adapter_toolchain_options())
+    if (option.rfind("--target=", 0) == 0)
+      return;
+  const std::string_view triple = package.target_triple();
+  const bool aarch64_snapshot = !package.receiver_storage().empty() &&
+      ::tracer::compat::starts_with(triple, "aarch64-");
+  if (!(::tracer::compat::starts_with(triple, "x86_64-") || aarch64_snapshot) ||
+      triple.find("-linux") == triple.npos || triple.size() > 128 ||
+      triple.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != triple.npos)
+    return;
+  package.add_adapter_toolchain_options("--target=" + std::string(triple));
+}
+
 inline bool abi_option(std::string_view option) {
   return option == "-std=c++17" || option == "-std=gnu++17" ||
          option == "-std=c++20" || option == "-std=gnu++20" ||
