@@ -724,6 +724,32 @@ instruction-aligned window accepted by the current copy-only detour policy.
 If the policy rejects the entry, the preview shows the reason. It performs
 no installation or writes.
 
+## Probe a variadic function
+
+A function or method that ends in `...` (`int log(const char *fmt, ...)`)
+can be probed when its debug information is available. The preview marks it
+`DWARF_SUPPORTED` with the note `variadic, fixed arguments only`.
+
+```text
+%probe inject "gaps::vlog(const char*, ...)" --callback observer.cpp
+```
+
+`pre()` receives the fixed arguments only. The variadic tail is forwarded,
+never captured: an entry stub saves every argument register, including the
+vector registers and the `%al` count, runs `pre()`, restores them and jumps to
+the original with its stack untouched, so integer, floating-point and stack
+arguments reach the original unchanged. Nothing is copied, so no size limit
+applies.
+
+Because the original runs after the probe, its return cannot be observed. The
+agent refuses, with a precise message, a `post()` that is not empty, argument,
+result or replacement control, calling the original, exception tracing,
+receiver sampling at return, `--stack-depth`, shared-context callbacks,
+prepared packages and a call-site patch. Only SysV x86-64 is covered; other
+targets need their own forwarding proof. The trampoline page of a removed
+variadic probe stays mapped, because a late thread can still be inside the
+stub.
+
 ## Probe a short getter
 
 `%probe inject` uses the `auto` backend by default. It keeps the verified

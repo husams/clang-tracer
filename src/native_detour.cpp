@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/MC/MCAsmBackend.h>
@@ -486,6 +487,73 @@ bool prepare_entry_jump(const Patch &patch, void *trampoline,
     write_absolute_jump(output.data(), target);
   }
   std::fill(output.begin() + patch.jump_size, output.begin() + patch.size, 0x90);
+  return true;
+}
+
+
+bool create_variadic_forwarder(void *trampoline, std::size_t mapping_size,
+                               const void *observer, const void *&entry, std::string &error) {
+  // Above the relay (kRelayOffset + kJumpBytes) and inside the same page.
+  constexpr std::size_t kForwarderOffset = 256;
+  constexpr std::int32_t kFrame = 0xC0; // 7 integer slots, padding, 8 xmm slots; 16-byte multiple
+  if (!trampoline || trampoline == MAP_FAILED || mapping_size < kForwarderOffset + 512 ||
+      kForwarderOffset < kRelayOffset + kJumpBytes)
+    return fail(error, "invalid variadic forwarder bounds");
+  std::vector<std::uint8_t> code;
+  const auto emit = [&](std::initializer_list<std::uint8_t> bytes) {
+    code.insert(code.end(), bytes.begin(), bytes.end());
+  };
+  const auto emit32 = [&](std::int32_t value) {
+    const auto *raw = reinterpret_cast<const std::uint8_t *>(&value);
+    code.insert(code.end(), raw, raw + sizeof(value));
+  };
+  const auto emit64 = [&](std::uint64_t value) {
+    const auto *raw = reinterpret_cast<const std::uint8_t *>(&value);
+    code.insert(code.end(), raw, raw + sizeof(value));
+  };
+  struct Slot {
+    std::uint8_t rex, reg; // REX prefix and ModRM register field
+    std::int32_t offset;
+  };
+  // rdi rsi rdx rcx r8 r9 rax at [rsp + 0x00 .. 0x30].
+  const Slot integers[] = {{0x48, 7, 0x00}, {0x48, 6, 0x08}, {0x48, 2, 0x10}, {0x48, 1, 0x18},
+                           {0x4c, 0, 0x20}, {0x4c, 1, 0x28}, {0x48, 0, 0x30}};
+  emit({0x55});                         // push %rbp
+  emit({0x48, 0x89, 0xe5});             // mov %rsp,%rbp
+  emit({0x48, 0x81, 0xec});             // sub $kFrame,%rsp
+  emit32(kFrame);
+  for (const auto &slot : integers) {   // mov %reg,offset(%rsp)
+    emit({slot.rex, 0x89, static_cast<std::uint8_t>(0x84 | (slot.reg << 3)), 0x24});
+    emit32(slot.offset);
+  }
+  for (std::uint8_t n = 0; n < 8; ++n) { // movaps %xmmN,0x40+16N(%rsp)
+    emit({0x0f, 0x29, static_cast<std::uint8_t>(0x84 | (n << 3)), 0x24});
+    emit32(0x40 + 16 * n);
+  }
+  emit({0x48, 0xb8});                   // movabs $observer,%rax
+  emit64(reinterpret_cast<std::uintptr_t>(observer));
+  emit({0xff, 0xd0});                   // call *%rax
+  for (const auto &slot : integers) {   // mov offset(%rsp),%reg
+    emit({slot.rex, 0x8b, static_cast<std::uint8_t>(0x84 | (slot.reg << 3)), 0x24});
+    emit32(slot.offset);
+  }
+  for (std::uint8_t n = 0; n < 8; ++n) { // movaps 0x40+16N(%rsp),%xmmN
+    emit({0x0f, 0x28, static_cast<std::uint8_t>(0x84 | (n << 3)), 0x24});
+    emit32(0x40 + 16 * n);
+  }
+  emit({0xc9});                         // leave: the entry stack pointer again
+  emit({0x49, 0xbb});                   // movabs $trampoline,%r11
+  emit64(reinterpret_cast<std::uintptr_t>(trampoline));
+  emit({0x41, 0xff, 0xe3});             // jmp *%r11
+  if (kForwarderOffset + code.size() > mapping_size)
+    return fail(error, "variadic forwarder does not fit the trampoline page");
+  if (::mprotect(trampoline, mapping_size, PROT_READ | PROT_WRITE) != 0)
+    return fail(error, "could not make the variadic forwarder writable");
+  auto *target = static_cast<std::uint8_t *>(trampoline) + kForwarderOffset;
+  std::memcpy(target, code.data(), code.size());
+  if (::mprotect(trampoline, mapping_size, PROT_READ | PROT_EXEC) != 0)
+    return fail(error, "could not make the variadic forwarder executable");
+  entry = target;
   return true;
 }
 

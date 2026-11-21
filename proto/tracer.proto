@@ -145,6 +145,9 @@ message DebugInfo {
   uint64 record_alignment = 24;
   RecordCallingConvention record_calling_convention = 25;
   bytes prepared_layout_sha256 = 26;
+  // The callable ends in `...`. Only its fixed parameters are described; the unknown
+  // tail is forwarded to the original unchanged and is never captured.
+  bool callable_is_variadic = 27;
 }
 message DebugMethod {
   string name = 1;
