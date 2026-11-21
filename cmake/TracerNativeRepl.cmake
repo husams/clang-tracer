@@ -903,6 +903,17 @@ function(tracer_add_native_repl)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_cdtor.cpp"
           "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_cdtor PROPERTIES TIMEOUT 300)
+      # Needs a GCC for the assembly transformation (skipped, exit 77, otherwise). Prefer the SDK's.
+      find_program(_unnamed_receiver_gcc NAMES g++ HINTS "${TRACER_SDK_ROOT}/bin" NO_DEFAULT_PATH)
+      if(NOT _unnamed_receiver_gcc)
+        find_program(_unnamed_receiver_gcc NAMES g++)
+      endif()
+      add_test(NAME native_repl_unnamed_receiver
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_unnamed_receiver.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> "${_unnamed_receiver_gcc}")
+      set_tests_properties(native_repl_unnamed_receiver PROPERTIES TIMEOUT 300
+        SKIP_RETURN_CODE 77)
       add_executable(repl-variadic-target tests/fixtures/repl_variadic.cpp)
       set_target_properties(repl-variadic-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-variadic-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer
