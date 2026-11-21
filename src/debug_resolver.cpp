@@ -909,6 +909,7 @@ struct PreviewName {
 };
 
 PreviewName preview_name(const std::string &linkage, std::string fallback);
+int cdtor_kind(const std::string &linkage);
 
 // Match a bare name or the name followed by its parameter list. A template
 // argument can itself contain parentheses, for example void (*)(int).
@@ -961,13 +962,30 @@ bool is_object_pointer_parameter(DWARFDie parameter, const std::vector<DWARFDie>
   return false;
 }
 
+// Whether a callable is a constructor or a destructor. A destructor is named `~T`. A constructor
+// is recognized from the Itanium name of its entry point (C1..C5), because its DWARF name need not
+// be the name of its class: the constructors of the specialization `Box<int>` are named `Box`,
+// and a producer may name a constructor template specialization `Box<int>` in a class `Box`. A
+// description without a linkage name is compared by name, without template arguments.
+bool is_special_member(DWARFDie die, DWARFDie decl) {
+  const auto member = name(decl);
+  if (::tracer::compat::starts_with(member, "~"))
+    return true;
+  for (auto entry : {die, decl}) {
+    const char *linkage = entry ? entry.getName(llvm::DINameKind::LinkageName) : nullptr;
+    if (linkage && cdtor_kind(linkage))
+      return true;
+  }
+  const auto record = name(decl.getParent());
+  return member.substr(0, member.find('<')) == record.substr(0, record.find('<'));
+}
+
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                 const PreviewName &display = {}, bool allow_virtual_entry = false,
                                 bool allow_variadic = false) {
   // Constructors and destructors are concrete entry points (C1/C2, D0/D1/D2) even when the
   // destructor is virtual; a caller chooses one by its linkage symbol.
-  const bool special_member = ::tracer::compat::starts_with(name(decl), "~") ||
-                              name(decl) == name(decl.getParent());
+  const bool special_member = is_special_member(die, decl);
   if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
     throw std::runtime_error("nondefault debug calling convention is unsupported");
   }
