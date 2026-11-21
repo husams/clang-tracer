@@ -929,6 +929,66 @@ Selector parse_selector(const std::string& text) {
   return selector;
 }
 
+bool overrides_method(const clang::CXXMethodDecl *method, const clang::CXXMethodDecl &base) {
+  for (const auto *overridden : method->overridden_methods())
+    if (overridden->getCanonicalDecl() == base.getCanonicalDecl() ||
+        overrides_method(overridden, base))
+      return true;
+  return false;
+}
+
+// Concrete (non-pure) overrides of `base` defined by the classes of the supplied translation
+// unit. Only the headers given as context are searched, never the loaded modules.
+void collect_concrete_overrides(const clang::DeclContext &scope, const clang::CXXMethodDecl &base,
+                                clang::ASTContext &context, std::set<std::string> &found) {
+  const auto &sources = context.getSourceManager();
+  clang::PrintingPolicy policy(context.getLangOpts());
+  policy.SuppressScope = false;
+  for (const auto *declaration : scope.decls()) {
+    if (const auto *space = llvm::dyn_cast<clang::NamespaceDecl>(declaration)) {
+      if (!space->isStdNamespace())
+        collect_concrete_overrides(*space, base, context, found);
+      continue;
+    }
+    const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration);
+    if (!record || !record->isCompleteDefinition() || record->isDependentContext() ||
+        sources.isInSystemHeader(record->getLocation()))
+      continue;
+    collect_concrete_overrides(*record, base, context, found);
+    for (const auto *method : record->methods()) {
+      if (method->isPureVirtual() || !method->isVirtual() || !overrides_method(method, base))
+        continue;
+      std::string text = method->getQualifiedNameAsString() + "(";
+      for (unsigned i = 0; i < method->getNumParams(); ++i)
+        text += (i ? ", " : "") + method->getParamDecl(i)->getType().getAsString(policy);
+      text += ")";
+      if (method->isConst())
+        text += " const";
+      found.insert(std::move(text));
+    }
+  }
+}
+
+// A pure virtual declaration has no executable body. The probe cannot patch it, so say which
+// concrete overrides the supplied headers define instead of letting a later layer report a
+// missing symbol.
+std::string pure_virtual_diagnostic(const clang::CXXMethodDecl &method,
+                                    clang::ASTContext &context) {
+  std::set<std::string> overrides;
+  collect_concrete_overrides(*context.getTranslationUnitDecl(), method, context, overrides);
+  std::string message = "no concrete implementation entry: " + method.getQualifiedNameAsString() +
+                        " is a pure virtual declaration with no executable body; ";
+  if (overrides.empty())
+    return message + "the supplied headers define no concrete override of it. Add a --include "
+                     "for a derived class definition, or select a concrete override by its "
+                     "full selector";
+  message += "it is covered by these concrete overrides in the supplied headers (select one by "
+             "its full selector; none is chosen automatically):";
+  for (const auto &entry : overrides)
+    message += "\n  " + entry;
+  return message;
+}
+
 struct Candidate {
   std::string name;
   std::string symbol;
@@ -1177,6 +1237,9 @@ public:
       }
       if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
+      }
+      if (method && method->isPureVirtual()) {
+        throw std::runtime_error(pure_virtual_diagnostic(*method, *context_));
       }
       if (declaration->getFormalLinkage() != clang::Linkage::External) {
         throw std::runtime_error("callables with internal or non-external linkage are unsupported");

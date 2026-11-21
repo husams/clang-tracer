@@ -1224,6 +1224,27 @@ std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   return {low, high};
 }
 
+constexpr const char *no_concrete_entry_prefix = "no concrete implementation entry: ";
+
+// A virtual declaration whose DIE carries no code is not an entry to patch. The pure case is the
+// common one, but a virtual method without a body in this unit has the same property.
+void require_concrete_virtual_entry(DWARFDie die, DWARFDie decl, const std::string &selector) {
+  const auto virtuality = number(decl, dw::DW_AT_virtuality, dw::DW_VIRTUALITY_none);
+  if (virtuality == dw::DW_VIRTUALITY_none)
+    return;
+  std::uint64_t low = 0, high = 0, section = 0;
+  if (die.getLowAndHighPC(low, high, section) && high > low)
+    return;
+  throw std::runtime_error(
+      std::string(no_concrete_entry_prefix) + selector +
+      (virtuality == dw::DW_VIRTUALITY_pure_virtual
+           ? " is a pure virtual declaration"
+           : " is declared virtual but has no executable body in this module (for example a pure "
+             "virtual method)") +
+      "; select a concrete override by its full selector, or prepare with --include/--compdb "
+      "for the derived class definitions that provide one");
+}
+
 bool in_override_section(const llvm::object::ELF64LEObjectFile &object,
                          std::uint64_t low, std::uint64_t high) {
   for (const auto &section : object.sections()) {
@@ -2006,25 +2027,21 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         std::string diagnostic;
         try {
           callable_code_range(die);
-          // C1/C2/D0/D1/D2 are concrete entry points even for a virtual destructor.
-          if (number(decl, dw::DW_AT_virtuality) && !cdtor_kind(linkage)) {
-            status = PreviewCandidate::PREPARED_REQUIRED;
-            diagnostic = "virtual implementation requires a compatible prepared package";
-          } else {
-            const auto shape = describe_callable(die, decl, display, false, true);
-            if (shape.receiver) {
-              api::DebugInfo record;
-              describe_record(shape.receiver, record);
-            }
-            const auto result_type = read_type(type_of(decl));
-            if (result_type.record) {
-              api::DebugInfo record;
-              describe_record(result_type.record, record, result_type.value == api::POINTER);
-            }
-            selector = shape.selector;
-            if (shape.variadic)
-              diagnostic = "variadic, fixed arguments only: the variadic tail is forwarded, not captured";
+          // A virtual method with a body is a concrete entry, reached through its vtable slot or
+          // a direct call, like any other function.
+          const auto shape = describe_callable(die, decl, display, true, true);
+          if (shape.receiver) {
+            api::DebugInfo record;
+            describe_record(shape.receiver, record);
           }
+          const auto result_type = read_type(type_of(decl));
+          if (result_type.record) {
+            api::DebugInfo record;
+            describe_record(result_type.record, record, result_type.value == api::POINTER);
+          }
+          selector = shape.selector;
+          if (shape.variadic)
+            diagnostic = "variadic, fixed arguments only: the variadic tail is forwarded, not captured";
         } catch (const std::exception &error) {
           status = PreviewCandidate::UNSUPPORTED;
           diagnostic = error.what();
@@ -2345,6 +2362,12 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     }
     if (ranges.empty() && source_only)
       continue;
+    if (ranges.empty())
+      throw std::runtime_error(
+          std::string(no_concrete_entry_prefix) + prepared.selector() +
+          " has no defined function symbol in " + path +
+          "; a declaration without a body (for example a pure virtual method) cannot be "
+          "probed, so prepare a concrete override with its own selector");
     if (ranges.size() != 1)
       throw std::runtime_error(
           "prepared function has no unique concrete ELF symbol");
@@ -2522,6 +2545,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
               throw std::runtime_error("nondefault debug calling convention is unsupported");
             }
+            require_concrete_virtual_entry(die, decl, selector);
             ResolvedCallable found;
             const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry, true);
             const bool bare_name = by_linkage || selected == dwarf_name ||
@@ -2687,6 +2711,14 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
     }
   }
   if (matches.size() != 1) {
+    if (matches.empty() && rejected.rfind(no_concrete_entry_prefix, 0) == 0)
+      throw std::runtime_error(rejected);
+    if (matches.empty() && rejected.empty() && by_linkage &&
+        (selected.rfind("_ZTh", 0) == 0 || selected.rfind("_ZTv", 0) == 0 ||
+         selected.rfind("_ZTc", 0) == 0))
+      rejected = "this is an adjusting or covariant-return thunk entry, which has no DWARF "
+                 "subprogram of its own and is unsupported; select the implementation it "
+                 "forwards to";
     std::string error = matches.empty()
                             ? "no supported matching callable in mapped ELF debug information; "
                               "build/install matching DWARF symbols"

@@ -42,7 +42,9 @@ struct DebugLookupOptions {
   std::uint32_t max_depth = 0; // Zero is unlimited.
   std::function<bool()> is_cancelled = [] { return false; };
   bool require_override_abi = false;
-  bool allow_virtual_entry = false; // Only for inspecting or translating a resolved body.
+  // A virtual method with a body is a concrete entry. Object-watch writers set this to false
+  // because a call through the vtable is not a direct call of the writer.
+  bool allow_virtual_entry = true;
 };
 
 class DebugLookupLimit : public std::runtime_error {

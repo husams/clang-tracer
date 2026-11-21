@@ -270,11 +270,9 @@ void describe_symbol(DWARFDie die, ModuleSymbol &symbol) {
   symbol.line = decl.getDeclLine();
   symbol.diagnostic.clear();
   if (die.getTag() != dw::DW_TAG_subprogram) return;
-  // A destructor entry (D0/D1/D2) is a concrete function even when the destructor is virtual;
-  // its hidden parameters are checked below.
-  const bool destructor = name(decl).rfind("~", 0) == 0;
-  if (number(decl, dw::DW_AT_calling_convention).value_or(dw::DW_CC_normal) != dw::DW_CC_normal ||
-      (flag(decl, dw::DW_AT_virtuality) && !destructor))
+  // A virtual method with a body (and any D0/D1/D2 destructor entry) is a concrete function: this
+  // row describes the entry at its address, not the declaration's vtable slot.
+  if (number(decl, dw::DW_AT_calling_convention).value_or(dw::DW_CC_normal) != dw::DW_CC_normal)
     symbol.diagnostic = "unsupported_call_abi";
   auto parameters = die;
   const auto children = die.children();
@@ -380,6 +378,24 @@ ModuleIdentity scan(const ModuleSource &source, const ModuleIndexOptions &option
         if (const auto *tag = kind(die.getTag())) type_sink(describe_type(die, tag));
         if (die.getTag() == dw::DW_TAG_subprogram || die.getTag() == dw::DW_TAG_variable) {
           const auto *linkage = die.getLinkageName();
+          if (linkage && die.getTag() == dw::DW_TAG_subprogram && flag(die, dw::DW_AT_declaration) &&
+              number(die, dw::DW_AT_virtuality).value_or(dw::DW_VIRTUALITY_none) !=
+                  dw::DW_VIRTUALITY_none &&
+              by_linkage.find(linkage) == by_linkage.end()) {
+            auto &symbol = symbols[{linkage, 0, "declaration", ""}];
+            if (symbol.linkage.empty()) {
+              auto [symbol_name, symbol_selector] = symbol_names(linkage);
+              symbol.linkage = linkage;
+              symbol.kind = "declaration";
+              symbol.name = std::move(symbol_name);
+              symbol.selector = std::move(symbol_selector);
+              symbol.diagnostic = "no_concrete_entry";
+              symbol.member = true;
+              symbol.has_debug = true;
+              if (const auto qualified_name = qualified(die); !qualified_name.empty())
+                symbol.name = qualified_name;
+            }
+          }
           if (linkage && !flag(die, dw::DW_AT_declaration)) {
             const auto range = by_linkage.equal_range(linkage);
             std::uint64_t address = 0, high = 0, section = 0;

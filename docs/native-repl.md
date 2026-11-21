@@ -522,8 +522,8 @@ an overload by its full C++ signature. Quote patterns at the REPL.
 The dry run reads executable mappings, ELF symbols and DWARF, including matching
 separate debug files. It reports a live entry when one can be verified.
 `DWARF_SUPPORTED` means the entry passed static ABI checks. Callback compilation
-and installation checks run separately. `PREPARED_REQUIRED` identifies a
-concrete virtual implementation that needs a compatible prepared package.
+and installation checks run separately. A virtual method with a body is a
+concrete entry and reports `DWARF_SUPPORTED` like any other function.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with `--module`.
 
@@ -642,7 +642,7 @@ object: `Leaf::Leaf` (`C1`) calls `Mid::Mid` (`C2`), which calls
 `DWARF_SUPPORTED` row each (`reason="constructor/destructor variant SYMBOL"`),
 and one row for names that share a body. `%trace apply` installs one probe per
 row and tells the rows apart with `reason="constructor/destructor entry SYMBOL"`.
-A virtual destructor is concrete here, so it is not `PREPARED_REQUIRED`.
+A virtual destructor is concrete here, like any virtual method with a body.
 
 A prepared package binds the complete-object entry point (`C1` or `D1`) of the
 C++ selector, the one called for a most-derived object, and spells constructors
@@ -660,6 +660,38 @@ entry points at different addresses stay ambiguous.
 
 Constructors and destructors that the compiler inlined have no symbol and
 cannot be observed.
+
+## Probe virtual methods
+
+A virtual method with a body (a base implementation or an override) is a concrete
+function at its own address. `%probe inject`, the module index and prepared
+packages accept it like a non-virtual method, and the probe fires for calls through
+a base reference or pointer because the vtable slot points at the patched entry.
+An override that is reached through an adjusting or covariant-return thunk is
+called through a separate thunk symbol with no debug information of its own; the
+thunk is not probed, and selecting it by linkage name says so.
+
+A pure virtual declaration has no executable body, so there is no entry to patch.
+Selecting one reports `no concrete implementation entry` and names the declaration:
+
+- on the DWARF route (name the module, for example `--module libdemo`, so the
+  debug information is read) and in the module index, where such a declaration is
+  listed with kind `declaration` and diagnostic `no_concrete_entry`;
+- with `--include`/`--compdb`, where the error also lists the concrete overrides
+  the supplied headers define. Only those headers are searched, never the loaded
+  modules. None is chosen for you: prepare the override you want by its full
+  selector, one package per override.
+
+`%object-probe` accepts a polymorphic receiver, including its non-virtual
+methods. A class that nothing in the debug information derives from keeps the
+complete-object proof from its constructor callers. A polymorphic class with
+derived classes cannot prove that a constructor or destructor call is for a
+complete object, because a derived class runs the same entries for its base
+subobject. Start still succeeds and reports `object identities remain
+provisional`; the lifetime sites are listed as provisional instead of
+complete-object entries. The deleting destructor of an abstract class is a trap
+that can never run, so it is not a lifetime entry. A non-polymorphic class with
+derived classes is still refused.
 
 ## Read and scan mapped memory
 
