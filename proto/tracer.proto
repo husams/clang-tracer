@@ -148,6 +148,8 @@ message DebugInfo {
   // The callable ends in `...`. Only its fixed parameters are described; the unknown
   // tail is forwarded to the original unchanged and is never captured.
   bool callable_is_variadic = 27;
+  // Debug-image unit and DIE of a record in an anonymous namespace; empty otherwise.
+  string record_identity = 28;
 }
 message DebugMethod {
   string name = 1;

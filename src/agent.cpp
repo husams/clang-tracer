@@ -2022,15 +2022,33 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
     const clangtracer::v1::ProbeSpec &target) {
   const auto &debug = target.debug_info();
   std::unordered_map<std::string, std::string> names;
+  std::unordered_map<std::string, std::string> identities;
+  const auto digest_key = [](const std::string &text) {
+    const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(text.data()), text.size()));
+    // Keep the generated identifier within the recovered identifier limit.
+    return llvm::toHex(llvm::ArrayRef<std::uint8_t>(digest).take_front(16), true);
+  };
   const auto add = [&](const clangtracer::v1::DebugInfo &record) {
     const auto &name = record.record_name();
+    if (!record.record_identity().empty()) {
+      // A record in an anonymous namespace has no spelling that names it. Derive its private
+      // name from the mapped debug image and the unit and DIE that describe it, so two
+      // same-named anonymous types never share a callback type.
+      const auto previous = identities.try_emplace(name, record.record_identity());
+      if (!previous.second && previous.first->second != record.record_identity())
+        throw std::runtime_error("two anonymous-namespace records share the display name " + name);
+      names.try_emplace(
+          name, "tracer_dwarf_types::anonymous_" +
+                    digest_key(debug.module() + '\n' + std::to_string(debug.device()) + ':' +
+                               std::to_string(debug.inode()) + ':' +
+                               std::to_string(debug.file_size()) + '\n' +
+                               record.record_identity()));
+      return;
+    }
     if (name.find('<') == std::string::npos || standard_library_record_name(name))
       return;
-    const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
-        reinterpret_cast<const std::uint8_t *>(name.data()), name.size()));
-    // Keep the generated identifier within the recovered identifier limit.
-    const auto key = llvm::toHex(llvm::ArrayRef<std::uint8_t>(digest).take_front(16), true);
-    names.try_emplace(name, "tracer_dwarf_types::record_" + key);
+    names.try_emplace(name, "tracer_dwarf_types::record_" + digest_key(name));
   };
   add(debug);
   for (const auto &argument : debug.arguments())
@@ -5781,8 +5799,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return false;
     }
   }
-  auto recovered = callback_headers_available || !target_specification.has_debug_info()
-      ? std::nullopt : template_recovery_spec(target_specification);
+  std::optional<clangtracer::v1::ProbeSpec> recovered;
+  try {
+    if (!callback_headers_available && target_specification.has_debug_info())
+      recovered = template_recovery_spec(target_specification);
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return false;
+  }
   auto &specification = recovered ? *recovered : target_specification;
   if (recovered) {
     local_verified_entry = VerifiedDebugEntry{&specification, verified_entry->runtime_entry};

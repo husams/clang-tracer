@@ -1,5 +1,6 @@
 #include "debug_resolver.hpp"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -88,6 +89,54 @@ std::string qualified(DWARFDie d) {
   return out;
 }
 
+// Display name of a record type. Unlike qualified(), an unnamed namespace is kept as
+// "(anonymous namespace)" so a record inside one is still identified. That spelling is for
+// display and selectors only; the callback representation is derived from record_identity().
+std::string record_display_name(DWARFDie d) {
+  std::vector<std::string> parts;
+  for (; d; d = d.getParent()) {
+    const auto tag = d.getTag();
+    if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_class_type ||
+        tag == dw::DW_TAG_structure_type || tag == dw::DW_TAG_union_type ||
+        tag == dw::DW_TAG_subprogram) {
+      auto part = name(d);
+      if (part.empty()) {
+        if (tag != dw::DW_TAG_namespace)
+          return {};
+        part = "(anonymous namespace)";
+      }
+      parts.push_back(std::move(part));
+    }
+  }
+  std::reverse(parts.begin(), parts.end());
+  std::string out;
+  for (const auto& p : parts) {
+    if (!out.empty()) {
+      out += "::";
+    }
+    out += p;
+  }
+  return out;
+}
+
+bool in_anonymous_namespace(DWARFDie d) {
+  for (d = d.getParent(); d; d = d.getParent())
+    if (d.getTag() == dw::DW_TAG_namespace && name(d).empty())
+      return true;
+  return false;
+}
+
+// Identity of one record's debug description inside its debug image: the unit and the DIE.
+// Two anonymous-namespace types with the same display name have different identities.
+std::string record_identity(DWARFDie d) {
+  const auto* unit = d.getDwarfUnit();
+  char buffer[96];
+  std::snprintf(buffer, sizeof buffer, "%s%llx:%llx", unit && unit->isTypeUnit() ? "tu:" : "cu:",
+                static_cast<unsigned long long>(unit ? unit->getOffset() : 0),
+                static_cast<unsigned long long>(d.getOffset()));
+  return buffer;
+}
+
 std::string compact(const std::string& text) {
   std::string out;
   bool space = false;
@@ -155,7 +204,7 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
   case dw::DW_TAG_class_type:
   case dw::DW_TAG_structure_type:
   case dw::DW_TAG_union_type:
-    return {qualified(d), number(d, dw::DW_AT_byte_size), api::OBJECT, d, false};
+    return {record_display_name(d), number(d, dw::DW_AT_byte_size), api::OBJECT, d, false};
   case dw::DW_TAG_base_type:
     break;
   default:
@@ -622,13 +671,21 @@ bool verified_mapping(std::uint32_t pid, const ExecutableMapping &mapping,
       [pid](auto address, auto bytes) { return matches_process_bytes(pid, address, bytes); });
 }
 
-void describe_record(DWARFDie record, api::DebugInfo& info) {
+// A record in an anonymous namespace is accepted only behind a pointer or reference: the
+// callback then observes an address, and members are read only from the checked DWARF layout.
+// By value it would need the original type's ABI, which no callback representation provides.
+void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer = false) {
   const bool is_union = record.getTag() == dw::DW_TAG_union_type;
   if (record.getTag() != dw::DW_TAG_class_type && record.getTag() != dw::DW_TAG_structure_type &&
       !is_union) {
     throw std::runtime_error("unsupported debug receiver");
   }
-  info.set_record_name(qualified(record));
+  info.set_record_name(record_display_name(record));
+  if (in_anonymous_namespace(record)) {
+    if (!behind_pointer)
+      throw std::runtime_error("anonymous-namespace record by value is unsupported");
+    info.set_record_identity(record_identity(record));
+  }
   if ((record.getParent().getTag() == dw::DW_TAG_class_type ||
        record.getParent().getTag() == dw::DW_TAG_structure_type) &&
       info.record_name().find('<') == std::string::npos) {
@@ -939,7 +996,7 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
     argument.set_is_reference(type.reference);
     argument.set_is_object_value(type.value == api::OBJECT);
     if (type.record) {
-      describe_record(type.record, *argument.mutable_object_type());
+      describe_record(type.record, *argument.mutable_object_type(), type.value == api::POINTER);
       describe_methods(type.record, *argument.mutable_object_type());
     }
     result.arguments.push_back(std::move(argument));
@@ -1024,7 +1081,7 @@ EntryAbi callable_abi(DWARFDie die) {
   info.set_result_is_object_value(returned.value == api::OBJECT);
   if (returned.record && complete(returned.record)) {
     api::DebugInfo layout;
-    describe_record(returned.record, layout);
+    describe_record(returned.record, layout, returned.value == api::POINTER);
     result.result = layout.SerializeAsString();
   }
   result.contract = abi.SerializeAsString();
@@ -1852,6 +1909,10 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
       candidate.set_diagnostic(std::move(diagnostic));
     };
     std::set<std::pair<std::string, std::uint64_t>> described;
+    // A function with internal linkage, such as one taking a pointer to an anonymous-namespace
+    // type, can have no DW_AT_linkage_name. Its DWARF row then carries the bare name, while the
+    // ELF symbol is mangled; remember the entry so the ELF pass does not list it a second time.
+    std::map<std::uint64_t, std::set<std::string>> unlinked;
     auto companion = open_debug_companion(path, *object);
     const auto *debug_object = companion
         ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary())
@@ -1893,6 +1954,9 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
                          [](const auto &glob) { return glob.find('(') != std::string::npos; }))
           continue;
         described.emplace(linkage, low);
+        // DWARFDie::getName() answers with the plain name when there is no linkage name.
+        if (!::tracer::compat::starts_with(linkage, "_Z"))
+          unlinked[low].insert(compact(qname));
         auto selector = display.selector;
         auto status = PreviewCandidate::DWARF_SUPPORTED;
         std::string diagnostic;
@@ -1911,7 +1975,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
             const auto result_type = read_type(type_of(decl));
             if (result_type.record) {
               api::DebugInfo record;
-              describe_record(result_type.record, record);
+              describe_record(result_type.record, record, result_type.value == api::POINTER);
             }
             selector = shape.selector;
             if (shape.variadic)
@@ -1941,6 +2005,9 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
           described.count({linkage->str(), *address}))
         return;
       const auto display = preview_name(linkage->str(), linkage->str());
+      if (const auto same = unlinked.find(*address);
+          same != unlinked.end() && same->second.count(compact(display.qualified)))
+        return;
       emit(display, display.selector, linkage->str(), *address, *address + elf.getSize(),
            PreviewCandidate::UNSUPPORTED, "ELF symbol has no matching concrete DWARF ABI");
     };
@@ -2461,8 +2528,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
               info->set_result_is_object_value(result_type.value == api::OBJECT);
               info->set_result_is_reference(result_type.reference);
               if (result_type.record) {
-                describe_record(result_type.record,
-                                *info->mutable_result_object_type());
+                describe_record(result_type.record, *info->mutable_result_object_type(),
+                                result_type.value == api::POINTER);
                 describe_methods(result_type.record,
                                  *info->mutable_result_object_type());
                 info->set_result_pass_by_reference(
