@@ -3794,7 +3794,10 @@ public:
   }
   case K::event_show: {
     auto b = batch(args.at(0));
-    print(b.at(command.number("--index", 0)));
+    const auto index = command.number("--index", 0);
+    if (index >= b.size())
+      throw std::out_of_range("event index is outside the retained collection");
+    print(b.at(index));
     return true;
   }
   case K::event_diff: {
