@@ -74,6 +74,16 @@ struct ModuleSelection {
   std::vector<std::string> symbols, types;
 };
 
+// Compiler-visible type definitions for preparing a callable whose records are passed or
+// returned by value. The headers define the types (they need not declare the callable) and the
+// compilation database supplies their language options, target and include paths.
+struct ModulePrepareContext {
+  std::vector<std::filesystem::path> includes;
+  std::filesystem::path compilation_database, translation_unit;
+  std::vector<std::string> extra_arguments;
+  bool empty() const { return includes.empty(); }
+};
+
 class ModuleIndex {
 public:
   static ModuleIndex build(const ModuleSource &, const std::filesystem::path &output,
@@ -92,7 +102,8 @@ public:
   void emit_headers(const ModuleSelection &, const std::filesystem::path &output) const;
   std::filesystem::path prepare_probe(const std::string &symbol_id,
       const std::filesystem::path &module, const std::filesystem::path &output,
-      const std::filesystem::path &generated = {}, bool metadata_only = false) const;
+      const std::filesystem::path &generated = {}, bool metadata_only = false,
+      const ModulePrepareContext &context = {}) const;
 
 private:
   std::filesystem::path path_;

@@ -758,6 +758,12 @@ function(tracer_add_native_repl)
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_module_index PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_class_preparation
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_class_preparation.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
+          --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_class_preparation PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_aliases
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_aliases.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

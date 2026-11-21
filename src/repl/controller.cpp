@@ -3,6 +3,7 @@
 #include "local_perf.hpp"
 #include "object_probe_package.hpp"
 #include "tracer/instruction_trace.h"
+#include "../abi_tags.hpp"
 #include "../prepared_contract.hpp"
 #include "../snapshot_limits.hpp"
 #include "../preparer_diagnostics.hpp"
@@ -370,8 +371,13 @@ PreparedMode prepared_options(Request &request, const Command &options,
                         prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
     const bool source_only = (prepared.format_version() == 2 || typed) &&
                              prepared.module_sha256().empty() && prepared.module_name().empty();
-    if ((!pinned && !source_only) ||
-        compact_selector(prepared.selector()) != selector)
+    // A package keeps the tagged spelling of an ABI-tagged callable it was prepared for; the
+    // same callable may be requested without its tags, but a request that spells any tag must
+    // match exactly.
+    const bool same_callable = compact_selector(prepared.selector()) == selector ||
+        (selector.find("[abi:") == selector.npos &&
+         compact_selector(tracer::strip_abi_tags(prepared.selector())) == selector);
+    if ((!pinned && !source_only) || !same_callable)
       throw std::runtime_error("invalid prepared contract or selector mismatch");
     *request.mutable_prepared() = prepared;
     request.set_selector(prepared.selector());
@@ -1308,7 +1314,9 @@ void discover_writers(const Command &command, api::ObjectWatchRequest &request) 
 Controller::PreparedPackage Controller::prepare_package(const std::string &selector,
                                                          const Command &options) {
   const bool elf_mode = options.has("--signature");
-  const bool indexed = !elf_mode && !options.has("--include");
+  const bool indexed = !elf_mode && (options.has("--module-index") || !options.has("--include"));
+  // Headers are the type definitions of a callable selected by ELF symbol or index entry.
+  const bool type_context = (elf_mode || indexed) && options.has("--include");
   std::vector<std::string> arguments{preparer_executable(), "--selector", selector};
   if (indexed) {
     arguments.insert(arguments.end(), {"--module-index", module_index_path(options).string()});
@@ -1318,7 +1326,8 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
   } else if (elf_mode) {
     arguments.insert(arguments.end(), {"--signature", options.option("--signature")});
     if (options.has("--member")) arguments.push_back("--member");
-  } else {
+  }
+  if (type_context || (!elf_mode && !indexed)) {
     const auto database = probe_path(options, options.option("--compdb", "compile_commands.json"));
     if (!options.has("--compdb") && !std::filesystem::is_regular_file(database))
       throw std::invalid_argument(
@@ -1350,7 +1359,8 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
       arguments.push_back(probe_path(options, value));
     }
   }
-  auto extra = indexed ? std::vector<std::string>{} : probe_extra_arguments(options, settings_);
+  auto extra = (indexed && !type_context) ? std::vector<std::string>{}
+                                          : probe_extra_arguments(options, settings_);
   if (options.has("--cwd"))
     extra = tracer::normalize_extra_compile_arguments(extra, {}, {}, options.option("--cwd"));
   for (const auto &argument : extra) {

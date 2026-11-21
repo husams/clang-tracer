@@ -81,7 +81,7 @@ shows the equivalent `%module` commands.
 | `find_type(name)`, `find_symbol(name)` | Resolve a type by name or a symbol by selector, name, or linkage name. Exact lookup requires a unique match. Use the full selector for overloaded functions. |
 | `get_type(id)`, `get_symbol(id)` | Read a particular entry using an ID from the same index. |
 | `emit_headers(selection, output)` | Write declarations, read-only field views, and a manifest to a new directory. Fill `ModuleSelection::symbols` and `types` with IDs. |
-| `prepare_probe(symbol_id, module, output, generated={}, metadata_only=false)` | Create a prepared package for the indexed symbol. Use an empty `module` to use the recorded ELF path. The output must be new. An optional generated bundle is checked before reuse. `metadata_only` keeps the package and skips separate adapter files. |
+| `prepare_probe(symbol_id, module, output, generated={}, metadata_only=false, context={})` | Create a prepared package for the indexed symbol. Use an empty `module` to use the recorded ELF path. The output must be new. An optional generated bundle is checked before reuse. `metadata_only` keeps the package and skips separate adapter files. A `ModulePrepareContext` (`includes`, `compilation_database`, `translation_unit`, `extra_arguments`) supplies the definitions of records passed or returned by value; the headers define the types and need not declare the function. A context cannot be combined with a generated bundle. |
 
 `ModuleIndexOptions` accepts `max_entries` and `max_depth` budgets (zero means
 unlimited) and a `cancelled` function that can abort indexing. A

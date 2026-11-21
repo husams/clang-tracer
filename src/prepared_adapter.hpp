@@ -257,8 +257,12 @@ private:
       source += "extern \"C\" ";
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&decl);
     const bool linkage_alias = selected && nested_static_method(method);
-    const auto symbol = linkage_alias || (selected && template_instance(decl))
-                            ? mangle(&decl, ast_) : std::string();
+    auto symbol = linkage_alias || (selected && template_instance(decl))
+                      ? mangle(&decl, ast_) : std::string();
+    // A function selected by its ELF symbol is declared with that symbol as its asm label.
+    if (symbol.empty() && selected && !method)
+      if (const auto *label = decl.getAttr<clang::AsmLabelAttr>())
+        symbol = label->getLabel().str();
     if (method && method->isStatic() && !linkage_alias)
       source += "static ";
     if (method && method->isVirtual())

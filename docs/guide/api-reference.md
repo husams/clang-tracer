@@ -1419,12 +1419,16 @@ idx.emit_headers({{hit.id}, {}}, "recovered");
 
 #### ModuleIndex prepare_probe
 
-`prepare_probe(symbol_id, module, output, generated={}, metadata_only=false)`
+`prepare_probe(symbol_id, module, output, generated={}, metadata_only=false, context={})`
 
-Make an indexed package for that symbol. Empty module uses the recorded ELF. A supplied generated bundle is verified; metadata_only skips separate adapter files.
+Make an indexed package for that symbol. Empty module uses the recorded ELF. A supplied generated bundle is verified; metadata_only skips separate adapter files. A `ModulePrepareContext` with `includes`, `compilation_database`, optional `translation_unit` and `extra_arguments` supplies the definitions of records passed or returned by value; the headers define the types and need not declare the function. A context cannot be combined with a generated bundle. The Python method takes the same values as `includes=`, `compilation_database=`, `translation_unit=` and `extra_arguments=`.
 
 ```cpp
 idx.prepare_probe(hit.id, {}, "prepared", "recovered");
+tracer_module::ModulePrepareContext types;
+types.includes = {"types.hpp"};
+types.compilation_database = "compile_commands.json";
+idx.prepare_probe(make_item.id, {}, "prepared-item", {}, false, types);
 ```
 
 
