@@ -913,6 +913,28 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-variadic-target>)
       set_tests_properties(native_repl_variadic PROPERTIES TIMEOUT 300)
+      set(_anon_fixtures "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/anon_pointer")
+      add_library(repl-anon-library-one SHARED "${_anon_fixtures}/anon_library_one.cpp")
+      add_library(repl-anon-library-two SHARED "${_anon_fixtures}/anon_library_two.cpp")
+      set_target_properties(repl-anon-library-one PROPERTIES OUTPUT_NAME anon_one CXX_STANDARD 17)
+      set_target_properties(repl-anon-library-two PROPERTIES OUTPUT_NAME anon_two CXX_STANDARD 17)
+      foreach(_anon_library repl-anon-library-one repl-anon-library-two)
+        target_compile_options(${_anon_library} PRIVATE -g -O0 -fno-inline -fcf-protection=none)
+        target_link_options(${_anon_library} PRIVATE "LINKER:--build-id=sha1")
+      endforeach()
+      add_executable(repl-anon-pointer-target
+        "${_anon_fixtures}/anon_unit_a.cpp" "${_anon_fixtures}/anon_unit_b.cpp"
+        "${_anon_fixtures}/anon_local.cpp" "${_anon_fixtures}/anon_main.cpp")
+      set_target_properties(repl-anon-pointer-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-anon-pointer-target PRIVATE -g -O0 -fno-inline
+        -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
+      target_link_options(repl-anon-pointer-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      target_link_libraries(repl-anon-pointer-target PRIVATE repl-anon-library-one repl-anon-library-two)
+      add_test(NAME native_repl_anon_pointer
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_anon_pointer.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-anon-pointer-target>)
+      set_tests_properties(native_repl_anon_pointer PROPERTIES TIMEOUT 300)
       add_executable(repl-person-target tests/fixtures/person/person.cpp tests/fixtures/person/driver.cpp)
       set_target_properties(repl-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
       target_compile_options(repl-person-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
