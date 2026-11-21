@@ -1,4 +1,4 @@
-"""Methods of classes nested in classes are DWARF receivers, with and without real headers.
+"""Nested DWARF receivers work with no headers, unrelated headers, and real type headers.
 
 The fixture (tests/fixtures/repl_nested_receivers.*) calls one method of each of: a class nested
 in a class, a sibling nested in the same class, a class nested two levels deep, and a plain
@@ -30,6 +30,7 @@ CASES = (
     ("SiblingCase::A::sibling(", "n", 4, 6),
     # The enclosing type is only named by pointer and has no recoverable layout.
     ("OpaqueOwner::Nested::owner(", "n", 5, 9),
+    ("UnionOwner::Nested::owner(", "n", 4, 11),
     # The method names a type nested in a sibling.
     ("DeepSibling::A::sibling(", "n", 6, 11),
     ("Plain::get(", "a", 1, 3),
@@ -87,28 +88,35 @@ def main():
             selectors[key] = re.search(r'"([^"]+)"', found[0])[1]
         assert not any("nested debug receiver" in row for row in rows), rows
 
-        # Real enclosing classes, supplied by the header, must be reused and not redeclared;
-        # without it every nested receiver is rebuilt from DWARF alone.
-        for header in (False, True):
+        # An unrelated callback include must preserve the same recovered layouts
+        # and public nested types. Real header declarations must still be reused.
+        for mode in ("none", "stdint", "real"):
             for index, (key, member, value, result) in enumerate(CASES + (PARTIAL,)):
                 selector = selectors[key]
                 partial_header = HEADER.with_name("repl_nested_partial.hpp")
-                if key == PARTIAL[0] and header:
-                    # The real header declares the nested class without defining it.
+                if key == PARTIAL[0] and mode == "real":
+                    # A real parent cannot be extended with recovered nested types,
+                    # whether the header forward-declares that type or omits it.
                     observer = root / "observer-partial.cpp"
                     observer.write_text(callback(member))
-                    send(f'%probe inject "{selector}" --callback "{observer}" --include "{partial_header}" '
-                         '--prepared-mode off')
-                    failure = output.expect(r"^installed probe=(\d+)|^error: .*", timeout=90)
-                    assert failure[0].startswith("error:") and "does not define its nested record" in failure[0], failure[0]
-                    assert "redefinition" not in failure[0], failure[0]
+                    missing_nested = root / "partial-without-nested.hpp"
+                    missing_nested.write_text(f"namespace {NS} {{ struct Partial {{}}; }}\n")
+                    for included in (partial_header, missing_nested):
+                        send(f'%probe inject "{selector}" --callback "{observer}" --include "{included}" '
+                             '--prepared-mode off')
+                        failure = output.expect(r"^installed probe=(\d+)|^error: .*", timeout=90)
+                        assert failure[0].startswith("error:") and "does not define its nested record" in failure[0], failure[0]
+                        assert "redefinition" not in failure[0], failure[0]
                     continue
-                observer = root / f"observer{index}{'h' if header else ''}.cpp"
-                observer.write_text(callback(member))
-                option = f' --include "{HEADER}" --prepared-mode off' if header else ""
+                observer = root / f"observer-{mode}-{index}.cpp"
+                prefix = "#include <cstdint>\n" if mode == "stdint" else ""
+                observer.write_text(prefix + callback(member))
+                option = " --prepared-mode off"
+                if mode == "real":
+                    option += f' --include "{HEADER}"'
                 send(f'%probe inject "{selector}" --callback "{observer}"{option}')
                 probe = output.expect(r"^installed probe=(\d+)|^error: .*", timeout=90)
-                assert probe[0].startswith("installed"), ("".join(output.seen[-5:]), selector, header)
+                assert probe[0].startswith("installed"), ("".join(output.seen[-5:]), selector, mode)
                 send(f"%collect --probe {probe[1]} --count 2 --timeout 20 --as nested_events")
                 output.expect(r"^received=2 ")
                 mark = len(output.seen)
@@ -116,8 +124,8 @@ def main():
                 send('std::cout << "nested-events-printed" << std::endl;')
                 output.expect(r"^nested-events-printed$")
                 text = "".join(output.seen[mark:])
-                assert field(text, "m") == value, (selector, header, text[-1500:])
-                assert field(text, "r") == result, (selector, header, text[-1500:])
+                assert field(text, "m") == value, (selector, mode, text[-1500:])
+                assert field(text, "r") == result, (selector, mode, text[-1500:])
                 send(f"%probe remove {probe[1]}")
                 output.expect(rf"^removed probe={probe[1]} restored=true$")
         send("%detach")
@@ -125,7 +133,7 @@ def main():
         send("%quit")
         assert console.wait(timeout=30) == 1, "".join(output.seen)  # the expected injection error
         assert child.poll() is None
-    print("Nested receivers observed from DWARF alone and with real headers.")
+    print("Nested receivers observed with no headers, unrelated headers, and real type headers.")
 
 
 if __name__ == "__main__":

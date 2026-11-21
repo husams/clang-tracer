@@ -17,6 +17,10 @@ struct OpaqueOwner {
   int values[2] = {1, 4};
   struct Nested { int n = 5; int owner(const OpaqueOwner *o) const; };
 };
+union UnionOwner {
+  int value = 7;
+  struct Nested { int n = 4; int owner(const UnionOwner *o) const; };
+};
 struct DeepSibling {
   struct B { struct Deep { int n = 5; }; };
   struct A { int n = 6; int sibling(const B::Deep *d) const; };

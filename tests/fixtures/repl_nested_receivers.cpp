@@ -19,6 +19,7 @@ NOINLINE int UnionScope::Nested::simple(int x) const { return n + x; }
 NOINLINE int OwnerCase::Nested::owner(const OwnerCase *o) const { return n + o->v * 3; }
 NOINLINE int SiblingCase::A::sibling(const B *b) const { return n + b->s; }
 NOINLINE int OpaqueOwner::Nested::owner(const OpaqueOwner *o) const { return n + o->values[1]; }
+NOINLINE int UnionOwner::Nested::owner(const UnionOwner *o) const { return n + o->value; }
 NOINLINE int DeepSibling::A::sibling(const B::Deep *d) const { return n + d->n; }
 NOINLINE int Plain::get() const { return a + b; }
 }  // namespace nested_receivers
@@ -32,6 +33,8 @@ int main() {
     nested_receivers::Plain plain;
     nested_receivers::OpaqueOwner opaque;
     nested_receivers::OpaqueOwner::Nested opaque_nested;
+    nested_receivers::UnionOwner union_owner;
+    nested_receivers::UnionOwner::Nested union_nested;
     nested_receivers::DeepSibling::A deep_a;
     nested_receivers::DeepSibling::B::Deep deep_b;
     nested_receivers::Partial::Nested partial;
@@ -42,7 +45,7 @@ int main() {
     nested_receivers::SiblingCase::B b;
     int sink = outer.n.f(7) + sibling.g(2) + deep.f(1) + plain.get() +
                partial.partial(1) + unioned.simple(1) + owned.owner(&owner) + a.sibling(&b) +
-               opaque_nested.owner(&opaque) + deep_a.sibling(&deep_b);
+               opaque_nested.owner(&opaque) + union_nested.owner(&union_owner) + deep_a.sibling(&deep_b);
     asm volatile("" : : "r"(sink));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }

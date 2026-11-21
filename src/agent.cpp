@@ -1602,15 +1602,24 @@ bool split_debug_template_arguments(llvm::StringRef spelling,
   return !arguments.empty();
 }
 
+// Recovered declarations are parsed in the synthetic main file or have no source
+// location. Only declarations from included files belong to real headers.
+bool debug_record_from_header(const clang::CXXRecordDecl *record) {
+  const auto &sources = record->getASTContext().getSourceManager();
+  const auto location = sources.getExpansionLoc(record->getLocation());
+  return location.isValid() && !sources.isWrittenInMainFile(location);
+}
+
 // Rebuild the declaration scope of a recovered record from the DWARF scope kinds:
 // namespaces become namespaces and enclosing classes and unions keep their kind. An enclosing
 // record found in the AST (for example from a real header) is reused; a missing one is a bare
 // stand-in that says nothing about the original enclosing type's layout or ABI.
-// `real_enclosing` is set to the first enclosing record that came from real source.
+// `real_enclosing` is set to the first enclosing record that came from a header.
 clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
                                           const clangtracer::v1::DebugInfo &info,
                                           llvm::StringRef &name, const char *error,
-                                          const clang::CXXRecordDecl **real_enclosing = nullptr) {
+                                          const clang::CXXRecordDecl **real_enclosing = nullptr,
+                                          bool create_missing = true) {
   clang::DeclContext *scope = context.getTranslationUnitDecl();
   llvm::StringRef remaining = info.record_name();
   int depth = 0;
@@ -1629,7 +1638,7 @@ clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
       if (is_record) {
         if (auto *enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(named)) {
           next = enclosing;
-          if (real_enclosing && !*real_enclosing && enclosing->getLocation().isValid())
+          if (real_enclosing && !*real_enclosing && debug_record_from_header(enclosing))
             *real_enclosing = enclosing;
         }
       } else if (auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(named)) {
@@ -1638,12 +1647,16 @@ clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
       if (next)
         break;
     }
+    if (!next && !create_missing)
+      return nullptr;
     if (!next && is_record) {
       auto *enclosing = clang::CXXRecordDecl::Create(
           context,
           kind == clangtracer::v1::RECORD_SCOPE_UNION ? clang::TagTypeKind::Union
                                                       : clang::TagTypeKind::Struct,
           scope, {}, {}, &id);
+      if (scope->isRecord())
+        enclosing->setAccess(clang::AS_public);
       scope->addDecl(enclosing);
       enclosing->startDefinition();
       enclosing->completeDefinition();
@@ -1967,6 +1980,8 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     record = clang::CXXRecordDecl::Create(
         context, clang::TagTypeKind::Struct, scope, {}, {},
         &context.Idents.get(remaining));
+    if (scope->isRecord())
+      record->setAccess(clang::AS_public);
     scope->addDecl(record);
     clangtracer::v1::ReceiverContext metadata;
     metadata.set_record_name(info.record_name());
@@ -1986,6 +2001,8 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     record =
         clang::CXXRecordDecl::Create(context, clang::TagTypeKind::Class, scope,
                                      {}, {}, &context.Idents.get(remaining));
+    if (scope->isRecord())
+      record->setAccess(clang::AS_public);
     scope->addDecl(record);
     record->startDefinition();
     for (const auto &field : info.fields()) {
@@ -2431,11 +2448,12 @@ bool ast_has_debug_record(clang::ASTContext &context,
 
 std::string missing_recovered_record_declarations(
     clang::ASTContext &context,
-    const clangtracer::v1::ProbeSpec &spec) {
+    const clangtracer::v1::ProbeSpec &spec, bool check_enclosing = false) {
   std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
   const auto append = [&](const clangtracer::v1::DebugInfo &record) {
     if (record.record_name().empty() ||
+        standard_library_record_name(record.record_name()) ||
         !seen.insert(record.record_name()).second ||
         ast_has_debug_record(context, record))
       return;
@@ -2449,6 +2467,14 @@ std::string missing_recovered_record_declarations(
       append(argument.object_type());
   if (info.has_result_object_type())
     append(info.result_object_type());
+  if (check_enclosing)
+    for (const auto *record : records) {
+      llvm::StringRef name;
+      const clang::CXXRecordDecl *real_enclosing = nullptr;
+      recovered_debug_scope(context, *record, name, "unsupported debug record scope",
+                            &real_enclosing, false);
+      reject_real_enclosing(real_enclosing, *record);
+    }
   return recovered_record_group(records);
 }
 
@@ -2562,72 +2588,85 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       headers += recovered_record_declarations(spec);
     if (!callback_includes.empty())
       headers = callback_includes + headers;
-    auto capture = std::make_unique<DiagnosticCapture>(nullptr);
-    if (spec.has_header_context()) {
-      const auto &header_context = spec.header_context();
-      const auto &directory = header_context.working_directory();
-      if (spec.include_headers().empty() || directory.empty() ||
-          directory.front() != '/' || directory.size() > 4095 ||
-          directory.find('\0') != std::string::npos ||
-          header_context.ByteSizeLong() > 64 * 1024 ||
-          header_context.compiler_arguments_size() > 512)
-        throw std::runtime_error("invalid header compilation context");
-      auto arguments = tracer::runtime::jit_arguments();
-      arguments.insert(arguments.end(),
-                       header_context.compiler_arguments().begin(),
-                       header_context.compiler_arguments().end());
-      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
-                       spec.extra_compile_arguments().end());
-      bool resource_dir = false;
-      for (const auto &argument : arguments) {
-        if (argument.find('\0') != std::string::npos)
-          throw std::runtime_error("invalid header compiler argument");
-        resource_dir |= argument == "-resource-dir" ||
-                        ::tracer::compat::starts_with(argument, "-resource-dir=");
+    const auto parse_types = [&] {
+      auto capture = std::make_unique<DiagnosticCapture>(nullptr);
+      if (spec.has_header_context()) {
+        const auto &header_context = spec.header_context();
+        const auto &directory = header_context.working_directory();
+        if (spec.include_headers().empty() || directory.empty() ||
+            directory.front() != '/' || directory.size() > 4095 ||
+            directory.find('\0') != std::string::npos ||
+            header_context.ByteSizeLong() > 64 * 1024 ||
+            header_context.compiler_arguments_size() > 512)
+          throw std::runtime_error("invalid header compilation context");
+        auto arguments = tracer::runtime::jit_arguments();
+        arguments.insert(arguments.end(),
+                         header_context.compiler_arguments().begin(),
+                         header_context.compiler_arguments().end());
+        arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                         spec.extra_compile_arguments().end());
+        bool resource_dir = false;
+        for (const auto &argument : arguments) {
+          if (argument.find('\0') != std::string::npos)
+            throw std::runtime_error("invalid header compiler argument");
+          resource_dir |= argument == "-resource-dir" ||
+                          ::tracer::compat::starts_with(argument, "-resource-dir=");
+        }
+        if (!resource_dir)
+          arguments.push_back(std::string("-resource-dir=") +
+                              tracer::runtime::clang_resource_dir());
+        arguments.insert(arguments.end(), {"-x", "c++"});
+        auto physical_fs = llvm::vfs::createPhysicalFileSystem();
+        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
+            physical_fs.release());
+        if (auto ec = private_fs->setCurrentWorkingDirectory(directory))
+          throw std::runtime_error("cannot use header working directory: " +
+                                   ec.message());
+        // Map a synthetic TU, never the compilation database's donor .cpp.
+        // The private filesystem keeps the target's process-wide cwd unchanged.
+        const auto input =
+            (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
+                .string();
+        output = clang::tooling::buildASTFromCodeWithArgs(
+            headers, arguments, input, "clang-tracer",
+            std::make_shared<clang::PCHContainerOperations>(),
+            clang::tooling::getClangStripDependencyFileAdjuster(), {},
+            capture.get(), std::move(private_fs));
+      } else {
+        auto arguments = tracer::runtime::jit_arguments();
+        arguments.insert(arguments.end(),
+                         {"-std=c++20", "-x", "c++",
+                          std::string("-resource-dir=") +
+                              tracer::runtime::clang_resource_dir()});
+        arguments.insert(arguments.end(), spec.compile_options().begin(),
+                         spec.compile_options().end());
+        arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                         spec.extra_compile_arguments().end());
+        output = clang::tooling::buildASTFromCodeWithArgs(
+            headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
+            std::make_shared<clang::PCHContainerOperations>(),
+            clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
       }
-      if (!resource_dir)
-        arguments.push_back(std::string("-resource-dir=") +
-                            tracer::runtime::clang_resource_dir());
-      arguments.insert(arguments.end(), {"-x", "c++"});
-      auto physical_fs = llvm::vfs::createPhysicalFileSystem();
-      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
-          physical_fs.release());
-      if (auto ec = private_fs->setCurrentWorkingDirectory(directory))
-        throw std::runtime_error("cannot use header working directory: " +
-                                 ec.message());
-      // Map a synthetic TU, never the compilation database's donor .cpp.
-      // The private filesystem keeps the target's process-wide cwd unchanged.
-      const auto input =
-          (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
-              .string();
-      output = clang::tooling::buildASTFromCodeWithArgs(
-          headers, arguments, input, "clang-tracer",
-          std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripDependencyFileAdjuster(), {},
-          capture.get(), std::move(private_fs));
-    } else {
-      auto arguments = tracer::runtime::jit_arguments();
-      arguments.insert(arguments.end(),
-                       {"-std=c++20", "-x", "c++",
-                        std::string("-resource-dir=") +
-                            tracer::runtime::clang_resource_dir()});
-      arguments.insert(arguments.end(), spec.compile_options().begin(),
-                       spec.compile_options().end());
-      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
-                       spec.extra_compile_arguments().end());
-      output = clang::tooling::buildASTFromCodeWithArgs(
-          headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
-          std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
+      auto *diagnostics = capture.get();
+      // AST import can report diagnostics after this function returns. Clang's
+      // tooling APIs borrow the consumer, so give the retained AST ownership.
+      if (output)
+        output->getDiagnostics().setClient(capture.release(), true);
+      if (!output || diagnostics->had_error())
+        throw std::runtime_error("cannot create debug type AST: " +
+                                 diagnostics->message());
+    };
+    parse_types();
+    if (headers_available) {
+      // Parse real headers first, then recover all missing records together so
+      // enclosing layouts and dependencies between nested types remain intact.
+      const auto missing =
+          missing_recovered_record_declarations(output->getASTContext(), spec, true);
+      if (!missing.empty()) {
+        headers += missing;
+        parse_types();
+      }
     }
-    auto *diagnostics = capture.get();
-    // AST import can report diagnostics after this function returns. Clang's
-    // tooling APIs borrow the consumer, so give the retained AST ownership.
-    if (output)
-      output->getDiagnostics().setClient(capture.release(), true);
-    if (!output || diagnostics->had_error())
-      throw std::runtime_error("cannot create debug type AST: " +
-                               diagnostics->message());
     auto &context = output->getASTContext();
     const auto &triple = context.getTargetInfo().getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -4581,7 +4620,7 @@ public:
       for (const auto &entry : *records_) {
         // Real header definitions are parsed below. Import only synthesized
         // DWARF records here, otherwise the later #include redefines them.
-        if (header_types_ && entry.decl->getLocation().isValid())
+        if (header_types_ && debug_record_from_header(entry.decl))
           continue;
         if (auto err = importer.ImportDefinition(entry.decl)) {
           *validation_error_ = llvm::toString(std::move(err));
@@ -4600,7 +4639,7 @@ public:
         imported_targets.push_back(target);
       }
     if (donor_record_ &&
-        !(header_types_ && donor_record_->getLocation().isValid())) {
+        !(header_types_ && debug_record_from_header(donor_record_))) {
       if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
         *validation_error_ = llvm::toString(std::move(import_error));
         return;
@@ -4642,7 +4681,7 @@ public:
     }
     if (header_types_ && records_)
       for (const auto &entry : *records_) {
-        if (entry.decl->getLocation().isInvalid())
+        if (!debug_record_from_header(entry.decl))
           continue;
         auto &context = compiler.getASTContext();
         auto *record =
@@ -6086,7 +6125,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   // callback TU. Only records synthesized from DWARF need AST import.
   const bool callback_header_receiver =
       callback_header_types && receiver_record &&
-      receiver_record->getLocation().isValid();
+      debug_record_from_header(receiver_record);
   const std::string header_receiver_alias =
       callback_header_receiver
           ? "namespace tracer { using ResolvedTarget = const " +
@@ -6569,7 +6608,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       // again creates duplicate specializations and builtin declarations.
       if (standard_library_record_name(entry.layout.record_name()))
         continue;
-      if (callback_header_types && entry.decl->getLocation().isValid())
+      if (callback_header_types && debug_record_from_header(entry.decl))
         continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
