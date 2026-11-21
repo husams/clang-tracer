@@ -1245,6 +1245,7 @@ public:
               });
           if (text_member && !adapter.standard_headers.count("string"))
             package.add_adapter_standard_headers("string");
+          tracer::prepared::add_implied_target_option(package);
         }
       } else {
         auto *signature = candidate.spec.mutable_signature();

@@ -293,6 +293,11 @@ std::cout << "PREPARED_TYPED_RESULTS=" << correct << std::endl;
                               args.compdb, donor)
             assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
                 offline.stdout + offline.stderr)
+            if sys.platform.startswith("linux") and os.uname().machine == "x86_64":
+                # The agent JIT defaults to its process triple; the package must pin its own so
+                # Clang selects the donor's GCC installation.
+                assert re.search(rb"--target=x86_64-[a-z0-9_]+-linux",
+                                 (struct_package / "prepared.pb").read_bytes()), offline.stdout
             struct_callback = root / "struct-interceptor.cpp"
             struct_callback.write_text(
                 'template <> class Interceptor<prepared_demo::LargeResult(int)> { public: '
