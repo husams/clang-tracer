@@ -44,6 +44,13 @@ bool create_trampoline(const Patch &patch, void *&address,
 bool prepare_entry_jump(const Patch &patch, void *trampoline,
                         std::size_t mapping_size, const void *destination,
                         ::tracer::compat::span<std::uint8_t> output, std::string &error);
+// Writes into a new trampoline an entry stub for a variadic callable: it saves every
+// argument register (including the SysV vector-register count in %al), calls `observer`
+// with the original register state, restores it, and jumps to the trampoline with the
+// original stack untouched, so the unknown variadic tail reaches the original unchanged.
+// The stub observes before the original runs and cannot observe its return.
+bool create_variadic_forwarder(void *trampoline, std::size_t mapping_size,
+                               const void *observer, const void *&entry, std::string &error);
 // A complete integer getter uses only the SysV receiver and returns directly.
 bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error);
 bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,

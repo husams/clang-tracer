@@ -858,10 +858,12 @@ struct CallableShape {
   std::string dwarf_selector;
   std::vector<api::DebugArgument> arguments;
   std::vector<std::string> argument_names;
+  bool variadic = false;
 };
 
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
-                                const PreviewName &display = {}, bool allow_virtual_entry = false) {
+                                const PreviewName &display = {}, bool allow_virtual_entry = false,
+                                bool allow_variadic = false) {
   // Constructors and destructors are concrete entry points (C1/C2, D0/D1/D2) even when the
   // destructor is virtual; a caller chooses one by its linkage symbol.
   const bool special_member = ::tracer::compat::starts_with(name(decl), "~") ||
@@ -950,9 +952,13 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   }
   for (auto child : decl.children()) {
     if (child.getTag() == dw::DW_TAG_unspecified_parameters) {
-      throw std::runtime_error("variadic debug callable is unsupported");
+      if (!allow_variadic)
+        throw std::runtime_error("variadic debug callable is unsupported");
+      result.variadic = true;
     }
   }
+  if (result.variadic)
+    types.push_back("...");
   result.signature.set_kind(result.receiver ? api::METHOD : api::FUNCTION);
   const auto qualified_name = qualified(decl);
   result.selector = "(";
@@ -992,10 +998,11 @@ struct EntryAbi {
 
 EntryAbi callable_abi(DWARFDie die) {
   const auto decl = declaration(die);
-  const auto shape = describe_callable(die, decl, {}, true);
+  const auto shape = describe_callable(die, decl, {}, true, true);
   api::ProbeSpec abi;
   *abi.mutable_signature() = shape.signature;
   auto &info = *abi.mutable_debug_info();
+  info.set_callable_is_variadic(shape.variadic);
   // GCC describes a class in full only in some translation units; the others carry a
   // declaration of it. The same function emitted from two of them has one contract, so layouts
   // are compared only between descriptions that have them.
@@ -1896,7 +1903,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
             status = PreviewCandidate::PREPARED_REQUIRED;
             diagnostic = "virtual implementation requires a compatible prepared package";
           } else {
-            const auto shape = describe_callable(die, decl, display);
+            const auto shape = describe_callable(die, decl, display, false, true);
             if (shape.receiver) {
               api::DebugInfo record;
               describe_record(shape.receiver, record);
@@ -1907,6 +1914,8 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
               describe_record(result_type.record, record);
             }
             selector = shape.selector;
+            if (shape.variadic)
+              diagnostic = "variadic, fixed arguments only: the variadic tail is forwarded, not captured";
           }
         } catch (const std::exception &error) {
           status = PreviewCandidate::UNSUPPORTED;
@@ -2403,7 +2412,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
               throw std::runtime_error("nondefault debug calling convention is unsupported");
             }
             ResolvedCallable found;
-            const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry);
+            const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry, true);
             const bool bare_name = by_linkage || selected == dwarf_name ||
                                    selected == name(decl) || selected == symbol_name;
             if (!bare_name && compact(shape.selector) != selected &&
@@ -2440,6 +2449,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             info->set_entry_size(high - low);
             info->set_runtime_entry(runtime_entry(pid, *object, *info, low, high));
             info->set_selector(shape.selector);
+            info->set_callable_is_variadic(shape.variadic);
             if (shape.receiver) {
               describe_record(shape.receiver, *info);
               describe_methods(shape.receiver, *info);
@@ -2685,7 +2695,7 @@ DebugSymbolPage list_debug_symbols(
             throw std::runtime_error("callable is outside mapped executable image ranges");
           }
           const auto display = preview_name(linkage_symbol, {});
-          const auto shape = describe_callable(die, decl, display);
+          const auto shape = describe_callable(die, decl, display, false, true);
           // The resolver validates the receiver layout too; discovery must not
           // advertise a method that the existing probe path cannot admit.
           if (shape.receiver) {

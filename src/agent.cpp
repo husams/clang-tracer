@@ -459,6 +459,9 @@ struct Probe {
   DebugRecords debug_records;
   void *trampoline = MAP_FAILED;
   std::size_t mapping_size = 0;
+  // The entry stub of a variadic probe runs after the wrapper has left its in-flight window,
+  // so a late thread can still be inside it when the probe is removed: keep the page mapped.
+  bool variadic_forwarder = false;
   std::size_t entry_jump_size = kJumpBytes;
   std::atomic<std::uint64_t> sequence{0};
   tracer::EventDelivery delivery;
@@ -506,7 +509,7 @@ struct Probe {
     if (delivery.socket_fd >= 0) {
       ::close(delivery.socket_fd);
     }
-    if (trampoline != MAP_FAILED) {
+    if (trampoline != MAP_FAILED && !variadic_forwarder) {
       ::munmap(trampoline, mapping_size);
     }
   }
@@ -3184,6 +3187,12 @@ std::string make_wrapper(const tracer::Request &r,
       (constructor_entry && typed && r.kind == tracer::CallableKind::Method && !shared_mode &&
        has_pre && has_post && snapshots && !snapshots->receiver.empty());
   const bool observe_returns = tracer::agent_has_observers(r.session_id);
+  // A variadic callable is observed by its fixed arguments only. The wrapper is entered by an
+  // entry stub that saved the whole argument state, runs PRE, and returns to the stub, which
+  // restores that state and jumps to the original: the unknown tail is never re-passed.
+  const bool variadic = spec && spec->debug_info().callable_is_variadic();
+  if (variadic && (shared_mode || overrides || trace_exceptions || refresh_receiver))
+    throw std::invalid_argument("a variadic callable supports only PRE observation of its fixed arguments");
   if (refresh_receiver && (!typed || r.kind != tracer::CallableKind::Method ||
                            shared_mode || !has_pre || !has_post || !snapshots ||
                            snapshots->receiver.empty()))
@@ -3283,9 +3292,12 @@ std::string make_wrapper(const tracer::Request &r,
   code += ");\nextern \"C\" __attribute__((force_align_arg_pointer)) ";
   if (overrides)
     code += "__attribute__((sysv_abi)) ";
-  code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
-                            "* result_slot"
-                      : result_type() + " clangtracer_wrapper(";
+  code += variadic
+              ? std::string("void clangtracer_wrapper(") +
+                    (result_sret ? result_type() + "* result_slot" : std::string())
+          : result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
+                              "* result_slot"
+                        : result_type() + " clangtracer_wrapper(";
   comma = result_sret;
   if (r.kind == tracer::CallableKind::Method) {
     if (comma)
@@ -3457,6 +3469,12 @@ std::string make_wrapper(const tracer::Request &r,
     else
       code += admit + "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
               "ULL,&ctx," + instance + ");\n";
+  }
+  if (variadic) {
+    // The entry stub forwards the call after this returns; the labels only keep the
+    // context's bridge range well-formed.
+    code += "original_begin: ;\noriginal_end: ;\nreturn;\n}";
+    return code;
   }
   if (callable_original)
     code += "ctx.invoke_original=nullptr; ctx.original_state=nullptr;\n";
@@ -5499,8 +5517,11 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
       // dispatches through the vtable), so it must not block probes on the class's other entries.
       if (method.is_virtual())
         continue;
-      if (method.is_variadic() ||
-          method.calling_convention() != llvm::dwarf::DW_CC_normal) {
+      // A variadic member has no fixed signature to call it by; it stays unbound, so only a
+      // callback that calls it directly fails to link.
+      if (method.is_variadic())
+        continue;
+      if (method.calling_convention() != llvm::dwarf::DW_CC_normal) {
         error = "debug method uses an unsupported virtual, variadic, or "
                 "nondefault calling convention: " + method.name();
         return false;
@@ -5789,6 +5810,24 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
             specification.debug_info().result_cpp_type())) {
       error = "multi-level pointers to recovered record results are not "
               "supported by Interceptor signature validation";
+      return false;
+    }
+  }
+  const bool variadic_target =
+      specification.has_debug_info() && specification.debug_info().callable_is_variadic();
+  if (variadic_target) {
+    // The entry stub forwards the original call before any return is seen, and re-passes no
+    // argument: nothing that needs the original's result or call can be offered.
+    const char *unsupported =
+        typed_prepared ? "prepared injection" :
+        overrides ? "argument, result or replacement control, and calling the original," :
+        specification.trace_exceptions() ? "exception tracing" :
+        specification.snapshot_receiver_at_return() ? "receiver sampling at return" :
+        specification.stack_depth() ? "stack capture" :
+        p.request.patch_backend == tracer::NativePatch::CallSite ? "a call-site patch" : nullptr;
+    if (unsupported) {
+      error = std::string("variadic callable: ") + unsupported +
+              " is unsupported; only PRE observation of the fixed arguments is available";
       return false;
     }
   }
@@ -6119,6 +6158,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         prefer_parse_errors();
       return false;
     }
+    if (context_declarations.requires_context && variadic_target) {
+      error = "variadic callable: a shared-context callback is unsupported; only PRE observation "
+              "of the fixed arguments is available";
+      return false;
+    }
     if (context_declarations.requires_context) {
       if (tracer::find_snapshot_encoders(user_ast->getASTContext()).requested) {
         error = "tracer_snapshot::encode requires an invocation-scoped callback";
@@ -6157,6 +6201,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
+    // The default observer declares an empty post(); it observes nothing, so it is accepted.
+    const auto empty_body = [](const clang::CXXMethodDecl *method) {
+      const auto *body = method ? llvm::dyn_cast_or_null<clang::CompoundStmt>(method->getBody()) : nullptr;
+      return body && body->body_empty();
+    };
+    if (shape_valid && variadic_target && shape.has_post && !empty_body(shape.post)) {
+      error = "variadic callable: post() is unsupported because the original runs after the "
+              "probe and its return cannot be observed; only pre() is available";
+      return false;
+    }
   } else {
     baseline_error = user_capture.message();
   }
@@ -7237,8 +7291,17 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         return operation.finish(-1);
       }
     } else if (p->request.patch_backend == tracer::NativePatch::Entry) {
+      const void *detour_destination = p->wrapper;
+      if (specification.has_debug_info() && specification.debug_info().callable_is_variadic()) {
+        if (!tracer::native_detour::create_variadic_forwarder(
+                p->trampoline, p->mapping_size, p->wrapper, detour_destination, error)) {
+          set_error(request, error.c_str());
+          return operation.finish(-1);
+        }
+        p->variadic_forwarder = true;
+      }
       if (!tracer::native_detour::prepare_entry_jump(
-              target_patch, p->trampoline, p->mapping_size, p->wrapper,
+              target_patch, p->trampoline, p->mapping_size, detour_destination,
               {p->request.installed, p->request.patch_size}, error)) {
         set_error(request, error.c_str());
         return operation.finish(-1);
