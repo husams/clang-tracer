@@ -1602,6 +1602,55 @@ bool split_debug_template_arguments(llvm::StringRef spelling,
   return !arguments.empty();
 }
 
+// Rebuild the declaration scope of a recovered record from the DWARF scope kinds:
+// namespaces become namespaces and enclosing classes stay classes. An enclosing record
+// found in the AST (for example from a real header) is reused; a missing one is a bare
+// stand-in that says nothing about the original enclosing type's layout or ABI.
+clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
+                                          const clangtracer::v1::DebugInfo &info,
+                                          llvm::StringRef &name, const char *error) {
+  clang::DeclContext *scope = context.getTranslationUnitDecl();
+  llvm::StringRef remaining = info.record_name();
+  int depth = 0;
+  while (::tracer::compat::contains(remaining, "::")) {
+    auto part = remaining.split("::");
+    if (!debug_identifier(part.first))
+      throw std::runtime_error(error);
+    const bool is_class = depth < info.record_scope_is_class_size() &&
+                          info.record_scope_is_class(depth);
+    ++depth;
+    auto &id = context.Idents.get(part.first);
+    clang::DeclContext *next = nullptr;
+    for (auto *named : scope->lookup(&id)) {
+      if (is_class) {
+        if (auto *enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(named))
+          next = enclosing;
+      } else if (auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(named)) {
+        next = ns;
+      }
+      if (next)
+        break;
+    }
+    if (!next && is_class) {
+      auto *enclosing = clang::CXXRecordDecl::Create(
+          context, clang::TagTypeKind::Struct, scope, {}, {}, &id);
+      scope->addDecl(enclosing);
+      enclosing->startDefinition();
+      enclosing->completeDefinition();
+      next = enclosing;
+    } else if (!next) {
+      auto *ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
+                                              nullptr, false);
+      scope->addDecl(ns);
+      next = ns;
+    }
+    scope = next;
+    remaining = part.second;
+  }
+  name = remaining;
+  return scope;
+}
+
 bool debug_record_identity_matches(clang::ASTContext &context,
                                    const clang::CXXRecordDecl *record,
                                    llvm::StringRef expected,
@@ -1887,25 +1936,9 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     return {record, std::move(metadata), true};
   }
   if (!record && info.record_is_opaque()) {
-    clang::DeclContext *scope = context.getTranslationUnitDecl();
-    llvm::StringRef remaining = info.record_name();
-    while (::tracer::compat::contains(remaining, "::")) {
-      auto part = remaining.split("::");
-      if (!debug_identifier(part.first))
-        throw std::runtime_error("unsupported debug record scope");
-      auto &id = context.Idents.get(part.first);
-      clang::NamespaceDecl *ns = nullptr;
-      for (auto *named : scope->lookup(&id))
-        if ((ns = llvm::dyn_cast<clang::NamespaceDecl>(named)))
-          break;
-      if (!ns) {
-        ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
-                                          nullptr, false);
-        scope->addDecl(ns);
-      }
-      scope = ns;
-      remaining = part.second;
-    }
+    llvm::StringRef remaining;
+    clang::DeclContext *scope =
+        recovered_debug_scope(context, info, remaining, "unsupported debug record scope");
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug record name");
     record = clang::CXXRecordDecl::Create(
@@ -1920,25 +1953,9 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     return {record, std::move(metadata), true};
   }
   if (!record) {
-    clang::DeclContext *scope = context.getTranslationUnitDecl();
-    llvm::StringRef remaining = info.record_name();
-    while (::tracer::compat::contains(remaining, "::")) {
-      auto part = remaining.split("::");
-      if (!debug_identifier(part.first))
-        throw std::runtime_error("unsupported debug receiver scope");
-      auto &id = context.Idents.get(part.first);
-      clang::NamespaceDecl *ns = nullptr;
-      for (auto *named : scope->lookup(&id))
-        if ((ns = llvm::dyn_cast<clang::NamespaceDecl>(named)))
-          break;
-      if (!ns) {
-        ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
-                                          nullptr, false);
-        scope->addDecl(ns);
-      }
-      scope = ns;
-      remaining = part.second;
-    }
+    llvm::StringRef remaining;
+    clang::DeclContext *scope =
+        recovered_debug_scope(context, info, remaining, "unsupported debug receiver scope");
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug receiver name");
     record =
@@ -2077,8 +2094,11 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
     }
   };
   const auto rename_record = [&](clangtracer::v1::DebugInfo &record) {
-    if (const auto found = names.find(record.record_name()); found != names.end())
+    if (const auto found = names.find(record.record_name()); found != names.end()) {
       record.set_record_name(found->second);
+      // The private name lives in a namespace, whatever scopes the original had.
+      record.clear_record_scope_is_class();
+    }
     for (auto &method : *record.mutable_methods()) {
       rename_type(*method.mutable_cpp_result_type());
       for (auto &parameter : *method.mutable_cpp_parameter_types())
@@ -2099,24 +2119,34 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
   return recovered;
 }
 
-std::string recovered_record_declaration(
-    const clangtracer::v1::DebugInfo &info) {
-  if (info.record_name().empty())
-    return {};
-  std::string result;
-  std::vector<std::string> namespaces;
-  llvm::StringRef name(info.record_name());
+struct RecoveredScopePart {
+  std::string name;
+  bool is_class;
+};
+
+// Split a recovered record name into its enclosing scopes (with their kinds) and its own name.
+std::vector<RecoveredScopePart> recovered_record_scopes(
+    const clangtracer::v1::DebugInfo &info, llvm::StringRef &name) {
+  std::vector<RecoveredScopePart> scopes;
+  name = info.record_name();
   while (::tracer::compat::contains(name, "::")) {
     auto part = name.split("::");
     if (!debug_identifier(part.first))
       throw std::runtime_error("unsupported recovered record namespace");
-    namespaces.push_back(part.first.str());
+    const auto depth = static_cast<int>(scopes.size());
+    scopes.push_back({part.first.str(), depth < info.record_scope_is_class_size() &&
+                                            info.record_scope_is_class(depth)});
     name = part.second;
   }
   if (!debug_identifier(name))
     throw std::runtime_error("unsupported recovered record name");
-  for (const auto &part : namespaces)
-    result += "namespace " + part + " { ";
+  return scopes;
+}
+
+// The record's own declaration, without its enclosing scopes.
+std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
+                                  llvm::StringRef name) {
+  std::string result;
   if (info.record_is_opaque()) {
     result += "class " + name.str() + "; ";
   } else {
@@ -2174,20 +2204,102 @@ std::string recovered_record_declaration(
     }
     result += "}; ";
   }
-  for (std::size_t i = 0; i < namespaces.size(); ++i)
-    result += "} ";
+  return result;
+}
+
+struct RecoveredScopeNode {
+  std::string name;
+  std::vector<RecoveredScopeNode> children;
+  std::vector<std::string> bodies;
+};
+
+std::string emit_recovered_scope(const RecoveredScopeNode &node) {
+  // A struct keeps the nested records public, matching the member access DWARF recorded.
+  std::string result = "struct " + node.name + " { ";
+  for (const auto &child : node.children)
+    result += emit_recovered_scope(child);
+  for (const auto &body : node.bodies)
+    result += body;
+  return result + "}; ";
+}
+
+// Declarations for a set of recovered records. Records sharing an enclosing class are
+// emitted inside one definition of it, because a class cannot be reopened.
+std::string recovered_record_group(
+    const std::vector<const clangtracer::v1::DebugInfo *> &records) {
+  struct Item {
+    std::string key;
+    std::vector<std::string> namespaces;
+    RecoveredScopeNode root;
+    std::string plain;
+  };
+  std::vector<Item> items;
+  for (const auto *info : records) {
+    llvm::StringRef name;
+    const auto scopes = recovered_record_scopes(*info, name);
+    const auto first_class = std::find_if(
+        scopes.begin(), scopes.end(), [](const auto &part) { return part.is_class; });
+    if (first_class == scopes.end()) {
+      std::string text;
+      for (const auto &part : scopes)
+        text += "namespace " + part.name + " { ";
+      text += recovered_record_body(*info, name);
+      for (std::size_t i = 0; i < scopes.size(); ++i)
+        text += "} ";
+      items.push_back({{}, {}, {}, std::move(text)});
+      continue;
+    }
+    std::string key;
+    std::vector<std::string> namespaces;
+    for (auto it = scopes.begin(); it != first_class; ++it) {
+      namespaces.push_back(it->name);
+      key += it->name + "::";
+    }
+    key += first_class->name;
+    auto item = std::find_if(items.begin(), items.end(),
+                             [&](const Item &candidate) { return candidate.key == key; });
+    if (item == items.end()) {
+      items.push_back({key, std::move(namespaces), {first_class->name, {}, {}}, {}});
+      item = std::prev(items.end());
+    }
+    RecoveredScopeNode *node = &item->root;
+    for (auto it = std::next(first_class); it != scopes.end(); ++it) {
+      if (!it->is_class)
+        throw std::runtime_error("unsupported recovered record scope");
+      auto child = std::find_if(node->children.begin(), node->children.end(),
+                                [&](const auto &candidate) { return candidate.name == it->name; });
+      if (child == node->children.end()) {
+        node->children.push_back({it->name, {}, {}});
+        child = std::prev(node->children.end());
+      }
+      node = &*child;
+    }
+    node->bodies.push_back(recovered_record_body(*info, name));
+  }
+  std::string result;
+  for (const auto &item : items) {
+    if (item.key.empty()) {
+      result += item.plain;
+      continue;
+    }
+    for (const auto &part : item.namespaces)
+      result += "namespace " + part + " { ";
+    result += emit_recovered_scope(item.root);
+    for (std::size_t i = 0; i < item.namespaces.size(); ++i)
+      result += "} ";
+  }
   return result;
 }
 
 std::string recovered_record_declarations(
     const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
-  std::string declarations;
+  std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
   auto append = [&](const clangtracer::v1::DebugInfo &record) {
     if (!record.record_name().empty() &&
         seen.insert(record.record_name()).second)
-      declarations += recovered_record_declaration(record);
+      records.push_back(&record);
   };
   if (!info.record_name().empty())
     append(info);
@@ -2196,7 +2308,7 @@ std::string recovered_record_declarations(
       append(argument.object_type());
   if (info.has_result_object_type())
     append(info.result_object_type());
-  return declarations;
+  return recovered_record_group(records);
 }
 
 bool ast_has_debug_record(clang::ASTContext &context,
@@ -2221,14 +2333,14 @@ bool ast_has_debug_record(clang::ASTContext &context,
 std::string missing_recovered_record_declarations(
     clang::ASTContext &context,
     const clangtracer::v1::ProbeSpec &spec) {
-  std::string declarations;
+  std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
   const auto append = [&](const clangtracer::v1::DebugInfo &record) {
     if (record.record_name().empty() ||
         !seen.insert(record.record_name()).second ||
         ast_has_debug_record(context, record))
       return;
-    declarations += recovered_record_declaration(record);
+    records.push_back(&record);
   };
   const auto &info = spec.debug_info();
   if (!info.record_name().empty())
@@ -2238,7 +2350,7 @@ std::string missing_recovered_record_declarations(
       append(argument.object_type());
   if (info.has_result_object_type())
     append(info.result_object_type());
-  return declarations;
+  return recovered_record_group(records);
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
