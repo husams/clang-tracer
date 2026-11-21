@@ -918,6 +918,37 @@ struct CallableShape {
   bool variadic = false;
 };
 
+// The receiver is identified by DW_AT_object_pointer, which a producer may attach to the concrete
+// entry, its declaration or an origin of either, and which may name the parameter itself or its
+// abstract origin. A producer may also omit the receiver's name, so the name is only a fallback.
+bool is_object_pointer_parameter(DWARFDie parameter, const std::vector<DWARFDie> &owners) {
+  std::vector<uint64_t> identities;
+  for (auto d = parameter; d; ) {
+    identities.push_back(d.getOffset());
+    auto next = d.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
+    if (!next || next.getOffset() == d.getOffset() || identities.size() > 8)
+      break;
+    d = next;
+  }
+  for (auto owner : owners) {
+    for (int depth = 0; owner && depth < 8; ++depth) {
+      auto pointer = owner.getAttributeValueAsReferencedDie(dw::DW_AT_object_pointer);
+      if (pointer) {
+        for (auto id : identities)
+          if (id == pointer.getOffset())
+            return true;
+      }
+      auto next = owner.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
+      if (!next)
+        next = owner.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
+      if (!next || next.getOffset() == owner.getOffset())
+        break;
+      owner = next;
+    }
+  }
+  return false;
+}
+
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                 const PreviewName &display = {}, bool allow_virtual_entry = false,
                                 bool allow_variadic = false) {
@@ -955,7 +986,8 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   }
   std::vector<std::string> types;
   for (auto parameter : params) {
-    if (number(parameter, dw::DW_AT_artificial) && name(parameter) == "this") {
+    if (number(parameter, dw::DW_AT_artificial) &&
+        (name(parameter) == "this" || is_object_pointer_parameter(parameter, {die, decl}))) {
       auto type = type_of(parameter);
       while (type && (type.getTag() == dw::DW_TAG_const_type ||
                       type.getTag() == dw::DW_TAG_volatile_type ||
