@@ -109,8 +109,9 @@ std::string descriptor_source(const RequestDescriptor &d) {
 } // namespace
 
 bool valid(const NativeFunctionTable &t) noexcept {
-  return t.abi_version == 1 && t.current_context && t.frame_enter &&
-         t.frame_exit && t.create_or_attach && t.hook_begin && t.hook_end &&
+  return t.abi_version == NativeFunctionTable::version && t.current_context &&
+         t.frame_enter && t.frame_exit && t.create_or_attach &&
+         t.hook_begin && t.hook_end &&
          t.access_begin && t.access_end && t.get && t.init_scope &&
          t.end_scope && t.event && t.thread_id;
 }

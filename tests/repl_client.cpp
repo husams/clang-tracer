@@ -277,7 +277,9 @@ public:
 
   grpc::Status AddProbe(grpc::ServerContext *, const api::AddProbeRequest *q,
                         api::Probe *r) override {
-    if (q->spec().callback_source() != "// client-only interceptor\n") {
+    const auto &spec = q->spec();
+    if (spec.callback_source() != "// client-only interceptor\n" &&
+        spec.callback_source() != "// package " + spec.callback_package_path() + "\n") {
       return {grpc::StatusCode::INVALID_ARGUMENT, "source content mismatch"};
     }
     ++installed;
@@ -783,7 +785,13 @@ int main(int argc, char **argv) {
       const auto apply = parse_command("%trace apply --manifest \"" + manifest + "\"");
       std::ostringstream output;
       Controller default_client(settings, output);
-      default_client.attach(7);
+      const auto attached = default_client.attach(7);
+      const auto callback = std::string(directory) + "/state.cpp";
+      std::ofstream(callback) << "// package " << callback << '\n';
+      default_client.execute(parse_command(
+          "%probe inject \"multiply(int, int)\" --callback state.cpp --cwd " +
+          std::string(directory)));
+      Facade(default_client).inject(attached, "multiply(int, int)", callback);
       default_client.execute(apply);
       require(output.str().find("complete=true") != std::string::npos,
               "bulk apply succeeds with its longer default deadline");

@@ -317,6 +317,20 @@ void verify_context_runtime() {
   auto scope = registered_fixture();
   SharedSourceRuntime first({scope}, pool, metadata_a, &publish, &sink);
   SharedSourceRuntime second({scope}, pool, metadata_b, &publish, &sink);
+  // No root call forces native construction to fail. It must be translated
+  // before returning to the facade, and restore the frame for later calls.
+  {
+    SharedSourceRuntime::Invocation invocation(first);
+    bool rejected = false;
+    try {
+      context_facade::InvocationFrame frame(context_facade::current_context());
+      frame.push_create_or_attach<RuntimeState>();
+    } catch (const context_facade::ContextError &error) {
+      rejected = error.code == static_cast<unsigned>(ErrorCode::construction_failed);
+    }
+    if (!rejected)
+      throw std::runtime_error("native construction failure was not translated");
+  }
   TraceContext trace{};
   trace.call_id = 0x1020304050607080ULL;
   trace.phase = TracePhase::Pre;

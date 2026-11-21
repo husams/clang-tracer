@@ -322,6 +322,11 @@ function(tracer_add_native_repl)
         set(_object_cache_agent clang_tracer_agent)
         set(_object_test_rendezvous)
         set(_object_test_arch_flags -fcf-protection=none)
+        add_test(NAME native_repl_shared_context_failures
+          COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_shared_context_failures.sh"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(native_repl_shared_context_failures PROPERTIES TIMEOUT 900)
       endif()
       foreach(_snapshot_case object_snapshots object_snapshot_unwind)
         set(_snapshot_target repl-${_snapshot_case}-target)
