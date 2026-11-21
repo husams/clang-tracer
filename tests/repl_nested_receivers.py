@@ -18,13 +18,23 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HEADER = FIXTURES / "repl_nested_receivers.hpp"
 NS = "nested_receivers"
 
-# selector, receiver member, member value, call result
+# method (as the preview row spells it), receiver member, member value, call result
 CASES = (
-    (f"{NS}::Outer::Nested::f(int) const", "v", 3, 10),
-    (f"{NS}::Outer::Sibling::g(int) const", "w", 5, 10),
-    (f"{NS}::Outer2::Mid::Deep::f(int) const", "v", 1, 2),
-    (f"{NS}::Plain::get() const", "a", 1, 3),
+    ("Outer::Nested::f(", "v", 3, 10),
+    ("Outer::Sibling::g(", "w", 5, 10),
+    ("Outer2::Mid::Deep::f(", "v", 1, 2),
+    ("UnionScope::Nested::simple(", "n", 6, 7),
+    # The enclosing type is also an argument: one declaration tree, no second definition.
+    ("OwnerCase::Nested::owner(", "n", 3, 12),
+    # A sibling is named by the method before it is declared.
+    ("SiblingCase::A::sibling(", "n", 4, 6),
+    # The enclosing type is only named by pointer and has no recoverable layout.
+    ("OpaqueOwner::Nested::owner(", "n", 5, 9),
+    # The method names a type nested in a sibling.
+    ("DeepSibling::A::sibling(", "n", 6, 11),
+    ("Plain::get(", "a", 1, 3),
 )
+PARTIAL = ("Partial::Nested::partial(", "n", 9, 10)
 
 
 def callback(member):
@@ -70,15 +80,29 @@ def main():
         send(f'%trace preview --include "{NS}::*"')
         output.expect(r"^dry-run matched=")
         rows = [line for line in output.seen[first:] if line.startswith(("DWARF_SUPPORTED ", "UNSUPPORTED "))]
-        for selector, *_ in CASES:
-            assert any(row.startswith("DWARF_SUPPORTED ") and f'"{selector}"' in row for row in rows), \
-                (selector, rows)
+        selectors = {}
+        for key, *_ in CASES + (PARTIAL,):
+            found = [row for row in rows if row.startswith("DWARF_SUPPORTED ") and f"{NS}::{key}" in row]
+            assert len(found) == 1, (key, rows)
+            selectors[key] = re.search(r'"([^"]+)"', found[0])[1]
         assert not any("nested debug receiver" in row for row in rows), rows
 
         # Real enclosing classes, supplied by the header, must be reused and not redeclared;
         # without it every nested receiver is rebuilt from DWARF alone.
         for header in (False, True):
-            for index, (selector, member, value, result) in enumerate(CASES):
+            for index, (key, member, value, result) in enumerate(CASES + (PARTIAL,)):
+                selector = selectors[key]
+                partial_header = HEADER.with_name("repl_nested_partial.hpp")
+                if key == PARTIAL[0] and header:
+                    # The real header declares the nested class without defining it.
+                    observer = root / "observer-partial.cpp"
+                    observer.write_text(callback(member))
+                    send(f'%probe inject "{selector}" --callback "{observer}" --include "{partial_header}" '
+                         '--prepared-mode off')
+                    failure = output.expect(r"^installed probe=(\d+)|^error: .*", timeout=90)
+                    assert failure[0].startswith("error:") and "does not define its nested record" in failure[0], failure[0]
+                    assert "redefinition" not in failure[0], failure[0]
+                    continue
                 observer = root / f"observer{index}{'h' if header else ''}.cpp"
                 observer.write_text(callback(member))
                 option = f' --include "{HEADER}" --prepared-mode off' if header else ""
@@ -99,7 +123,7 @@ def main():
         send("%detach")
         output.expect(r"^detached session=")
         send("%quit")
-        assert console.wait(timeout=30) == 0, "".join(output.seen)
+        assert console.wait(timeout=30) == 1, "".join(output.seen)  # the expected injection error
         assert child.poll() is None
     print("Nested receivers observed from DWARF alone and with real headers.")
 

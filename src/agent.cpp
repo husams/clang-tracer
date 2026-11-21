@@ -1603,12 +1603,14 @@ bool split_debug_template_arguments(llvm::StringRef spelling,
 }
 
 // Rebuild the declaration scope of a recovered record from the DWARF scope kinds:
-// namespaces become namespaces and enclosing classes stay classes. An enclosing record
-// found in the AST (for example from a real header) is reused; a missing one is a bare
+// namespaces become namespaces and enclosing classes and unions keep their kind. An enclosing
+// record found in the AST (for example from a real header) is reused; a missing one is a bare
 // stand-in that says nothing about the original enclosing type's layout or ABI.
+// `real_enclosing` is set to the first enclosing record that came from real source.
 clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
                                           const clangtracer::v1::DebugInfo &info,
-                                          llvm::StringRef &name, const char *error) {
+                                          llvm::StringRef &name, const char *error,
+                                          const clang::CXXRecordDecl **real_enclosing = nullptr) {
   clang::DeclContext *scope = context.getTranslationUnitDecl();
   llvm::StringRef remaining = info.record_name();
   int depth = 0;
@@ -1616,24 +1618,32 @@ clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
     auto part = remaining.split("::");
     if (!debug_identifier(part.first))
       throw std::runtime_error(error);
-    const bool is_class = depth < info.record_scope_is_class_size() &&
-                          info.record_scope_is_class(depth);
+    const auto kind = depth < info.record_scopes_size()
+                          ? info.record_scopes(depth)
+                          : clangtracer::v1::RECORD_SCOPE_NAMESPACE;
+    const bool is_record = kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE;
     ++depth;
     auto &id = context.Idents.get(part.first);
     clang::DeclContext *next = nullptr;
     for (auto *named : scope->lookup(&id)) {
-      if (is_class) {
-        if (auto *enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(named))
+      if (is_record) {
+        if (auto *enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(named)) {
           next = enclosing;
+          if (real_enclosing && !*real_enclosing && enclosing->getLocation().isValid())
+            *real_enclosing = enclosing;
+        }
       } else if (auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(named)) {
         next = ns;
       }
       if (next)
         break;
     }
-    if (!next && is_class) {
+    if (!next && is_record) {
       auto *enclosing = clang::CXXRecordDecl::Create(
-          context, clang::TagTypeKind::Struct, scope, {}, {}, &id);
+          context,
+          kind == clangtracer::v1::RECORD_SCOPE_UNION ? clang::TagTypeKind::Union
+                                                      : clang::TagTypeKind::Struct,
+          scope, {}, {}, &id);
       scope->addDecl(enclosing);
       enclosing->startDefinition();
       enclosing->completeDefinition();
@@ -1649,6 +1659,17 @@ clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
   }
   name = remaining;
   return scope;
+}
+
+// A real enclosing class from a header cannot receive a synthesized nested definition: importing
+// it would drag the real parent along and redefine it when the header is parsed again.
+void reject_real_enclosing(const clang::CXXRecordDecl *real_enclosing,
+                           const clangtracer::v1::DebugInfo &info) {
+  if (real_enclosing)
+    throw std::runtime_error(
+        "header class " + real_enclosing->getQualifiedNameAsString() +
+        " does not define its nested record in " + info.record_name() +
+        "; the header must define that nested type");
 }
 
 bool debug_record_identity_matches(clang::ASTContext &context,
@@ -1937,8 +1958,10 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
   }
   if (!record && info.record_is_opaque()) {
     llvm::StringRef remaining;
-    clang::DeclContext *scope =
-        recovered_debug_scope(context, info, remaining, "unsupported debug record scope");
+    const clang::CXXRecordDecl *real_enclosing = nullptr;
+    clang::DeclContext *scope = recovered_debug_scope(
+        context, info, remaining, "unsupported debug record scope", &real_enclosing);
+    reject_real_enclosing(real_enclosing, info);
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug record name");
     record = clang::CXXRecordDecl::Create(
@@ -1954,8 +1977,10 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
   }
   if (!record) {
     llvm::StringRef remaining;
-    clang::DeclContext *scope =
-        recovered_debug_scope(context, info, remaining, "unsupported debug receiver scope");
+    const clang::CXXRecordDecl *real_enclosing = nullptr;
+    clang::DeclContext *scope = recovered_debug_scope(
+        context, info, remaining, "unsupported debug receiver scope", &real_enclosing);
+    reject_real_enclosing(real_enclosing, info);
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug receiver name");
     record =
@@ -2097,7 +2122,7 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
     if (const auto found = names.find(record.record_name()); found != names.end()) {
       record.set_record_name(found->second);
       // The private name lives in a namespace, whatever scopes the original had.
-      record.clear_record_scope_is_class();
+      record.clear_record_scopes();
     }
     for (auto &method : *record.mutable_methods()) {
       rename_type(*method.mutable_cpp_result_type());
@@ -2121,7 +2146,7 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
 
 struct RecoveredScopePart {
   std::string name;
-  bool is_class;
+  int kind;  // RecordScopeKind
 };
 
 // Split a recovered record name into its enclosing scopes (with their kinds) and its own name.
@@ -2134,8 +2159,9 @@ std::vector<RecoveredScopePart> recovered_record_scopes(
     if (!debug_identifier(part.first))
       throw std::runtime_error("unsupported recovered record namespace");
     const auto depth = static_cast<int>(scopes.size());
-    scopes.push_back({part.first.str(), depth < info.record_scope_is_class_size() &&
-                                            info.record_scope_is_class(depth)});
+    scopes.push_back({part.first.str(), depth < info.record_scopes_size()
+                                            ? static_cast<int>(info.record_scopes(depth))
+                                            : static_cast<int>(clangtracer::v1::RECORD_SCOPE_NAMESPACE)});
     name = part.second;
   }
   if (!debug_identifier(name))
@@ -2143,19 +2169,35 @@ std::vector<RecoveredScopePart> recovered_record_scopes(
   return scopes;
 }
 
-// The record's own declaration, without its enclosing scopes.
+// The record's own declaration, without its enclosing scopes. `nested` is the text of records
+// declared inside it.
 std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
-                                  llvm::StringRef name) {
+                                  llvm::StringRef name, const std::string &nested = {}) {
   std::string result;
   if (info.record_is_opaque()) {
-    result += "class " + name.str() + "; ";
+    if (nested.empty()) {
+      result += "class " + name.str() + "; ";
+    } else {
+      // The record is only named by pointer, but it must be complete to hold the nested
+      // declarations. Give the stand-in the size and alignment DWARF recorded so that the
+      // layout check against the opaque type holds; nothing is claimed about its members.
+      result += "class " + name.str() + " { public: " + nested;
+      if (info.record_size() != 0) {
+        const auto alignment = info.record_alignment() > 1 ? info.record_alignment() : 1;
+        result += "alignas(" + std::to_string(alignment) + ") unsigned char tracer_opaque_storage[" +
+                  std::to_string(info.record_size()) + "]; ";
+      }
+      result += "}; ";
+    }
   } else {
     result += "class";
     if (info.record_alignment() > 1)
       result += " alignas(" + std::to_string(info.record_alignment()) + ")";
     result += " " + name.str();
     result += " { ";
-    std::string access;
+    if (!nested.empty())
+      result += "public: " + nested;
+    std::string access = nested.empty() ? std::string() : "public";
     for (const auto &field : info.fields()) {
       if (!debug_identifier(field.name()))
         throw std::runtime_error("unsupported recovered field name");
@@ -2207,26 +2249,76 @@ std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
   return result;
 }
 
+// One name declared inside an enclosing class or union: a scope that only holds other
+// declarations, a recovered record, or both.
 struct RecoveredScopeNode {
   std::string name;
+  int kind = clangtracer::v1::RECORD_SCOPE_CLASS;
+  const clangtracer::v1::DebugInfo *record = nullptr;
   std::vector<RecoveredScopeNode> children;
-  std::vector<std::string> bodies;
 };
 
 std::string emit_recovered_scope(const RecoveredScopeNode &node) {
-  // A struct keeps the nested records public, matching the member access DWARF recorded.
-  std::string result = "struct " + node.name + " { ";
+  // Forward declarations first: a method may name a sibling declared later, or a cycle.
+  std::string inner;
+  for (const auto &child : node.children) {
+    const char *keyword = child.record ? "class"
+                          : child.kind == clangtracer::v1::RECORD_SCOPE_UNION ? "union" : "struct";
+    inner += std::string(keyword) + " " + child.name + "; ";
+  }
+  // A forward declaration cannot supply `Sibling::Inner`: a sibling whose nested name is used
+  // by another must be defined first. Keep the original order, except for that dependency.
+  std::vector<std::string> texts;
   for (const auto &child : node.children)
-    result += emit_recovered_scope(child);
-  for (const auto &body : node.bodies)
-    result += body;
-  return result + "}; ";
+    texts.push_back(emit_recovered_scope(child));
+  std::vector<bool> emitted(texts.size(), false);
+  const auto blocked = [&](std::size_t index) {
+    for (std::size_t other = 0; other < texts.size(); ++other)
+      if (other != index && !emitted[other] &&
+          texts[index].find("::" + node.children[other].name + "::") != std::string::npos)
+        return true;
+    return false;
+  };
+  for (std::size_t count = 0; count < texts.size(); ++count) {
+    std::size_t pick = texts.size();
+    for (std::size_t i = 0; i < texts.size() && pick == texts.size(); ++i)
+      if (!emitted[i] && !blocked(i))
+        pick = i;
+    if (pick == texts.size())  // A dependency cycle: fall back to the original order.
+      pick = static_cast<std::size_t>(std::find(emitted.begin(), emitted.end(), false) -
+                                      emitted.begin());
+    emitted[pick] = true;
+    inner += texts[pick];
+  }
+  if (node.record)
+    return recovered_record_body(*node.record, node.name, inner);
+  // A struct keeps the nested records public, matching the member access DWARF recorded.
+  const char *keyword = node.kind == clangtracer::v1::RECORD_SCOPE_UNION ? "union" : "struct";
+  return std::string(keyword) + " " + node.name + " { " + inner + "}; ";
 }
 
-// Declarations for a set of recovered records. Records sharing an enclosing class are
-// emitted inside one definition of it, because a class cannot be reopened.
+// Declarations for a set of recovered records. Records that share an enclosing class, or are
+// one, are emitted as one declaration tree, because a class cannot be reopened.
 std::string recovered_record_group(
     const std::vector<const clangtracer::v1::DebugInfo *> &records) {
+  struct Parsed {
+    const clangtracer::v1::DebugInfo *info;
+    std::vector<RecoveredScopePart> scopes;
+    std::string name;
+  };
+  std::vector<Parsed> parsed;
+  std::unordered_set<std::string> enclosing;  // Qualified names that enclose another record.
+  for (const auto *info : records) {
+    llvm::StringRef name;
+    auto scopes = recovered_record_scopes(*info, name);
+    std::string path;
+    for (const auto &part : scopes) {
+      path += (path.empty() ? "" : "::") + part.name;
+      if (part.kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE)
+        enclosing.insert(path);
+    }
+    parsed.push_back({info, std::move(scopes), name.str()});
+  }
   struct Item {
     std::string key;
     std::vector<std::string> namespaces;
@@ -2234,47 +2326,54 @@ std::string recovered_record_group(
     std::string plain;
   };
   std::vector<Item> items;
-  for (const auto *info : records) {
-    llvm::StringRef name;
-    const auto scopes = recovered_record_scopes(*info, name);
-    const auto first_class = std::find_if(
-        scopes.begin(), scopes.end(), [](const auto &part) { return part.is_class; });
-    if (first_class == scopes.end()) {
+  for (const auto &entry : parsed) {
+    const auto &scopes = entry.scopes;
+    std::string full;
+    for (const auto &part : scopes)
+      full += part.name + "::";
+    full += entry.name;
+    // Components from the first enclosing record onward form the tree; the record itself is
+    // one more node when it is nested or itself encloses another record.
+    auto first_record = std::find_if(scopes.begin(), scopes.end(), [](const auto &part) {
+      return part.kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE;
+    });
+    const bool encloses = enclosing.count(full) != 0;
+    if (first_record == scopes.end() && !encloses) {
       std::string text;
       for (const auto &part : scopes)
         text += "namespace " + part.name + " { ";
-      text += recovered_record_body(*info, name);
+      text += recovered_record_body(*entry.info, entry.name);
       for (std::size_t i = 0; i < scopes.size(); ++i)
         text += "} ";
       items.push_back({{}, {}, {}, std::move(text)});
       continue;
     }
-    std::string key;
+    std::vector<RecoveredScopePart> chain(first_record, scopes.end());
+    chain.push_back({entry.name, clangtracer::v1::RECORD_SCOPE_CLASS});
     std::vector<std::string> namespaces;
-    for (auto it = scopes.begin(); it != first_class; ++it) {
+    std::string key;
+    for (auto it = scopes.begin(); it != first_record; ++it) {
       namespaces.push_back(it->name);
       key += it->name + "::";
     }
-    key += first_class->name;
+    key += chain.front().name;
     auto item = std::find_if(items.begin(), items.end(),
                              [&](const Item &candidate) { return candidate.key == key; });
     if (item == items.end()) {
-      items.push_back({key, std::move(namespaces), {first_class->name, {}, {}}, {}});
+      items.push_back({key, std::move(namespaces), {chain.front().name, chain.front().kind}, {}});
       item = std::prev(items.end());
     }
     RecoveredScopeNode *node = &item->root;
-    for (auto it = std::next(first_class); it != scopes.end(); ++it) {
-      if (!it->is_class)
-        throw std::runtime_error("unsupported recovered record scope");
+    for (std::size_t i = 1; i < chain.size(); ++i) {
       auto child = std::find_if(node->children.begin(), node->children.end(),
-                                [&](const auto &candidate) { return candidate.name == it->name; });
+                                [&](const auto &candidate) { return candidate.name == chain[i].name; });
       if (child == node->children.end()) {
-        node->children.push_back({it->name, {}, {}});
+        node->children.push_back({chain[i].name, chain[i].kind, nullptr, {}});
         child = std::prev(node->children.end());
       }
       node = &*child;
     }
-    node->bodies.push_back(recovered_record_body(*info, name));
+    node->record = entry.info;
   }
   std::string result;
   for (const auto &item : items) {
