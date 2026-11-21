@@ -629,10 +629,21 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
     throw std::runtime_error("unsupported debug receiver");
   }
   info.set_record_name(qualified(record));
-  if ((record.getParent().getTag() == dw::DW_TAG_class_type ||
-       record.getParent().getTag() == dw::DW_TAG_structure_type) &&
-      info.record_name().find('<') == std::string::npos) {
-    throw std::runtime_error("nested debug receiver classes are unsupported");
+  // Keep each enclosing scope's kind: a class scope cannot be rebuilt as a namespace.
+  for (auto scope = record.getParent(); scope; scope = scope.getParent()) {
+    const auto tag = scope.getTag();
+    if (tag == dw::DW_TAG_union_type)
+      throw std::runtime_error("unions enclosing a debug receiver are unsupported");
+    if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_subprogram ||
+        tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type)
+      info.add_record_scope_is_class(tag == dw::DW_TAG_class_type ||
+                                     tag == dw::DW_TAG_structure_type);
+  }
+  {
+    auto *kinds = info.mutable_record_scope_is_class();
+    std::reverse(kinds->begin(), kinds->end());
+    if (std::none_of(kinds->begin(), kinds->end(), [](bool is_class) { return is_class; }))
+      kinds->Clear();
   }
   info.set_record_size(number(record, dw::DW_AT_byte_size));
   const auto record_calling_convention =

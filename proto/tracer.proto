@@ -145,6 +145,9 @@ message DebugInfo {
   uint64 record_alignment = 24;
   RecordCallingConvention record_calling_convention = 25;
   bytes prepared_layout_sha256 = 26;
+  // One entry per enclosing scope of record_name, outermost first: true for an enclosing
+  // class, struct or union, false for a namespace. Empty means every scope is a namespace.
+  repeated bool record_scope_is_class = 27;
 }
 message DebugMethod {
   string name = 1;
