@@ -671,16 +671,249 @@ bool verified_mapping(std::uint32_t pid, const ExecutableMapping &mapping,
       [pid](auto address, auto bytes) { return matches_process_bytes(pid, address, bytes); });
 }
 
+// DIE offsets on the path currently being described. A template argument can name a record
+// whose own arguments name further records; a DIE met again on that path is a cycle and is
+// described by name only, so no depth or size limit is needed to terminate.
+using DescribePath = std::set<std::uint64_t>;
+
+void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer = false,
+                     bool template_provenance = true, DescribePath* path = nullptr);
+
+// A string-form attribute value, or nothing when it is absent or not a string.
+std::optional<std::string> string_value(const std::optional<llvm::DWARFFormValue>& value) {
+  if (!value)
+    return std::nullopt;
+  auto text = value->getAsCString();
+  if (!text) {
+    llvm::consumeError(text.takeError());
+    return std::nullopt;
+  }
+  return *text ? std::optional<std::string>(*text) : std::nullopt;
+}
+
+std::string compile_unit_producer(DWARFDie die) {
+  auto* unit = die ? die.getDwarfUnit() : nullptr;
+  if (!unit)
+    return {};
+  return string_value(unit->getUnitDIE().find(dw::DW_AT_producer)).value_or(std::string());
+}
+
+// Qualified display name of an enumeration or record type, including its own name.
+std::string type_display_name(DWARFDie die) {
+  if (die.getTag() != dw::DW_TAG_enumeration_type)
+    return record_display_name(die);
+  const auto own = name(die);
+  if (own.empty())
+    return {};
+  const auto scope = record_display_name(die.getParent());
+  return scope.empty() ? own : scope + "::" + own;
+}
+
+// Describes the type of one template argument structurally. Anything DWARF can express here
+// but this does not yet model throws, so a caller never keeps a partly described argument.
+void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribePath& path) {
+  if (!die) {
+    out.set_kind(api::DebugTemplateType::VOID);
+    return;
+  }
+  const auto offset = die.getOffset();
+  if (!path.insert(offset).second)
+    throw std::runtime_error("cyclic template argument type");
+  struct Leave {
+    DescribePath& path;
+    std::uint64_t offset;
+    ~Leave() { path.erase(offset); }
+  } leave{path, offset};
+  switch (die.getTag()) {
+  case dw::DW_TAG_typedef:
+    describe_template_type(type_of(die), out, path);
+    return;
+  case dw::DW_TAG_const_type:
+    describe_template_type(type_of(die), out, path);
+    out.set_is_const(true);
+    return;
+  case dw::DW_TAG_volatile_type:
+    describe_template_type(type_of(die), out, path);
+    out.set_is_volatile(true);
+    return;
+  case dw::DW_TAG_pointer_type:
+  case dw::DW_TAG_reference_type:
+  case dw::DW_TAG_rvalue_reference_type:
+    out.set_kind(die.getTag() == dw::DW_TAG_pointer_type ? api::DebugTemplateType::POINTER
+                 : die.getTag() == dw::DW_TAG_reference_type
+                     ? api::DebugTemplateType::LVALUE_REFERENCE
+                     : api::DebugTemplateType::RVALUE_REFERENCE);
+    out.set_byte_size(number(die, dw::DW_AT_byte_size, 8));
+    describe_template_type(type_of(die), *out.mutable_element(), path);
+    return;
+  case dw::DW_TAG_base_type:
+    out.set_kind(api::DebugTemplateType::BUILTIN);
+    out.set_name(name(die));
+    out.set_byte_size(number(die, dw::DW_AT_byte_size));
+    out.set_dwarf_encoding(static_cast<std::uint32_t>(number(die, dw::DW_AT_encoding)));
+    return;
+  case dw::DW_TAG_enumeration_type:
+    out.set_kind(api::DebugTemplateType::ENUM);
+    out.set_name(type_display_name(die));
+    out.set_byte_size(number(die, dw::DW_AT_byte_size));
+    if (out.name().empty())
+      throw std::runtime_error("unnamed enumeration template argument");
+    return;
+  case dw::DW_TAG_class_type:
+  case dw::DW_TAG_structure_type:
+  case dw::DW_TAG_union_type: {
+    out.set_kind(api::DebugTemplateType::RECORD);
+    out.set_name(record_display_name(die));
+    out.set_byte_size(number(die, dw::DW_AT_byte_size));
+    if (out.name().empty())
+      throw std::runtime_error("unnamed record template argument");
+    // The record is reached through the argument, so it is described like a record behind a
+    // pointer: only its identity and layout are taken, never an ABI by value.
+    api::DebugInfo nested;
+    try {
+      path.erase(offset);  // describe_record puts the record on the path itself.
+      describe_record(die, nested, true, true, &path);
+      *out.mutable_record() = std::move(nested);
+    } catch (const std::exception&) {
+      out.clear_record();
+    }
+    return;
+  }
+  case dw::DW_TAG_array_type: {
+    out.set_kind(api::DebugTemplateType::ARRAY);
+    describe_template_type(type_of(die), *out.mutable_element(), path);
+    for (const auto child : die.children()) {
+      if (child.getTag() != dw::DW_TAG_subrange_type)
+        continue;
+      if (const auto count = child.find(dw::DW_AT_count); count && count->getAsUnsignedConstant()) {
+        out.set_has_array_count(true);
+        out.set_array_count(*count->getAsUnsignedConstant());
+      } else if (const auto upper = child.find(dw::DW_AT_upper_bound);
+                 upper && upper->getAsUnsignedConstant()) {
+        out.set_has_array_count(true);
+        out.set_array_count(*upper->getAsUnsignedConstant() + 1);
+      }
+    }
+    return;
+  }
+  case dw::DW_TAG_subroutine_type:
+    out.set_kind(api::DebugTemplateType::FUNCTION);
+    describe_template_type(type_of(die), *out.mutable_element(), path);
+    for (const auto child : die.children()) {
+      if (child.getTag() == dw::DW_TAG_formal_parameter)
+        describe_template_type(type_of(child), *out.add_parameters(), path);
+      else if (child.getTag() == dw::DW_TAG_unspecified_parameters)
+        out.set_function_variadic(true);
+    }
+    return;
+  default:
+    throw std::runtime_error("unsupported template argument type");
+  }
+}
+
+// The integral DW_AT_const_value of a value parameter as decimal text. The signedness comes
+// from the parameter's type, because a DWARF data form does not carry it.
+std::optional<std::string> template_constant_text(DWARFDie parameter,
+                                                  const api::DebugTemplateType& type) {
+  const auto value = parameter.find(dw::DW_AT_const_value);
+  if (!value)
+    return std::nullopt;
+  bool is_signed = value->getForm() == dw::DW_FORM_sdata;
+  if (type.kind() == api::DebugTemplateType::BUILTIN)
+    is_signed = type.dwarf_encoding() == dw::DW_ATE_signed ||
+                type.dwarf_encoding() == dw::DW_ATE_signed_char;
+  if (is_signed) {
+    if (const auto signed_value = value->getAsSignedConstant())
+      return std::to_string(*signed_value);
+  } else if (const auto unsigned_value = value->getAsUnsignedConstant()) {
+    return std::to_string(*unsigned_value);
+  }
+  return std::nullopt;
+}
+
+void describe_template_argument(DWARFDie parameter, api::DebugTemplateArgument& out,
+                                DescribePath& path) {
+  out.set_parameter_name(name(parameter));
+  out.set_is_default(number(parameter, dw::DW_AT_default_value) != 0);
+  switch (parameter.getTag()) {
+  case dw::DW_TAG_template_type_parameter:
+    out.set_kind(api::DebugTemplateArgument::TYPE);
+    describe_template_type(type_of(parameter), *out.mutable_type(), path);
+    return;
+  case dw::DW_TAG_template_value_parameter: {
+    out.set_kind(api::DebugTemplateArgument::VALUE);
+    describe_template_type(type_of(parameter), *out.mutable_type(), path);
+    if (const auto text = template_constant_text(parameter, out.type())) {
+      out.set_has_constant_value(true);
+      out.set_constant_value(*text);
+    }
+    return;
+  }
+  case dw::DW_TAG_GNU_template_template_param: {
+    out.set_kind(api::DebugTemplateArgument::TEMPLATE);
+    const auto text = string_value(parameter.find(dw::DW_AT_GNU_template_name));
+    if (!text || text->empty())
+      throw std::runtime_error("template template argument without a name");
+    out.set_template_name(*text);
+    return;
+  }
+  case dw::DW_TAG_GNU_template_parameter_pack:
+    out.set_kind(api::DebugTemplateArgument::PACK);
+    for (const auto element : parameter.children())
+      describe_template_argument(element, *out.add_pack_elements(), path);
+    return;
+  default:
+    throw std::runtime_error("unsupported template parameter tag");
+  }
+}
+
+// Reads the record's template parameters from DWARF. A record with none, or with one this
+// cannot describe, keeps an empty list: the display name is then the only evidence.
+void describe_template_arguments(DWARFDie record, api::DebugInfo& info, DescribePath& path) {
+  info.clear_template_arguments();
+  try {
+    for (const auto child : record.children()) {
+      switch (child.getTag()) {
+      case dw::DW_TAG_template_type_parameter:
+      case dw::DW_TAG_template_value_parameter:
+      case dw::DW_TAG_GNU_template_template_param:
+      case dw::DW_TAG_GNU_template_parameter_pack:
+        describe_template_argument(child, *info.add_template_arguments(), path);
+        break;
+      default:
+        break;
+      }
+    }
+  } catch (const std::exception&) {
+    info.clear_template_arguments();
+  }
+}
+
 // A record in an anonymous namespace is accepted only behind a pointer or reference: the
 // callback then observes an address, and members are read only from the checked DWARF layout.
 // By value it would need the original type's ABI, which no callback representation provides.
-void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer = false) {
+// `template_provenance` adds the DWARF template arguments and the producer. They are evidence
+// for identity checks and diagnostics, not part of an entry's ABI contract, so contract
+// comparisons between two definitions of one function leave them out.
+void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer,
+                     bool template_provenance, DescribePath* path) {
   const bool is_union = record.getTag() == dw::DW_TAG_union_type;
   if (record.getTag() != dw::DW_TAG_class_type && record.getTag() != dw::DW_TAG_structure_type &&
       !is_union) {
     throw std::runtime_error("unsupported debug receiver");
   }
   info.set_record_name(record_display_name(record));
+  if (template_provenance) {
+    DescribePath local;
+    DescribePath& active = path ? *path : local;
+    // A record already on the path keeps only its name and layout; its arguments are on the
+    // path above it.
+    if (active.insert(record.getOffset()).second) {
+      describe_template_arguments(record, info, active);
+      active.erase(record.getOffset());
+    }
+    info.set_producer(compile_unit_producer(record));
+  }
   if (in_anonymous_namespace(record)) {
     if (!behind_pointer)
       throw std::runtime_error("anonymous-namespace record by value is unsupported");
@@ -1131,7 +1364,7 @@ EntryAbi callable_abi(DWARFDie die) {
     info.set_receiver_volatile(shape.receiver_volatile);
     if (complete(shape.receiver)) {
       api::DebugInfo layout;
-      describe_record(shape.receiver, layout);
+      describe_record(shape.receiver, layout, false, false);
       result.receiver = layout.SerializeAsString();
     }
   }
@@ -1143,7 +1376,7 @@ EntryAbi callable_abi(DWARFDie die) {
   info.set_result_is_object_value(returned.value == api::OBJECT);
   if (returned.record && complete(returned.record)) {
     api::DebugInfo layout;
-    describe_record(returned.record, layout, returned.value == api::POINTER);
+    describe_record(returned.record, layout, returned.value == api::POINTER, false);
     result.result = layout.SerializeAsString();
   }
   result.contract = abi.SerializeAsString();
@@ -2050,12 +2283,12 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
           const auto shape = describe_callable(die, decl, display, true, true);
           if (shape.receiver) {
             api::DebugInfo record;
-            describe_record(shape.receiver, record);
+            describe_record(shape.receiver, record, false, false);
           }
           const auto result_type = read_type(type_of(decl));
           if (result_type.record) {
             api::DebugInfo record;
-            describe_record(result_type.record, record, result_type.value == api::POINTER);
+            describe_record(result_type.record, record, result_type.value == api::POINTER, false);
           }
           selector = shape.selector;
           if (shape.variadic)
@@ -2641,6 +2874,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
               describe_methods(shape.receiver, *info);
               info->set_receiver_volatile(shape.receiver_volatile);
             }
+            // The compiler and library release the traced code was built with.
+            info->set_producer(compile_unit_producer(die));
             {
               const auto result_type = read_type(type_of(declaration(die)));
               info->set_result_cpp_type(result_type.spelling);
@@ -2899,7 +3134,7 @@ DebugSymbolPage list_debug_symbols(
           // advertise a method that the existing probe path cannot admit.
           if (shape.receiver) {
             api::DebugInfo receiver_info;
-            describe_record(shape.receiver, receiver_info);
+            describe_record(shape.receiver, receiver_info, false, false);
           }
           const auto& selector = shape.selector;
           if (linkage_symbol.empty()) {

@@ -943,6 +943,38 @@ function(tracer_add_native_repl)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_virtual.cpp"
           "${CMAKE_CXX_COMPILER}" "${_unnamed_receiver_gcc}")
       set_tests_properties(native_repl_virtual_gcc PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+      # Standard-library records resolve their real headers; the fixture is also rebuilt by the
+      # test with a GCC (the SDK's when there is one) in both libstdc++ string ABIs.
+      add_executable(repl-std-headers-target tests/fixtures/repl_std_headers.cpp
+        tests/fixtures/repl_std_headers_main.cpp)
+      set_target_properties(repl-std-headers-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-std-headers-target PRIVATE -g -O0 -fno-inline
+        -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
+      target_link_options(repl-std-headers-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      find_program(_std_headers_gxx NAMES g++ HINTS "${TRACER_SDK_ROOT}/bin" NO_DEFAULT_PATH)
+      if(NOT _std_headers_gxx)
+        find_program(_std_headers_gxx NAMES g++)
+      endif()
+      if(NOT _std_headers_gxx)
+        set(_std_headers_gxx "${CMAKE_CXX_COMPILER}")
+      endif()
+      set(_std_headers_link_flags "-")
+      if(TRACER_SDK_ROOT AND TRACER_DYNAMIC_LOADER)
+        set(_std_headers_link_flags
+          "-Wl,--dynamic-linker=${TRACER_DYNAMIC_LOADER} -Wl,--enable-new-dtags -Wl,-rpath,${TRACER_SDK_ROOT}/x86_64-1a-linux-gnu/lib64:${CMAKE_SYSROOT}/lib64")
+      endif()
+      find_program(_std_headers_dwarfdump NAMES llvm-dwarfdump
+        HINTS "${TRACER_SDK_ROOT}/bin" "${LLVM_TOOLS_BINARY_DIR}")
+      if(NOT _std_headers_dwarfdump)
+        set(_std_headers_dwarfdump "-")
+      endif()
+      add_test(NAME native_repl_std_headers
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_std_headers.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-std-headers-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${_std_headers_gxx}"
+          "${_std_headers_link_flags}" "${_std_headers_dwarfdump}")
+      set_tests_properties(native_repl_std_headers PROPERTIES TIMEOUT 900)
       add_executable(repl-variadic-target tests/fixtures/repl_variadic.cpp)
       set_target_properties(repl-variadic-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-variadic-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer

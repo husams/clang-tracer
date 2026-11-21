@@ -1497,6 +1497,63 @@ thread-local suppression of nested callbacks and events. Its side effects still
 occur. Receiver construction, allocation, destruction and static data member
 guards continue to apply to callback code.
 
+### Standard-library records without headers
+
+A callable that takes, returns or belongs to a standard-library record (`std::string`,
+`std::vector<Person>`, `std::array<int, 4>`, ...) needs that record's real definition: its
+layout and calling convention come from the compiler, never from a rebuilt class. When a probe
+names no header (no `--include`, no `#include` in the callback, no forced include), the agent
+chooses the real standard headers itself:
+
+- the records come from the target's DWARF, including the records its template arguments
+  name, so `std::chrono::duration` inside a `std::vector` brings in `<chrono>` too;
+- each record is mapped to its public header through a table (`std::basic_string` to `<string>`,
+  `std::vector` to `<vector>`, `std::map` to `<map>`, `std::unique_ptr` to `<memory>`, ...). The
+  key is the primary template without template arguments and without inline ABI namespaces
+  (`std::__cxx11`, `std::__1`), so the header's own ABI macros pick the namespace;
+- the headers are compiled with the agent's own toolchain, as a plain `#include` in the callback
+  source, then the compiler's specialization is compared with the DWARF description (template
+  arguments by kind, layout, size) before it is used. A program's own record that appears only
+  as a template argument (the `Person` of `std::vector<Person>`) is recovered from DWARF as for
+  any other program record; standard-library records are never recovered that way.
+
+A record the table does not cover is reported with the exact entry that maps it:
+
+```text
+error: ... standard-library record std::uniform_real_distribution (argument 0) has no header
+mapping: map it with --std-header std::uniform_real_distribution=<header>, or supply its real
+header with --include or an #include in the callback
+```
+
+`--std-header RECORD=HEADER` (repeatable, accepted wherever `--include` is) extends or overrides the
+table for one probe. `RECORD` is a qualified record name without template arguments or inline ABI
+namespaces, in `std::`, `__gnu_cxx::` or `__cxxabiv1::`; `HEADER` is `<name>` or an absolute path.
+
+The libstdc++ string ABI follows the target: DWARF that shows `std::__cxx11::basic_string` selects
+`_GLIBCXX_USE_CXX11_ABI=1` and DWARF that shows `std::basic_string` selects `0`, whatever the agent's
+own default is. A `--compile-option -D_GLIBCXX_USE_CXX11_ABI=...` that disagrees with the
+target, an option such as `-D_GLIBCXX_DEBUG` that makes the headers define a different type, or a
+standard library whose definition differs from the target's all end in a message that names
+the headers chosen, the agent toolchain (libstdc++ release, default ABI, runtime), the compiler
+that built the target and the ways out: the target's own headers through `--include` with
+`--compdb`, or a different `--std-header`. A header the agent's toolchain does not have is
+reported as a missing standard header, not as a type mismatch.
+
+Explicit headers are the unchanged baseline: with `--include`, an `#include` in the callback or a
+forced include, nothing is chosen automatically and the same checks (including
+the libstdc++ ABI check against the headers' own `_GLIBCXX_USE_CXX11_ABI`) apply.
+
+`%probe resolve` prints what the resolver read from DWARF. For a template specialization the
+record carries `template_arguments`, one entry per DW_TAG_template_type_parameter,
+DW_TAG_template_value_parameter (with its type and integral value),
+DW_TAG_GNU_template_template_param and DW_TAG_GNU_template_parameter_pack (with its elements).
+Types are described structurally: builtin, enumeration, record (itself described the same way),
+pointer, reference, array and function types keep their qualifiers and shape. The identity check
+that selects the compiler's record compares these by kind; a record whose arguments DWARF does not
+describe (for example only a declaration of it exists in the program) is compared by its display
+name as before. `DebugInfo.template_arguments` and `DebugInfo.producer` are new, optional fields:
+an older consumer ignores them.
+
 ### Probe working directory
 
 Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.

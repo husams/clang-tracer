@@ -158,6 +158,46 @@ message DebugInfo {
   // One entry per enclosing scope of record_name, outermost first. Empty means every scope
   // is a namespace.
   repeated RecordScopeKind record_scopes = 29;
+  // The record's DW_TAG_template_*_parameter / DW_TAG_GNU_template_* children, in declaration
+  // order. Empty for a record that is not a template specialization or whose arguments could
+  // not be described; the display name alone then remains the only (textual) evidence.
+  repeated DebugTemplateArgument template_arguments = 30;
+  // DW_AT_producer of the compile unit that defines this record (callable's unit for the
+  // callable's own description). Diagnostics only: it names the compiler and library release
+  // the target was built with.
+  string producer = 31;
+}
+// One template argument as the target's debug data describes it, with its kind kept apart
+// so that a type, a constant, a template and a pack are never compared as text.
+message DebugTemplateArgument {
+  enum Kind { KIND_UNSPECIFIED = 0; TYPE = 1; VALUE = 2; TEMPLATE = 3; PACK = 4; }
+  Kind kind = 1;
+  string parameter_name = 2;   // DW_AT_name of the parameter; may be empty.
+  DebugTemplateType type = 3;  // TYPE: the argument. VALUE: the type of the constant.
+  bool has_constant_value = 4; // VALUE: an integral DW_AT_const_value was present.
+  string constant_value = 5;   // VALUE: decimal text of that value, interpreted through `type`.
+  string template_name = 6;    // TEMPLATE: DW_AT_GNU_template_name.
+  repeated DebugTemplateArgument pack_elements = 7; // PACK: DW_TAG_GNU_template_parameter_pack children.
+  bool is_default = 8;         // DW_AT_default_value was set on the parameter.
+}
+// A type reached through a template argument, kept structural.
+message DebugTemplateType {
+  enum Kind {
+    UNSPECIFIED = 0; BUILTIN = 1; RECORD = 2; ENUM = 3; POINTER = 4;
+    LVALUE_REFERENCE = 5; RVALUE_REFERENCE = 6; ARRAY = 7; FUNCTION = 8; VOID = 9;
+  }
+  Kind kind = 1;
+  string name = 2;              // BUILTIN: DW_AT_name. RECORD/ENUM: qualified display name.
+  bool is_const = 3;
+  bool is_volatile = 4;
+  DebugTemplateType element = 5;       // POINTER/REFERENCE/ARRAY target; FUNCTION result.
+  bool has_array_count = 6;
+  uint64 array_count = 7;              // ARRAY: element count when DWARF bounds give one.
+  repeated DebugTemplateType parameters = 8; // FUNCTION parameter types.
+  bool function_variadic = 9;
+  uint64 byte_size = 10;               // BUILTIN/ENUM/RECORD size.
+  uint32 dwarf_encoding = 11;          // BUILTIN DW_AT_encoding.
+  DebugInfo record = 12;               // RECORD: its description, when it could be described.
 }
 message DebugMethod {
   string name = 1;
@@ -303,6 +343,9 @@ message ProbeSpec {
   repeated SnapshotRttiRange snapshot_rtti_ranges = 45;
   repeated string snapshot_receiver_fields = 46; // Receiver fields used by object watch comparison.
   uint64 object_watch_id = 47; // Assigned by the server for grouped methods.
+  // "RECORD=HEADER" entries that extend or override the standard-library header map used when a
+  // probe has no explicit headers; see docs/native-repl.md.
+  repeated string standard_headers = 48;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -363,6 +406,7 @@ message ResolveProbeRequest {
   PreparedInjector prepared = 9;
   string translation_unit = 10; // Optional entry in the server-host compilation database.
   repeated string extra_compile_arguments = 11;
+  repeated string standard_headers = 12; // "RECORD=HEADER" entries, copied to ProbeSpec.
 }
 message ValidateProbeRequest {
   string session_id = 1;
@@ -379,6 +423,7 @@ message ValidateProbeRequest {
   PreparedInjector prepared = 11;
   string translation_unit = 12; // Optional entry in the server-host compilation database.
   repeated string extra_compile_arguments = 13;
+  repeated string standard_headers = 20; // "RECORD=HEADER" entries, copied to ProbeSpec.
   bool allow_argument_overrides = 18;
   bool allow_result_override = 19;
   bool allow_replacement = 14;
