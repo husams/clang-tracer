@@ -1602,6 +1602,89 @@ bool split_debug_template_arguments(llvm::StringRef spelling,
   return !arguments.empty();
 }
 
+// Recovered declarations are parsed in the synthetic main file or have no source
+// location. Only declarations from included files belong to real headers.
+bool debug_record_from_header(const clang::CXXRecordDecl *record) {
+  const auto &sources = record->getASTContext().getSourceManager();
+  const auto location = sources.getExpansionLoc(record->getLocation());
+  return location.isValid() && !sources.isWrittenInMainFile(location);
+}
+
+// Rebuild the declaration scope of a recovered record from the DWARF scope kinds:
+// namespaces become namespaces and enclosing classes and unions keep their kind. An enclosing
+// record found in the AST (for example from a real header) is reused; a missing one is a bare
+// stand-in that says nothing about the original enclosing type's layout or ABI.
+// `real_enclosing` is set to the first enclosing record that came from a header.
+clang::DeclContext *recovered_debug_scope(clang::ASTContext &context,
+                                          const clangtracer::v1::DebugInfo &info,
+                                          llvm::StringRef &name, const char *error,
+                                          const clang::CXXRecordDecl **real_enclosing = nullptr,
+                                          bool create_missing = true) {
+  clang::DeclContext *scope = context.getTranslationUnitDecl();
+  llvm::StringRef remaining = info.record_name();
+  int depth = 0;
+  while (::tracer::compat::contains(remaining, "::")) {
+    auto part = remaining.split("::");
+    if (!debug_identifier(part.first))
+      throw std::runtime_error(error);
+    const auto kind = depth < info.record_scopes_size()
+                          ? info.record_scopes(depth)
+                          : clangtracer::v1::RECORD_SCOPE_NAMESPACE;
+    const bool is_record = kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE;
+    ++depth;
+    auto &id = context.Idents.get(part.first);
+    clang::DeclContext *next = nullptr;
+    for (auto *named : scope->lookup(&id)) {
+      if (is_record) {
+        if (auto *enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(named)) {
+          next = enclosing;
+          if (real_enclosing && !*real_enclosing && debug_record_from_header(enclosing))
+            *real_enclosing = enclosing;
+        }
+      } else if (auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(named)) {
+        next = ns;
+      }
+      if (next)
+        break;
+    }
+    if (!next && !create_missing)
+      return nullptr;
+    if (!next && is_record) {
+      auto *enclosing = clang::CXXRecordDecl::Create(
+          context,
+          kind == clangtracer::v1::RECORD_SCOPE_UNION ? clang::TagTypeKind::Union
+                                                      : clang::TagTypeKind::Struct,
+          scope, {}, {}, &id);
+      if (scope->isRecord())
+        enclosing->setAccess(clang::AS_public);
+      scope->addDecl(enclosing);
+      enclosing->startDefinition();
+      enclosing->completeDefinition();
+      next = enclosing;
+    } else if (!next) {
+      auto *ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
+                                              nullptr, false);
+      scope->addDecl(ns);
+      next = ns;
+    }
+    scope = next;
+    remaining = part.second;
+  }
+  name = remaining;
+  return scope;
+}
+
+// A real enclosing class from a header cannot receive a synthesized nested definition: importing
+// it would drag the real parent along and redefine it when the header is parsed again.
+void reject_real_enclosing(const clang::CXXRecordDecl *real_enclosing,
+                           const clangtracer::v1::DebugInfo &info) {
+  if (real_enclosing)
+    throw std::runtime_error(
+        "header class " + real_enclosing->getQualifiedNameAsString() +
+        " does not define its nested record in " + info.record_name() +
+        "; the header must define that nested type");
+}
+
 bool debug_record_identity_matches(clang::ASTContext &context,
                                    const clang::CXXRecordDecl *record,
                                    llvm::StringRef expected,
@@ -1887,30 +1970,18 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     return {record, std::move(metadata), true};
   }
   if (!record && info.record_is_opaque()) {
-    clang::DeclContext *scope = context.getTranslationUnitDecl();
-    llvm::StringRef remaining = info.record_name();
-    while (::tracer::compat::contains(remaining, "::")) {
-      auto part = remaining.split("::");
-      if (!debug_identifier(part.first))
-        throw std::runtime_error("unsupported debug record scope");
-      auto &id = context.Idents.get(part.first);
-      clang::NamespaceDecl *ns = nullptr;
-      for (auto *named : scope->lookup(&id))
-        if ((ns = llvm::dyn_cast<clang::NamespaceDecl>(named)))
-          break;
-      if (!ns) {
-        ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
-                                          nullptr, false);
-        scope->addDecl(ns);
-      }
-      scope = ns;
-      remaining = part.second;
-    }
+    llvm::StringRef remaining;
+    const clang::CXXRecordDecl *real_enclosing = nullptr;
+    clang::DeclContext *scope = recovered_debug_scope(
+        context, info, remaining, "unsupported debug record scope", &real_enclosing);
+    reject_real_enclosing(real_enclosing, info);
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug record name");
     record = clang::CXXRecordDecl::Create(
         context, clang::TagTypeKind::Struct, scope, {}, {},
         &context.Idents.get(remaining));
+    if (scope->isRecord())
+      record->setAccess(clang::AS_public);
     scope->addDecl(record);
     clangtracer::v1::ReceiverContext metadata;
     metadata.set_record_name(info.record_name());
@@ -1920,30 +1991,18 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     return {record, std::move(metadata), true};
   }
   if (!record) {
-    clang::DeclContext *scope = context.getTranslationUnitDecl();
-    llvm::StringRef remaining = info.record_name();
-    while (::tracer::compat::contains(remaining, "::")) {
-      auto part = remaining.split("::");
-      if (!debug_identifier(part.first))
-        throw std::runtime_error("unsupported debug receiver scope");
-      auto &id = context.Idents.get(part.first);
-      clang::NamespaceDecl *ns = nullptr;
-      for (auto *named : scope->lookup(&id))
-        if ((ns = llvm::dyn_cast<clang::NamespaceDecl>(named)))
-          break;
-      if (!ns) {
-        ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
-                                          nullptr, false);
-        scope->addDecl(ns);
-      }
-      scope = ns;
-      remaining = part.second;
-    }
+    llvm::StringRef remaining;
+    const clang::CXXRecordDecl *real_enclosing = nullptr;
+    clang::DeclContext *scope = recovered_debug_scope(
+        context, info, remaining, "unsupported debug receiver scope", &real_enclosing);
+    reject_real_enclosing(real_enclosing, info);
     if (!debug_identifier(remaining))
       throw std::runtime_error("unsupported debug receiver name");
     record =
         clang::CXXRecordDecl::Create(context, clang::TagTypeKind::Class, scope,
                                      {}, {}, &context.Idents.get(remaining));
+    if (scope->isRecord())
+      record->setAccess(clang::AS_public);
     scope->addDecl(record);
     record->startDefinition();
     for (const auto &field : info.fields()) {
@@ -2077,8 +2136,11 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
     }
   };
   const auto rename_record = [&](clangtracer::v1::DebugInfo &record) {
-    if (const auto found = names.find(record.record_name()); found != names.end())
+    if (const auto found = names.find(record.record_name()); found != names.end()) {
       record.set_record_name(found->second);
+      // The private name lives in a namespace, whatever scopes the original had.
+      record.clear_record_scopes();
+    }
     for (auto &method : *record.mutable_methods()) {
       rename_type(*method.mutable_cpp_result_type());
       for (auto &parameter : *method.mutable_cpp_parameter_types())
@@ -2099,33 +2161,60 @@ std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
   return recovered;
 }
 
-std::string recovered_record_declaration(
-    const clangtracer::v1::DebugInfo &info) {
-  if (info.record_name().empty())
-    return {};
-  std::string result;
-  std::vector<std::string> namespaces;
-  llvm::StringRef name(info.record_name());
+struct RecoveredScopePart {
+  std::string name;
+  int kind;  // RecordScopeKind
+};
+
+// Split a recovered record name into its enclosing scopes (with their kinds) and its own name.
+std::vector<RecoveredScopePart> recovered_record_scopes(
+    const clangtracer::v1::DebugInfo &info, llvm::StringRef &name) {
+  std::vector<RecoveredScopePart> scopes;
+  name = info.record_name();
   while (::tracer::compat::contains(name, "::")) {
     auto part = name.split("::");
     if (!debug_identifier(part.first))
       throw std::runtime_error("unsupported recovered record namespace");
-    namespaces.push_back(part.first.str());
+    const auto depth = static_cast<int>(scopes.size());
+    scopes.push_back({part.first.str(), depth < info.record_scopes_size()
+                                            ? static_cast<int>(info.record_scopes(depth))
+                                            : static_cast<int>(clangtracer::v1::RECORD_SCOPE_NAMESPACE)});
     name = part.second;
   }
   if (!debug_identifier(name))
     throw std::runtime_error("unsupported recovered record name");
-  for (const auto &part : namespaces)
-    result += "namespace " + part + " { ";
+  return scopes;
+}
+
+// The record's own declaration, without its enclosing scopes. `nested` is the text of records
+// declared inside it.
+std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
+                                  llvm::StringRef name, const std::string &nested = {}) {
+  std::string result;
   if (info.record_is_opaque()) {
-    result += "class " + name.str() + "; ";
+    if (nested.empty()) {
+      result += "class " + name.str() + "; ";
+    } else {
+      // The record is only named by pointer, but it must be complete to hold the nested
+      // declarations. Give the stand-in the size and alignment DWARF recorded so that the
+      // layout check against the opaque type holds; nothing is claimed about its members.
+      result += "class " + name.str() + " { public: " + nested;
+      if (info.record_size() != 0) {
+        const auto alignment = info.record_alignment() > 1 ? info.record_alignment() : 1;
+        result += "alignas(" + std::to_string(alignment) + ") unsigned char tracer_opaque_storage[" +
+                  std::to_string(info.record_size()) + "]; ";
+      }
+      result += "}; ";
+    }
   } else {
     result += "class";
     if (info.record_alignment() > 1)
       result += " alignas(" + std::to_string(info.record_alignment()) + ")";
     result += " " + name.str();
     result += " { ";
-    std::string access;
+    if (!nested.empty())
+      result += "public: " + nested;
+    std::string access = nested.empty() ? std::string() : "public";
     for (const auto &field : info.fields()) {
       if (!debug_identifier(field.name()))
         throw std::runtime_error("unsupported recovered field name");
@@ -2174,20 +2263,159 @@ std::string recovered_record_declaration(
     }
     result += "}; ";
   }
-  for (std::size_t i = 0; i < namespaces.size(); ++i)
-    result += "} ";
+  return result;
+}
+
+// One name declared inside an enclosing class or union: a scope that only holds other
+// declarations, a recovered record, or both.
+struct RecoveredScopeNode {
+  std::string name;
+  int kind = clangtracer::v1::RECORD_SCOPE_CLASS;
+  const clangtracer::v1::DebugInfo *record = nullptr;
+  std::vector<RecoveredScopeNode> children;
+};
+
+std::string emit_recovered_scope(const RecoveredScopeNode &node) {
+  // Forward declarations first: a method may name a sibling declared later, or a cycle.
+  std::string inner;
+  for (const auto &child : node.children) {
+    const char *keyword = child.record ? "class"
+                          : child.kind == clangtracer::v1::RECORD_SCOPE_UNION ? "union" : "struct";
+    inner += std::string(keyword) + " " + child.name + "; ";
+  }
+  // A forward declaration cannot supply `Sibling::Inner`: a sibling whose nested name is used
+  // by another must be defined first. Keep the original order, except for that dependency.
+  std::vector<std::string> texts;
+  for (const auto &child : node.children)
+    texts.push_back(emit_recovered_scope(child));
+  std::vector<bool> emitted(texts.size(), false);
+  const auto blocked = [&](std::size_t index) {
+    for (std::size_t other = 0; other < texts.size(); ++other)
+      if (other != index && !emitted[other] &&
+          texts[index].find("::" + node.children[other].name + "::") != std::string::npos)
+        return true;
+    return false;
+  };
+  for (std::size_t count = 0; count < texts.size(); ++count) {
+    std::size_t pick = texts.size();
+    for (std::size_t i = 0; i < texts.size() && pick == texts.size(); ++i)
+      if (!emitted[i] && !blocked(i))
+        pick = i;
+    if (pick == texts.size())  // A dependency cycle: fall back to the original order.
+      pick = static_cast<std::size_t>(std::find(emitted.begin(), emitted.end(), false) -
+                                      emitted.begin());
+    emitted[pick] = true;
+    inner += texts[pick];
+  }
+  if (node.record)
+    return recovered_record_body(*node.record, node.name, inner);
+  // A struct keeps the nested records public, matching the member access DWARF recorded.
+  const char *keyword = node.kind == clangtracer::v1::RECORD_SCOPE_UNION ? "union" : "struct";
+  return std::string(keyword) + " " + node.name + " { " + inner + "}; ";
+}
+
+// Declarations for a set of recovered records. Records that share an enclosing class, or are
+// one, are emitted as one declaration tree, because a class cannot be reopened.
+std::string recovered_record_group(
+    const std::vector<const clangtracer::v1::DebugInfo *> &records) {
+  struct Parsed {
+    const clangtracer::v1::DebugInfo *info;
+    std::vector<RecoveredScopePart> scopes;
+    std::string name;
+  };
+  std::vector<Parsed> parsed;
+  std::unordered_set<std::string> enclosing;  // Qualified names that enclose another record.
+  for (const auto *info : records) {
+    llvm::StringRef name;
+    auto scopes = recovered_record_scopes(*info, name);
+    std::string path;
+    for (const auto &part : scopes) {
+      path += (path.empty() ? "" : "::") + part.name;
+      if (part.kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE)
+        enclosing.insert(path);
+    }
+    parsed.push_back({info, std::move(scopes), name.str()});
+  }
+  struct Item {
+    std::string key;
+    std::vector<std::string> namespaces;
+    RecoveredScopeNode root;
+    std::string plain;
+  };
+  std::vector<Item> items;
+  for (const auto &entry : parsed) {
+    const auto &scopes = entry.scopes;
+    std::string full;
+    for (const auto &part : scopes)
+      full += part.name + "::";
+    full += entry.name;
+    // Components from the first enclosing record onward form the tree; the record itself is
+    // one more node when it is nested or itself encloses another record.
+    auto first_record = std::find_if(scopes.begin(), scopes.end(), [](const auto &part) {
+      return part.kind != clangtracer::v1::RECORD_SCOPE_NAMESPACE;
+    });
+    const bool encloses = enclosing.count(full) != 0;
+    if (first_record == scopes.end() && !encloses) {
+      std::string text;
+      for (const auto &part : scopes)
+        text += "namespace " + part.name + " { ";
+      text += recovered_record_body(*entry.info, entry.name);
+      for (std::size_t i = 0; i < scopes.size(); ++i)
+        text += "} ";
+      items.push_back({{}, {}, {}, std::move(text)});
+      continue;
+    }
+    std::vector<RecoveredScopePart> chain(first_record, scopes.end());
+    chain.push_back({entry.name, clangtracer::v1::RECORD_SCOPE_CLASS});
+    std::vector<std::string> namespaces;
+    std::string key;
+    for (auto it = scopes.begin(); it != first_record; ++it) {
+      namespaces.push_back(it->name);
+      key += it->name + "::";
+    }
+    key += chain.front().name;
+    auto item = std::find_if(items.begin(), items.end(),
+                             [&](const Item &candidate) { return candidate.key == key; });
+    if (item == items.end()) {
+      items.push_back({key, std::move(namespaces), {chain.front().name, chain.front().kind}, {}});
+      item = std::prev(items.end());
+    }
+    RecoveredScopeNode *node = &item->root;
+    for (std::size_t i = 1; i < chain.size(); ++i) {
+      auto child = std::find_if(node->children.begin(), node->children.end(),
+                                [&](const auto &candidate) { return candidate.name == chain[i].name; });
+      if (child == node->children.end()) {
+        node->children.push_back({chain[i].name, chain[i].kind, nullptr, {}});
+        child = std::prev(node->children.end());
+      }
+      node = &*child;
+    }
+    node->record = entry.info;
+  }
+  std::string result;
+  for (const auto &item : items) {
+    if (item.key.empty()) {
+      result += item.plain;
+      continue;
+    }
+    for (const auto &part : item.namespaces)
+      result += "namespace " + part + " { ";
+    result += emit_recovered_scope(item.root);
+    for (std::size_t i = 0; i < item.namespaces.size(); ++i)
+      result += "} ";
+  }
   return result;
 }
 
 std::string recovered_record_declarations(
     const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
-  std::string declarations;
+  std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
   auto append = [&](const clangtracer::v1::DebugInfo &record) {
     if (!record.record_name().empty() &&
         seen.insert(record.record_name()).second)
-      declarations += recovered_record_declaration(record);
+      records.push_back(&record);
   };
   if (!info.record_name().empty())
     append(info);
@@ -2196,7 +2424,7 @@ std::string recovered_record_declarations(
       append(argument.object_type());
   if (info.has_result_object_type())
     append(info.result_object_type());
-  return declarations;
+  return recovered_record_group(records);
 }
 
 bool ast_has_debug_record(clang::ASTContext &context,
@@ -2220,15 +2448,16 @@ bool ast_has_debug_record(clang::ASTContext &context,
 
 std::string missing_recovered_record_declarations(
     clang::ASTContext &context,
-    const clangtracer::v1::ProbeSpec &spec) {
-  std::string declarations;
+    const clangtracer::v1::ProbeSpec &spec, bool check_enclosing = false) {
+  std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
   const auto append = [&](const clangtracer::v1::DebugInfo &record) {
     if (record.record_name().empty() ||
+        standard_library_record_name(record.record_name()) ||
         !seen.insert(record.record_name()).second ||
         ast_has_debug_record(context, record))
       return;
-    declarations += recovered_record_declaration(record);
+    records.push_back(&record);
   };
   const auto &info = spec.debug_info();
   if (!info.record_name().empty())
@@ -2238,7 +2467,15 @@ std::string missing_recovered_record_declarations(
       append(argument.object_type());
   if (info.has_result_object_type())
     append(info.result_object_type());
-  return declarations;
+  if (check_enclosing)
+    for (const auto *record : records) {
+      llvm::StringRef name;
+      const clang::CXXRecordDecl *real_enclosing = nullptr;
+      recovered_debug_scope(context, *record, name, "unsupported debug record scope",
+                            &real_enclosing, false);
+      reject_real_enclosing(real_enclosing, *record);
+    }
+  return recovered_record_group(records);
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
@@ -2351,72 +2588,85 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       headers += recovered_record_declarations(spec);
     if (!callback_includes.empty())
       headers = callback_includes + headers;
-    auto capture = std::make_unique<DiagnosticCapture>(nullptr);
-    if (spec.has_header_context()) {
-      const auto &header_context = spec.header_context();
-      const auto &directory = header_context.working_directory();
-      if (spec.include_headers().empty() || directory.empty() ||
-          directory.front() != '/' || directory.size() > 4095 ||
-          directory.find('\0') != std::string::npos ||
-          header_context.ByteSizeLong() > 64 * 1024 ||
-          header_context.compiler_arguments_size() > 512)
-        throw std::runtime_error("invalid header compilation context");
-      auto arguments = tracer::runtime::jit_arguments();
-      arguments.insert(arguments.end(),
-                       header_context.compiler_arguments().begin(),
-                       header_context.compiler_arguments().end());
-      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
-                       spec.extra_compile_arguments().end());
-      bool resource_dir = false;
-      for (const auto &argument : arguments) {
-        if (argument.find('\0') != std::string::npos)
-          throw std::runtime_error("invalid header compiler argument");
-        resource_dir |= argument == "-resource-dir" ||
-                        ::tracer::compat::starts_with(argument, "-resource-dir=");
+    const auto parse_types = [&] {
+      auto capture = std::make_unique<DiagnosticCapture>(nullptr);
+      if (spec.has_header_context()) {
+        const auto &header_context = spec.header_context();
+        const auto &directory = header_context.working_directory();
+        if (spec.include_headers().empty() || directory.empty() ||
+            directory.front() != '/' || directory.size() > 4095 ||
+            directory.find('\0') != std::string::npos ||
+            header_context.ByteSizeLong() > 64 * 1024 ||
+            header_context.compiler_arguments_size() > 512)
+          throw std::runtime_error("invalid header compilation context");
+        auto arguments = tracer::runtime::jit_arguments();
+        arguments.insert(arguments.end(),
+                         header_context.compiler_arguments().begin(),
+                         header_context.compiler_arguments().end());
+        arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                         spec.extra_compile_arguments().end());
+        bool resource_dir = false;
+        for (const auto &argument : arguments) {
+          if (argument.find('\0') != std::string::npos)
+            throw std::runtime_error("invalid header compiler argument");
+          resource_dir |= argument == "-resource-dir" ||
+                          ::tracer::compat::starts_with(argument, "-resource-dir=");
+        }
+        if (!resource_dir)
+          arguments.push_back(std::string("-resource-dir=") +
+                              tracer::runtime::clang_resource_dir());
+        arguments.insert(arguments.end(), {"-x", "c++"});
+        auto physical_fs = llvm::vfs::createPhysicalFileSystem();
+        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
+            physical_fs.release());
+        if (auto ec = private_fs->setCurrentWorkingDirectory(directory))
+          throw std::runtime_error("cannot use header working directory: " +
+                                   ec.message());
+        // Map a synthetic TU, never the compilation database's donor .cpp.
+        // The private filesystem keeps the target's process-wide cwd unchanged.
+        const auto input =
+            (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
+                .string();
+        output = clang::tooling::buildASTFromCodeWithArgs(
+            headers, arguments, input, "clang-tracer",
+            std::make_shared<clang::PCHContainerOperations>(),
+            clang::tooling::getClangStripDependencyFileAdjuster(), {},
+            capture.get(), std::move(private_fs));
+      } else {
+        auto arguments = tracer::runtime::jit_arguments();
+        arguments.insert(arguments.end(),
+                         {"-std=c++20", "-x", "c++",
+                          std::string("-resource-dir=") +
+                              tracer::runtime::clang_resource_dir()});
+        arguments.insert(arguments.end(), spec.compile_options().begin(),
+                         spec.compile_options().end());
+        arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                         spec.extra_compile_arguments().end());
+        output = clang::tooling::buildASTFromCodeWithArgs(
+            headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
+            std::make_shared<clang::PCHContainerOperations>(),
+            clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
       }
-      if (!resource_dir)
-        arguments.push_back(std::string("-resource-dir=") +
-                            tracer::runtime::clang_resource_dir());
-      arguments.insert(arguments.end(), {"-x", "c++"});
-      auto physical_fs = llvm::vfs::createPhysicalFileSystem();
-      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
-          physical_fs.release());
-      if (auto ec = private_fs->setCurrentWorkingDirectory(directory))
-        throw std::runtime_error("cannot use header working directory: " +
-                                 ec.message());
-      // Map a synthetic TU, never the compilation database's donor .cpp.
-      // The private filesystem keeps the target's process-wide cwd unchanged.
-      const auto input =
-          (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
-              .string();
-      output = clang::tooling::buildASTFromCodeWithArgs(
-          headers, arguments, input, "clang-tracer",
-          std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripDependencyFileAdjuster(), {},
-          capture.get(), std::move(private_fs));
-    } else {
-      auto arguments = tracer::runtime::jit_arguments();
-      arguments.insert(arguments.end(),
-                       {"-std=c++20", "-x", "c++",
-                        std::string("-resource-dir=") +
-                            tracer::runtime::clang_resource_dir()});
-      arguments.insert(arguments.end(), spec.compile_options().begin(),
-                       spec.compile_options().end());
-      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
-                       spec.extra_compile_arguments().end());
-      output = clang::tooling::buildASTFromCodeWithArgs(
-          headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
-          std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
+      auto *diagnostics = capture.get();
+      // AST import can report diagnostics after this function returns. Clang's
+      // tooling APIs borrow the consumer, so give the retained AST ownership.
+      if (output)
+        output->getDiagnostics().setClient(capture.release(), true);
+      if (!output || diagnostics->had_error())
+        throw std::runtime_error("cannot create debug type AST: " +
+                                 diagnostics->message());
+    };
+    parse_types();
+    if (headers_available) {
+      // Parse real headers first, then recover all missing records together so
+      // enclosing layouts and dependencies between nested types remain intact.
+      const auto missing =
+          missing_recovered_record_declarations(output->getASTContext(), spec, true);
+      if (!missing.empty()) {
+        headers += missing;
+        parse_types();
+      }
     }
-    auto *diagnostics = capture.get();
-    // AST import can report diagnostics after this function returns. Clang's
-    // tooling APIs borrow the consumer, so give the retained AST ownership.
-    if (output)
-      output->getDiagnostics().setClient(capture.release(), true);
-    if (!output || diagnostics->had_error())
-      throw std::runtime_error("cannot create debug type AST: " +
-                               diagnostics->message());
     auto &context = output->getASTContext();
     const auto &triple = context.getTargetInfo().getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -4370,7 +4620,7 @@ public:
       for (const auto &entry : *records_) {
         // Real header definitions are parsed below. Import only synthesized
         // DWARF records here, otherwise the later #include redefines them.
-        if (header_types_ && entry.decl->getLocation().isValid())
+        if (header_types_ && debug_record_from_header(entry.decl))
           continue;
         if (auto err = importer.ImportDefinition(entry.decl)) {
           *validation_error_ = llvm::toString(std::move(err));
@@ -4389,7 +4639,7 @@ public:
         imported_targets.push_back(target);
       }
     if (donor_record_ &&
-        !(header_types_ && donor_record_->getLocation().isValid())) {
+        !(header_types_ && debug_record_from_header(donor_record_))) {
       if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
         *validation_error_ = llvm::toString(std::move(import_error));
         return;
@@ -4431,7 +4681,7 @@ public:
     }
     if (header_types_ && records_)
       for (const auto &entry : *records_) {
-        if (entry.decl->getLocation().isInvalid())
+        if (!debug_record_from_header(entry.decl))
           continue;
         auto &context = compiler.getASTContext();
         auto *record =
@@ -5875,7 +6125,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   // callback TU. Only records synthesized from DWARF need AST import.
   const bool callback_header_receiver =
       callback_header_types && receiver_record &&
-      receiver_record->getLocation().isValid();
+      debug_record_from_header(receiver_record);
   const std::string header_receiver_alias =
       callback_header_receiver
           ? "namespace tracer { using ResolvedTarget = const " +
@@ -6358,7 +6608,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       // again creates duplicate specializations and builtin declarations.
       if (standard_library_record_name(entry.layout.record_name()))
         continue;
-      if (callback_header_types && entry.decl->getLocation().isValid())
+      if (callback_header_types && debug_record_from_header(entry.decl))
         continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
