@@ -277,6 +277,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_temporary_vectors.py"
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_temporary_vectors PROPERTIES TIMEOUT 180)
+    add_test(NAME native_repl_array_expressions
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_array_expressions.py"
+        $<TARGET_FILE:clang-tracer-repl>)
+    set_tests_properties(native_repl_array_expressions PROPERTIES TIMEOUT 120)
     add_test(NAME native_repl_plugins
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_plugins.py"
         $<TARGET_FILE:clang-tracer-repl> "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")

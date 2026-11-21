@@ -1566,6 +1566,12 @@ earlier variables, sessions and background collectors remain usable. Bare
 top-level void calls retain their optional trailing semicolon. Temporary
 collections can be inspected directly, including `live.snapshot().size()`.
 
+Bare array expressions, including string literals such as `"banking"`, are
+rejected before execution because Clang's array value capture is unsupported.
+The rejected cell does not change existing variables or require `%cpp reset`;
+`1 + 1` and later C++ input remain usable. Add `;` to discard the value, or use
+`std::cout << "banking" << '\n';` to print a string explicitly.
+
 ### C++17 event ranges
 
 Synchronous collection waits for the count, timeout (30 seconds by default),
