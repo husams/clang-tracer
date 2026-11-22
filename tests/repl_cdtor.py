@@ -1,8 +1,10 @@
 """Observe constructors and destructors: every Itanium entry point, on every path.
 
 The fixture (tests/fixtures/repl_cdtor.*) constructs and destroys a plain class (C1/C2 and D1/D2
-are one body), a class template, and a virtual-inheritance hierarchy whose base-object entry
-points take a hidden VTT argument and whose destructor is deleted through a base pointer (D0).
+are one body), a class template, a virtual-inheritance hierarchy whose base-object entry
+points take a hidden VTT argument and whose destructor is deleted through a base pointer (D0),
+and a class template with a virtual base (hidden VTT argument, constructor named without its
+template arguments).
 One "g" byte makes the fixture do one exact pass, so every count below is exact.
 """
 
@@ -29,6 +31,8 @@ BOX_CTOR = "cdtor::Box<int>::Box(int)"
 BOX_DTOR = "cdtor::Box<int>::~Box()"
 LEAF_CTOR = "cdtor::Leaf::Leaf(int)"
 HOLDER = "cdtor::Holder<std::unique_ptr<int>>"
+TMID_CTOR = "cdtor::TMid<int>::TMid(int)"
+TMID_DTOR = "cdtor::TMid<int>::~TMid()"
 
 
 class Output(Transcript):
@@ -228,6 +232,62 @@ def dwarf_phase(session):
 
     session.detach()
     return original
+
+
+def template_vtt_phase(session):
+    """A class template with a virtual base. DWARF names the constructors of `TMid<int>` `TMid`,
+    and its base-object entry points take the hidden VTT argument like those of a plain class.
+    So does a specialization of a constructor template."""
+    session.command('%trace preview --include "cdtor::TMid<int>::*"')
+    rows = {}
+    while True:
+        line = session.output.expect(
+            r'^(\w+) address=\S+ "([^"]+)" symbol=(\S+).*|^dry-run (.*)')
+        if line.group(4):
+            break
+        rows[line.group(3)] = (line.group(1), line.group(2), line.group(0))
+    # Every entry point is its own code: C1 and D1 construct and destroy the virtual base.
+    for symbol, selector in (("_ZN5cdtor4TMidIiEC1Ei", TMID_CTOR),
+                             ("_ZN5cdtor4TMidIiEC2Ei", TMID_CTOR),
+                             ("_ZN5cdtor4TMidIiED1Ev", TMID_DTOR),
+                             ("_ZN5cdtor4TMidIiED2Ev", TMID_DTOR)):
+        assert rows[symbol][:2] == ("DWARF_SUPPORTED", selector), rows
+    assert all(row[0] in ("DWARF_SUPPORTED", "ALIAS") for row in rows.values()), rows
+
+    # The selector names both constructor entry points; each is chosen by its linkage symbol.
+    error = session.inject_error(f'"{TMID_CTOR}"')
+    assert "ambiguous debug callable" in error, error
+    c1, _ = session.inject("_ZN5cdtor4TMidIiEC1Ei")
+    c2, _ = session.inject("_ZN5cdtor4TMidIiEC2Ei")
+    d2, _ = session.inject("_ZN5cdtor4TMidIiED2Ev")
+    # A constructor template is one more spelling: Clang names the specialization `TCtor<int>`.
+    made, _ = session.inject("_ZN5cdtor5TCtorC2IiEET_")
+    session.run_passes()
+    n = PASSES
+
+    # Once per pass each: C1 for the complete object, C2 from the constructor of TLeaf.
+    complete = session.events(c1, "POST", n, "tmid-c1")
+    assert all(argument_names(e) == ["x"] for e in complete), complete
+    assert [argument(e, "x") for e in complete] == list(range(n)), complete
+    base = session.events(c2, "POST", n, "tmid-c2")
+    assert all(len(argument_names(e)) == 2 and argument_names(e)[1] == "x" for e in base), base
+    vtt = argument_names(base[0])[0]
+    assert vtt in ("__vtt_parm", "vtt"), vtt
+    assert all(argument(e, vtt) != 0 for e in base), base
+    assert [argument(e, "x") for e in base] == [i + 1 for i in range(n)], base
+    assert all(e["functionName"] == TMID_CTOR for e in base), base
+    session.command(f"%collect --probe {c2} --phase PRE --count {n} --timeout 10")
+    session.output.expect(rf"received={n} ")
+    # The base-object destructor takes the VTT pointer as its only argument.
+    destroyed = session.events(d2, "POST", n, "tmid-d2")
+    assert all(argument_names(e) == [vtt] and argument(e, vtt) != 0 for e in destroyed), destroyed
+    template = session.events(made, "POST", n, "tctor-c2")
+    assert all(argument_names(e) == [vtt, "x"] and argument(e, vtt) != 0 for e in template), template
+    assert [argument(e, "x") for e in template] == [i + 1 for i in range(n)], template
+
+    session.run_passes(1)
+    assert session.target.process.poll() is None
+    session.detach()
 
 
 def bulk_phase(session, bytes_at):
@@ -446,13 +506,16 @@ def main(repl, server, agent, fixture, header, source, compiler):
         assert match, symbol
         entries[symbol] = int(match.group(1), 16)
     # A fixture process per phase: an agent keeps a fixed number of probe slots per process.
-    for phase in (dwarf_phase, bulk_phase, prepared_phase, elf_phase, index_phase):
+    for phase in (dwarf_phase, template_vtt_phase, bulk_phase, prepared_phase, elf_phase,
+                  index_phase):
         with tempfile.TemporaryDirectory(prefix="ct-cdtor-") as directory, ExitStack() as stack:
             root = Path(directory)
             target = Target(fixture, stack)
             session = Session(repl, server, agent, target, stack, root)
             if phase is dwarf_phase:
                 dwarf_phase(session)
+            elif phase is template_vtt_phase:
+                template_vtt_phase(session)
             elif phase is bulk_phase:
                 bulk_phase(session, entries)
             elif phase is prepared_phase:
@@ -463,7 +526,7 @@ def main(repl, server, agent, fixture, header, source, compiler):
                 index_phase(session, fixture)
             send(target.process, "q")
             target.process.wait(timeout=10)
-    print("constructors and destructors observed: dwarf, bulk, prepared, elf, index")
+    print("constructors and destructors observed: dwarf, template, bulk, prepared, elf, index")
 
 
 if __name__ == "__main__":
