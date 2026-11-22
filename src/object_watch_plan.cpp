@@ -2520,19 +2520,31 @@ Plan::Plan(std::uint32_t pid, std::string executable,
                                "cross-image admission is not enabled for " + concrete);
     if (constructor == lifetime_image->symbols.end())
       throw std::runtime_error("no verified constructor entries for lifetime-only type " + concrete);
+    bool polymorphic = false;
     for (const auto &entry : lifetime_image->symbols) {
       if (!is_constructor(entry))
         continue;
       const auto site = lifetime_image->dwarf->getDIEsForAddress(entry.range.first);
       const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
       std::set<DWARFDie> seen;
-      if (has_virtual_members_or_bases(type, seen))
-        throw std::runtime_error("lifetime-only identity cannot establish complete-object ownership for a polymorphic type");
+      polymorphic |= has_virtual_members_or_bases(type, seen);
     }
     if (derived_types(*lifetime_image->dwarf, concrete).present ||
-        (main_ && derived_types(*main_->dwarf, concrete).present))
-      throw std::runtime_error("lifetime-only identity cannot disambiguate known derived construction of " +
-                               concrete + "; register the complete derived type until constructor coverage is available");
+        (main_ && derived_types(*main_->dwarf, concrete).present)) {
+      // A derived class runs these constructor and destructor entries for its base subobject, so
+      // an entry call is not proof of a complete object of this type. A polymorphic class is a
+      // base by design: keep it, but report its identities as provisional instead of complete.
+      // Other classes keep the stricter rule.
+      if (!polymorphic)
+        throw std::runtime_error("lifetime-only identity cannot disambiguate known derived construction of " +
+                                 concrete + "; register the complete derived type until constructor coverage is available");
+      if (!lifetime_coverage_diagnostic.empty())
+        lifetime_coverage_diagnostic += "; ";
+      lifetime_coverage_diagnostic += "polymorphic type " + concrete +
+          " has derived types in debug information, and its constructor and destructor entries also run "
+          "for their base subobjects, so complete-object ownership is not proven; "
+          "object identities remain provisional";
+    }
     const auto add_lifecycle = [&](const Symbol &symbol, Boundary role, bool uncertain,
                                    bool deleting = false) {
       const auto pc = lifetime_image->bind(pid, symbol.range);
@@ -2560,8 +2572,22 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         continue;
       if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D1Ev"))
         destructors.insert(symbol.range);
-      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev"))
-        deleting_destructors.insert(symbol.range);
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev")) {
+        // Clang emits the deleting destructor of an abstract class as a trap: no complete
+        // object of the class exists, so nothing can run it and there is no entry to watch.
+        // Only a body that can do nothing but trap qualifies: straight-line code that ends in
+        // ud2, with no call, branch or return. A real deleting destructor that merely has a
+        // trap on one path stays a lifetime entry.
+        const auto pc = lifetime_image->bind(pid, symbol.range);
+        const auto body = native_entry::scan(pc, lifetime_image->code(pc).substr(0, symbol.range.second));
+        const bool only_traps = !body.decode_failed && body.diagnostic.empty() &&
+            !body.instructions.empty() && body.instructions.back().text == "ud2" &&
+            std::all_of(body.instructions.begin(), body.instructions.end(), [](const auto &inst) {
+              return inst.flow == native_entry::Flow::ordinary;
+            });
+        if (!only_traps)
+          deleting_destructors.insert(symbol.range);
+      }
       else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D2Ev"))
         base_destructors.insert(symbol.range);
     }

@@ -14,6 +14,9 @@ struct ResolvedCallable {
   std::string declaration;
   std::string source;
   bool requires_typed_adapter = false;
+  // Set for a pure virtual declaration resolved from headers: the concrete overrides those
+  // headers define. Whether the declaration has a body is a question for the module.
+  std::string pure_virtual_overrides;
 };
 
 ResolvedCallable resolve_header_callable(const std::string& selector,

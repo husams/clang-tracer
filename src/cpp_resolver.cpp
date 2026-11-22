@@ -929,6 +929,74 @@ Selector parse_selector(const std::string& text) {
   return selector;
 }
 
+bool overrides_method(const clang::CXXMethodDecl *method, const clang::CXXMethodDecl &base) {
+  for (const auto *overridden : method->overridden_methods())
+    if (overridden->getCanonicalDecl() == base.getCanonicalDecl() ||
+        overrides_method(overridden, base))
+      return true;
+  return false;
+}
+
+// Concrete (non-pure) overrides of `base` defined by the classes of the supplied translation
+// unit. Only the headers given as context are searched, never the loaded modules.
+void collect_concrete_overrides(const clang::DeclContext &scope, const clang::CXXMethodDecl &base,
+                                clang::ASTContext &context, std::set<std::string> &found) {
+  const auto &sources = context.getSourceManager();
+  clang::PrintingPolicy policy(context.getLangOpts());
+  policy.SuppressScope = false;
+  for (const auto *declaration : scope.decls()) {
+    if (const auto *space = llvm::dyn_cast<clang::NamespaceDecl>(declaration)) {
+      // A class in an anonymous namespace has internal linkage and cannot be selected.
+      if (!space->isStdNamespace() && !space->isAnonymousNamespace())
+        collect_concrete_overrides(*space, base, context, found);
+      continue;
+    }
+    if (const auto *linkage = llvm::dyn_cast<clang::LinkageSpecDecl>(declaration)) {
+      collect_concrete_overrides(*linkage, base, context, found);
+      continue;
+    }
+    const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration);
+    if (!record || !record->isCompleteDefinition() || record->isDependentContext() ||
+        !record->isExternallyVisible() || sources.isInSystemHeader(record->getLocation()))
+      continue;
+    collect_concrete_overrides(*record, base, context, found);
+    for (const auto *method : record->methods()) {
+      if (method->isPureVirtual() || !method->isVirtual() || !overrides_method(method, base))
+        continue;
+      std::string text = method->getQualifiedNameAsString() + "(";
+      for (unsigned i = 0; i < method->getNumParams(); ++i)
+        text += (i ? ", " : "") + method->getParamDecl(i)->getType().getAsString(policy);
+      text += ")";
+      if (method->isConst())
+        text += " const";
+      if (method->isVolatile())
+        text += " volatile";
+      if (method->getRefQualifier() == clang::RQ_LValue)
+        text += " &";
+      if (method->getRefQualifier() == clang::RQ_RValue)
+        text += " &&";
+      found.insert(std::move(text));
+    }
+  }
+}
+
+// What the supplied headers say about the overrides of a pure virtual declaration. A pure
+// virtual method may still be defined, so this is not a rejection: the preparer uses it when
+// the selected module turns out to define no body, and as a note otherwise.
+std::string pure_virtual_overrides(const clang::CXXMethodDecl &method,
+                                   clang::ASTContext &context) {
+  std::set<std::string> overrides;
+  collect_concrete_overrides(*context.getTranslationUnitDecl(), method, context, overrides);
+  if (overrides.empty())
+    return "the supplied headers define no concrete override of it. Add a --include for a "
+           "derived class definition, or select a concrete override by its full selector";
+  std::string message = "the supplied headers define these concrete overrides (select one by "
+                        "its full selector; none is chosen automatically):";
+  for (const auto &entry : overrides)
+    message += "\n  " + entry;
+  return message;
+}
+
 struct Candidate {
   std::string name;
   std::string symbol;
@@ -942,6 +1010,7 @@ struct Candidate {
   clang::RefQualifierKind ref_qualifier = clang::RQ_None;
   api::ProbeSpec spec;
   std::string unsupported_reason;
+  std::string pure_virtual_overrides;  // non-empty when the declaration is pure virtual
   bool selected_by_type = false;
   bool requires_typed_adapter = false;
 };
@@ -1177,6 +1246,9 @@ public:
       }
       if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
+      }
+      if (method && method->isPureVirtual()) {
+        candidate.pure_virtual_overrides = pure_virtual_overrides(*method, *context_);
       }
       if (declaration->getFormalLinkage() != clang::Linkage::External) {
         throw std::runtime_error("callables with internal or non-external linkage are unsupported");
@@ -1630,6 +1702,7 @@ static ResolvedCallable select_cpp_candidate(std::vector<Candidate> candidates,
   resolved.declaration = std::move(candidate.declaration);
   resolved.source = std::move(candidate.source);
   resolved.requires_typed_adapter = candidate.requires_typed_adapter;
+  resolved.pure_virtual_overrides = std::move(candidate.pure_virtual_overrides);
   return resolved;
 }
 

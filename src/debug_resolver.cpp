@@ -1224,6 +1224,27 @@ std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   return {low, high};
 }
 
+constexpr const char *no_concrete_entry_prefix = "no concrete implementation entry: ";
+
+// A virtual declaration whose DIE carries no code is not an entry to patch. A DIE with
+// DW_AT_ranges (a body split into hot and cold parts) does have code; whether that code is
+// usable is callable_code_range's question, not this one.
+bool bodyless_virtual_declaration(DWARFDie die, DWARFDie decl) {
+  return number(decl, dw::DW_AT_virtuality, dw::DW_VIRTUALITY_none) != dw::DW_VIRTUALITY_none &&
+         !die.find(dw::DW_AT_low_pc) && !die.find(dw::DW_AT_ranges);
+}
+
+std::string no_concrete_entry_diagnostic(DWARFDie decl, const std::string &selector) {
+  return std::string(no_concrete_entry_prefix) + selector +
+         (number(decl, dw::DW_AT_virtuality, dw::DW_VIRTUALITY_none) ==
+                  dw::DW_VIRTUALITY_pure_virtual
+              ? " is a pure virtual declaration without a body in this module"
+              : " is declared virtual but has no executable body in this module (for example a "
+                "pure virtual method that is not defined)") +
+         "; select a concrete override by its full selector, or prepare with --include/--compdb "
+         "for the derived class definitions that provide one";
+}
+
 bool in_override_section(const llvm::object::ELF64LEObjectFile &object,
                          std::uint64_t low, std::uint64_t high) {
   for (const auto &section : object.sections()) {
@@ -2006,25 +2027,21 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         std::string diagnostic;
         try {
           callable_code_range(die);
-          // C1/C2/D0/D1/D2 are concrete entry points even for a virtual destructor.
-          if (number(decl, dw::DW_AT_virtuality) && !cdtor_kind(linkage)) {
-            status = PreviewCandidate::PREPARED_REQUIRED;
-            diagnostic = "virtual implementation requires a compatible prepared package";
-          } else {
-            const auto shape = describe_callable(die, decl, display, false, true);
-            if (shape.receiver) {
-              api::DebugInfo record;
-              describe_record(shape.receiver, record);
-            }
-            const auto result_type = read_type(type_of(decl));
-            if (result_type.record) {
-              api::DebugInfo record;
-              describe_record(result_type.record, record, result_type.value == api::POINTER);
-            }
-            selector = shape.selector;
-            if (shape.variadic)
-              diagnostic = "variadic, fixed arguments only: the variadic tail is forwarded, not captured";
+          // A virtual method with a body is a concrete entry, reached through its vtable slot or
+          // a direct call, like any other function.
+          const auto shape = describe_callable(die, decl, display, true, true);
+          if (shape.receiver) {
+            api::DebugInfo record;
+            describe_record(shape.receiver, record);
           }
+          const auto result_type = read_type(type_of(decl));
+          if (result_type.record) {
+            api::DebugInfo record;
+            describe_record(result_type.record, record, result_type.value == api::POINTER);
+          }
+          selector = shape.selector;
+          if (shape.variadic)
+            diagnostic = "variadic, fixed arguments only: the variadic tail is forwarded, not captured";
         } catch (const std::exception &error) {
           status = PreviewCandidate::UNSUPPORTED;
           diagnostic = error.what();
@@ -2345,6 +2362,12 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     }
     if (ranges.empty() && source_only)
       continue;
+    if (ranges.empty())
+      throw std::runtime_error(
+          std::string(no_concrete_entry_prefix) + prepared.selector() + " (" +
+          prepared.symbol() + ") is not a defined function in " + path +
+          "; if it is a declaration without a body (for example a pure virtual method that "
+          "is not defined), prepare a concrete override with its own selector");
     if (ranges.size() != 1)
       throw std::runtime_error(
           "prepared function has no unique concrete ELF symbol");
@@ -2411,7 +2434,9 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
   if (matches.empty())
     throw std::runtime_error(pinned
         ? "PREPARED_MODULE_MISMATCH: no mapped module matches the prepared image digest"
-        : "prepared symbol was not found in the target's mapped modules: " + prepared.symbol());
+        : "prepared symbol was not found in the target's mapped modules: " + prepared.symbol() +
+          "; if it is a declaration without a body (for example a pure virtual method that is "
+          "not defined), prepare a concrete override with its own selector");
   if (matches.size() != 1)
     throw std::runtime_error("prepared module is ambiguous; select an exact --module path");
   return std::move(matches.front());
@@ -2431,6 +2456,15 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
   const bool by_linkage = selected.size() > 2 && selected.compare(0, 2, "_Z") == 0;
   std::map<std::string, ResolvedCallable> matches;
   std::string rejected;
+  // Set when the selected callable is a virtual declaration without code (see the final error).
+  std::string bodyless;
+  // The first rejection of a DIE that has no code; `rejected` is kept for definitions.
+  std::string declaration_rejected;
+  // An adjusting or covariant-return thunk is an ELF function without a DWARF subprogram.
+  const bool thunk_selector = by_linkage &&
+      (selected.rfind("_ZTh", 0) == 0 || selected.rfind("_ZTv", 0) == 0 ||
+       selected.rfind("_ZTc", 0) == 0);
+  bool thunk_defined = false;
   std::uint64_t visited = 0;
   const auto check_cancelled = [&] {
     if (options.is_cancelled())
@@ -2454,6 +2488,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         object->getBytesInAddress() != 8 || !object->isLittleEndian()) {
       continue;
     }
+    if (thunk_selector && elf_function_address(*object, selected))
+      thunk_defined = true;
     if (options.module.empty() && !lists_symbol(*object, selected, selected_name))
       continue;
     std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
@@ -2521,6 +2557,27 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
           try {
             if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
               throw std::runtime_error("nondefault debug calling convention is unsupported");
+            }
+            // A virtual declaration without code has no entry, whatever its ABI. It is the
+            // answer only when it is the declaration that was selected (not an overload of the
+            // same name), no definition of it is found and nothing more specific was rejected.
+            // Clang leaves the receiver of a declaration unnamed, so the declaration may not be
+            // describable; its demangled linkage name is compared instead.
+            if (bodyless_virtual_declaration(die, decl)) {
+              bool is_selected = by_linkage || selected == dwarf_name ||
+                                 selected == name(decl) || selected == symbol_name;
+              if (!is_selected) {
+                try {
+                  const auto shape = describe_callable(die, decl, display, true, true);
+                  is_selected = compact(shape.selector) == selected ||
+                                compact(shape.dwarf_selector) == selected;
+                } catch (const std::exception &) {
+                  is_selected = compact(llvm::demangle(symbol)) == selected;
+                }
+              }
+              if (is_selected)
+                bodyless = no_concrete_entry_diagnostic(decl, selector);
+              return;
             }
             ResolvedCallable found;
             const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry, true);
@@ -2598,7 +2655,12 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             const auto key = path + ":" + std::to_string(low);
             matches[key] = std::move(found);
           } catch (const std::exception& e) {
-            rejected = e.what();
+            // A DIE without code is a declaration: what is wrong with it only matters when no
+            // definition says something more specific.
+            if (die.find(dw::DW_AT_low_pc) || die.find(dw::DW_AT_ranges))
+              rejected = e.what();
+            else if (declaration_rejected.empty())
+              declaration_rejected = e.what();
           }
         }
       }
@@ -2687,6 +2749,14 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
     }
   }
   if (matches.size() != 1) {
+    if (matches.empty() && rejected.empty() && !bodyless.empty())
+      throw std::runtime_error(bodyless);
+    if (matches.empty() && rejected.empty() && thunk_defined)
+      rejected = "this is an adjusting or covariant-return thunk entry, which has no DWARF "
+                 "subprogram of its own and is unsupported; select the implementation it "
+                 "forwards to";
+    if (rejected.empty())
+      rejected = declaration_rejected;
     std::string error = matches.empty()
                             ? "no supported matching callable in mapped ELF debug information; "
                               "build/install matching DWARF symbols"
@@ -2806,7 +2876,7 @@ DebugSymbolPage list_debug_symbols(
             throw std::runtime_error("callable is outside mapped executable image ranges");
           }
           const auto display = preview_name(linkage_symbol, {});
-          const auto shape = describe_callable(die, decl, display, false, true);
+          const auto shape = describe_callable(die, decl, display, true, true);
           // The resolver validates the receiver layout too; discovery must not
           // advertise a method that the existing probe path cannot admit.
           if (shape.receiver) {

@@ -522,8 +522,8 @@ an overload by its full C++ signature. Quote patterns at the REPL.
 The dry run reads executable mappings, ELF symbols and DWARF, including matching
 separate debug files. It reports a live entry when one can be verified.
 `DWARF_SUPPORTED` means the entry passed static ABI checks. Callback compilation
-and installation checks run separately. `PREPARED_REQUIRED` identifies a
-concrete virtual implementation that needs a compatible prepared package.
+and installation checks run separately. A virtual method with a body is a
+concrete entry and reports `DWARF_SUPPORTED` like any other function.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with `--module`.
 
@@ -642,7 +642,7 @@ object: `Leaf::Leaf` (`C1`) calls `Mid::Mid` (`C2`), which calls
 `DWARF_SUPPORTED` row each (`reason="constructor/destructor variant SYMBOL"`),
 and one row for names that share a body. `%trace apply` installs one probe per
 row and tells the rows apart with `reason="constructor/destructor entry SYMBOL"`.
-A virtual destructor is concrete here, so it is not `PREPARED_REQUIRED`.
+A virtual destructor is concrete here, like any virtual method with a body.
 
 A prepared package binds the complete-object entry point (`C1` or `D1`) of the
 C++ selector, the one called for a most-derived object, and spells constructors
@@ -660,6 +660,52 @@ entry points at different addresses stay ambiguous.
 
 Constructors and destructors that the compiler inlined have no symbol and
 cannot be observed.
+
+## Probe virtual methods
+
+A virtual method with a body (a base implementation or an override) is a concrete
+function at its own address. `%symbols`, `%trace preview`, `%probe inject`, the
+module index and prepared packages treat it like a non-virtual method, and the
+probe fires for calls through a base reference or pointer because the vtable slot
+points at the patched entry. An override that is reached through an adjusting or
+covariant-return thunk is called through a separate thunk symbol with no debug
+information of its own; the thunk is not probed, and selecting it by linkage name
+says so.
+
+What decides is whether the module defines a body, not whether the method is
+marked pure. A pure virtual method that is defined (`virtual int rank() const = 0;`
+with `int Shape::rank() const { ... }`, or a pure virtual destructor, which always
+has a body) is an ordinary callable on every route. A virtual declaration that
+nothing defines has no entry to patch, and selecting it reports `no concrete
+implementation entry` with the declaration's name:
+
+- on the DWARF route, when the module is named (for example `--module libdemo`)
+  so that its debug information is read;
+- in the module index, where such a declaration is listed with kind `declaration`
+  and diagnostic `no_concrete_entry`. A function with the same name wins a lookup
+  by bare name;
+- with `--include`/`--compdb` and `--module`: preparation is refused and the error
+  lists the concrete overrides the supplied headers define. Only those headers are
+  searched, never the loaded modules. None is chosen for you: prepare the override
+  you want by its full selector, one package per override. Without `--module`
+  nothing says whether a body exists, so the package is written with a note that
+  lists the same overrides, and installing it fails where no module defines the
+  method.
+
+`%object-probe` accepts a polymorphic receiver, including its non-virtual
+methods. Derived classes are looked for in the debug information of the selected
+module and of the main executable. A class with none there keeps the
+complete-object proof from its constructor callers: a construction counts as a
+complete object only when it is called from a verified ordinary caller, so a base
+subobject built by a derived class in another module is reported as
+`LIFETIME_UNCERTAIN`, not as a created object. A polymorphic class with derived
+classes there cannot prove that a constructor or destructor call is for a complete
+object, because a derived class runs the same entries for its base subobject.
+Start still succeeds and reports `object identities remain provisional`; the
+lifetime sites are listed as provisional instead of complete-object entries.
+Clang emits the deleting destructor of an abstract class as a bare trap that
+nothing can run; that one is not a lifetime entry. GCC emits a real one, which is.
+A non-polymorphic class with derived classes is still refused.
 
 ## Read and scan mapped memory
 
