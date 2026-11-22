@@ -216,9 +216,15 @@ ResolvedCallable resolve_elf_signature(
     const TypeContext *context) {
   if (!indexed && !tracer::spliceable_type_text(signature))
     throw std::invalid_argument(
-        "--signature requires a C++ function type such as 'const int&()' (it must not contain "
-        "; { } # \\ or comments)");
+        "--signature requires a C++ function type such as 'const int&()' (it must not contain " +
+        std::string(tracer::unspliceable_text) + ")");
   const auto target = select_symbol(image, selector, member, indexed);
+  // The agent's install request carries the linkage name in a fixed 512-byte field, so a
+  // package for a longer name could be written but never installed.
+  if (target.symbol.size() > 511)
+    throw std::invalid_argument(
+        selector + ": the symbol's linkage name is " + std::to_string(target.symbol.size()) +
+        " bytes, and a probe can be installed only on a symbol of at most 511 bytes");
   if (context) {
     SymbolContract contract;
     contract.symbol = target.symbol;

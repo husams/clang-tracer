@@ -1360,8 +1360,9 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
       arguments.push_back(probe_path(options, value));
     }
   }
-  auto extra = (indexed && !type_context) ? std::vector<std::string>{}
-                                          : probe_extra_arguments(options, settings_);
+  // Compiler arguments belong to headers: a declaration source or a type context.
+  auto extra = (type_context || (!elf_mode && !indexed))
+                   ? probe_extra_arguments(options, settings_) : std::vector<std::string>{};
   if (options.has("--cwd"))
     extra = tracer::normalize_extra_compile_arguments(extra, {}, {}, options.option("--cwd"));
   for (const auto &argument : extra) {

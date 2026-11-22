@@ -108,7 +108,15 @@ class Generator {
     const auto &type = get(id);
     if (type.kind == "void") return "void";
     if (type.kind == "scalar") return scalar(type);
-    if (type.kind == "alias") return spelling(type.target_id, behind_pointer);
+    if (type.kind == "alias") {
+      // An unnamed record or enum is known to the headers only by its typedef name.
+      bool is_volatile = false;
+      const auto &target = unqualified(type.target_id, is_volatile);
+      if (context_ && !type.name.empty() && target.name.empty() &&
+          (record(target) || target.kind == "enum"))
+        return "::" + type.name;
+      return spelling(type.target_id, behind_pointer);
+    }
     if (type.kind == "const" || type.kind == "volatile")
       return spelling(type.target_id, behind_pointer) + " " + type.kind;
     if (indirect(type)) {
@@ -117,14 +125,26 @@ class Generator {
       const auto suffix = type.kind == "pointer" ? "*" : type.kind == "reference" ? "&" : "&&";
       return spelling(type.target_id, true) + suffix;
     }
-    // A record reached only through a pointer or reference needs a declaration, not a
-    // definition, so it is declared here whether or not the supplied headers define it.
+    if (context_ && (record(type) || type.kind == "enum") && !type.name.empty()) {
+      // A record reached only through a pointer or reference needs a declaration, not a
+      // definition, so one that can be forward declared is, in case the headers leave it
+      // out. Any other (a std, template or nested record) must come from the headers.
+      if (record(type) && behind_pointer) {
+        try {
+          forward(type);
+        } catch (const std::invalid_argument &) {
+        }
+      }
+      return "::" + type.name;
+    }
     if (record(type) && behind_pointer) {
       forward(type);
       return "::" + type.name;
     }
-    if (context_ && (record(type) || type.kind == "enum") && !type.name.empty())
-      return "::" + type.name;
+    if (record(type) && context_)
+      throw std::invalid_argument(
+          "unsupported_call_abi: an unnamed " + type.kind + " is passed or returned by value "
+          "and no typedef names it for the supplied type context");
     if (record(type))
       throw std::invalid_argument(
           "unsupported_call_abi: " + type.kind + " " + type.name + " is passed or returned by "

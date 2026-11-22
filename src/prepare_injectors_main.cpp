@@ -151,8 +151,11 @@ int main(int argc, char **argv) {
       if (!options.count(option))
         throw std::runtime_error(std::string("missing required option: ") +
                                  option);
-    if (!options.count("--module-index") && headers.empty() && !options.count("--signature") &&
-        !options.count("--compdb") && !options.count("--translation-unit")) {
+    // An index entry named by --id is prepared from an index even when headers supply a type
+    // context; otherwise headers or compiler options select source preparation.
+    if (!options.count("--module-index") && !options.count("--signature") &&
+        (options.count("--id") || (headers.empty() && !options.count("--compdb") &&
+                                   !options.count("--translation-unit")))) {
       if (const auto image = options.find("--module"); image != options.end()) {
         const auto sidecar = image->second + ".tracer.sqlite";
         if (fs::is_regular_file(sidecar)) options.emplace("--module-index", sidecar);

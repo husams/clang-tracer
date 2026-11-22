@@ -14,8 +14,12 @@ import tempfile
 
 TYPES = """#pragma once
 #include <string>
+// A global type with a plain name, which the generated adapter must not hide.
+struct Result { long a, b, c; };
 namespace extra {
 struct Plain { int value; };
+class Session { public: int id; };
+typedef struct { int x, y; } Point;
 struct Mix16 { long id; double scale; };
 struct Duo { double scale; double bias; };
 struct Large { long a, b, c, d, e; };
@@ -32,7 +36,11 @@ struct Outer { struct Inner { int x; int y; }; };
 
 API = """#pragma once
 #include "types.hpp"
+int take_result(Result value);
 namespace extra {
+int area(Point value);
+Plain make_for(Session* session);
+int mixed(const std::string& text, const Outer::Inner* inner, const Box<Plain>& box, Plain value);
 Plain make_plain(int n);
 int take_plain(Plain value);
 Mix16 make_mix16(long n);
@@ -73,6 +81,8 @@ LOOKUP_NAMES = {
     # tagged symbols would see neither of them.
     "amb_first": "_ZN2pg7zzzzambB1pEi",
     "amb_last": "_ZN2pg7zzzzambB1qEi",
+    # A linkage name longer than an install request can carry.
+    "long_name": "_ZN600" + "q" * 600 + "1fEi",
 }
 FILLERS = 300
 
@@ -101,8 +111,15 @@ def lookup_source():
 
 MODULE = """#include "api.hpp"
 #include <string>
+__attribute__((noinline)) int take_result(Result value) { return static_cast<int>(value.a + value.c); }
 namespace extra {
 namespace { int live = 0, copies = 0; }
+__attribute__((noinline)) int area(Point value) { return value.x * value.y; }
+__attribute__((noinline)) Plain make_for(Session* session) { return {session->id}; }
+__attribute__((noinline)) int mixed(const std::string& text, const Outer::Inner* inner,
+                                    const Box<Plain>& box, Plain value) {
+    return static_cast<int>(text.size()) + inner->x + box.tag + value.value;
+}
 Tracked::Tracked(int v) : value(v) { ++live; }
 Tracked::Tracked(const Tracked& other) : value(other.value) { ++live; ++copies; }
 Tracked::~Tracked() { --live; }
@@ -172,6 +189,8 @@ int main() {
         std::string label = extra::make_label(1);
         if (label != "label1" || extra::count_label(label) != 6) return 9;
         if (extra::tagged(3) != 5 || extra::multi(3) != 6) return 10;
+        if (take_result(Result{1, 2, 3}) != 4) return 13;
+        if (extra::area(extra::Point{2, 5}) != 10) return 14;
         usleep(10000);
     }
 }
@@ -197,6 +216,7 @@ ROUTES = {
     # A selector is the demangled name, so a std::string parameter is spelled in full.
     "count_label": ("extra::count_label(std::__cxx11::basic_string<char, std::char_traits<char>, "
                     "std::allocator<char> >)", "int(std::string)"),
+    "take_result": ("take_result(Result)", "int(Result)"),
 }
 
 # What each observed call must show, checked on both PRE-independent POST events.
@@ -229,6 +249,8 @@ BODIES = {
     "make_label": 'if (e.result_as<std::string>() != "label1") throw std::runtime_error("make_label");',
     "count_label": 'if (e.result_as<int>() != 6 || e.argument_as<std::string>(0) != "label1") '
                    'throw std::runtime_error("count_label");',
+    "take_result": 'if (e.result_as<int>() != 4 || e.argument_snapshot(0).field("c").as<long long>() != 3) '
+                   'throw std::runtime_error("take_result");',
     "tagged": 'if (e.result_as<int>() != 5) throw std::runtime_error("tagged");',
 }
 
@@ -304,6 +326,11 @@ def main():
              "--translation-unit module.cpp --output pkg/undeclared\n",
              expected_error="cannot be compiled in the supplied type context")
         assert not (root / "pkg/incomplete").exists() and not (root / "pkg/undeclared").exists()
+        # A symbol that could not be installed is refused when it is prepared.
+        repl(f'%probe prepare "{"q" * 600}::f(int)" --signature "int(int)" '
+             "--module ./libclassprep.so --output pkg/long\n",
+             expected_error="at most 511 bytes")
+        assert not (root / "pkg/long").exists()
         # A mismatched parameter list is still caught against the ELF symbol.
         repl('%probe prepare "extra::take_plain(extra::Plain)" --signature "int(extra::Plain, int)" '
              f"--module ./libclassprep.so {context} --output pkg/arity\n",
@@ -351,10 +378,42 @@ def main():
              "--include types.hpp --compdb compile_commands.json --translation-unit module.cpp "
              "--output pkg/opaque_pointer\n%quit\n")
         assert (root / "pkg/opaque_pointer/prepared.pb").is_file()
-        # A type context missing a header reports the header, not one of the types.
+        # Records the headers do define, reached through a pointer or reference: a std
+        # template, a nested record and a template instance cannot be forward declared.
+        repl('%probe prepare "extra::mixed(std::__cxx11::basic_string<char, std::char_traits<char>, '
+             'std::allocator<char> > const&, extra::Outer::Inner const*, '
+             f'extra::Box<extra::Plain> const&, extra::Plain)" --module-index {index} '
+             f"{context} --output pkg/mixed\n%quit\n")
+        assert (root / "pkg/mixed/prepared.pb").is_file()
+        # A generated declaration does not turn a strict build's warnings into a failure: the
+        # index records Session as a class and the declaration says struct.
+        (root / "compile_commands_strict.json").write_text(json.dumps([{
+            "directory": str(root), "file": str(root / "module.cpp"),
+            "arguments": [args.compiler, *flags, "-Wall", "-Werror", "-fPIC", "-I" + str(root),
+                          "-c", str(root / "module.cpp"), "-o", "module.o"]}]))
+        repl(f'%probe prepare "extra::make_for(extra::Session*)" --module-index {index} '
+             "--include types.hpp --compdb compile_commands_strict.json "
+             "--translation-unit module.cpp --output pkg/strict\n%quit\n")
+        assert (root / "pkg/strict/prepared.pb").is_file()
+        # An unnamed struct is spelled by its typedef name, so the failure is about the type the
+        # adapter cannot name, not about missing headers.
+        repl(f'%probe prepare "extra::area(extra::Point)" --module-index {index} {context} '
+             "--output pkg/unnamed\n", expected_error="requires a named concrete declaration")
+        assert not (root / "pkg/unnamed").exists()
+        # A type context whose header does not compile reports the header, not one of the types.
+        (root / "broken.hpp").write_text('#pragma once\n#include "does_not_exist.hpp"\n')
         repl(f'%probe prepare "extra::make_plain(int)" --module-index {index} '
-             "--include missing.hpp --compdb compile_commands.json --translation-unit module.cpp "
-             "--output pkg/no_header\n", expected_error="missing.hpp")
+             "--include broken.hpp --compdb compile_commands.json --translation-unit module.cpp "
+             "--output pkg/no_header\n",
+             expected_error="parsing the supplied type context for extra::make_plain(int): "
+                            "'does_not_exist.hpp' file not found")
+        # A global declaration with one of the adapter's own alias names is refused.
+        (root / "reserved.hpp").write_text(
+            '#pragma once\n#include "types.hpp"\nstruct TracerProbeResult {};\n')
+        repl(f'%probe prepare "extra::make_plain(int)" --module-index {index} '
+             "--include reserved.hpp --compdb compile_commands.json --translation-unit module.cpp "
+             "--output pkg/reserved\n", expected_error="declares '::TracerProbeResult'")
+        assert not (root / "pkg/no_header").exists() and not (root / "pkg/reserved").exists()
 
         # C. ABI-tag lookup.
         def show(selector, expected_error=None):
@@ -388,6 +447,11 @@ def main():
              f'%probe prepare "extra::multi(int)" --module-index {index} --output pkg/tag_multi\n'
              '%probe prepare "extra::tagged(int)" --signature "int(int)" --module ./libclassprep.so '
              "--output pkg/tag_explicit\n%quit\n")
+        # --id selects the entry from the index in use when headers supply the type context.
+        plain = json.loads(show("extra::make_plain(int)"))
+        repl(f'%module use {index}\n%probe prepare "extra::make_plain(int)" --id {plain["id"]} '
+             f"{context} --output pkg/by_id\n%quit\n")
+        assert (root / "pkg/by_id/prepared.pb").is_file()
         other = json.loads(show("extra::multi(int)"))
         repl(f'%probe prepare "extra::tagged(int)" --module-index {index} --id {other["id"]} '
              "--output pkg/tag_wrong_id\n", expected_error="--id does not match the requested selector")
