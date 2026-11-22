@@ -38,6 +38,11 @@ struct ContextHookPlan {
   bool ends_scope = false;
   bool unsupported_effects = false;
   std::string unsupported_effect;
+  // Presumed location of the construct behind unsupported_effect; line 0 when
+  // no location is known.
+  std::string unsupported_file;
+  unsigned unsupported_line = 0;
+  unsigned unsupported_column = 0;
   bool invalid_access = false;
   std::string invalid_access_effect;
   bool has_reference_capture = false;
@@ -64,6 +69,10 @@ struct ContextDeclarations {
   std::vector<ContextDependency> states;
   std::vector<ContextClassPlan> classes;
   std::string error;
+  // Presumed source location of `error` when the analysis can point at one.
+  std::string error_file;
+  unsigned error_line = 0;
+  unsigned error_column = 0;
 };
 
 ContextDeclarations analyze_context_declarations(clang::ASTContext &);

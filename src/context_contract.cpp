@@ -157,19 +157,38 @@ public:
                << ";dynamic:" << record->isDynamicClass()
                << ";virtual-bases:" << record->getNumVBases();
     if (!opaque_standard) {
+      auto &sources = context_.getSourceManager();
+      const auto token_range =
+          clang::CharSourceRange::getTokenRange(record->getSourceRange());
       bool invalid_range = false;
-      const auto source_text = clang::Lexer::getSourceText(
-          clang::CharSourceRange::getTokenRange(record->getSourceRange()),
-          context_.getSourceManager(), context_.getLangOpts(), &invalid_range);
-      if ((invalid_range || source_text.empty()) &&
-          !builtin_va_list_record(context_, record)) {
-        return invalid("record source definition cannot be captured for " +
-                       name);
+      llvm::StringRef source_text = clang::Lexer::getSourceText(
+          token_range, sources, context_.getLangOpts(), &invalid_range);
+      if (invalid_range || source_text.empty()) {
+        // A record declared through a macro has no spelling of its own; use
+        // the text of the invocation that produced it.
+        const auto file_range = clang::Lexer::makeFileCharRange(
+            token_range, sources, context_.getLangOpts());
+        invalid_range = false;
+        source_text = file_range.isValid()
+                          ? clang::Lexer::getSourceText(
+                                file_range, sources, context_.getLangOpts(),
+                                &invalid_range)
+                          : llvm::StringRef();
       }
-      if (!invalid_range && !source_text.empty())
+      if (!invalid_range && !source_text.empty()) {
         definition << ";source:" << source_text.size() << ':' << source_text;
-      else
+      } else if (builtin_va_list_record(context_, record)) {
         definition << ";builtin-va-list-record";
+      } else {
+        std::string printed;
+        llvm::raw_string_ostream stream(printed);
+        record->print(stream, policy_);
+        stream.flush();
+        if (printed.empty())
+          return invalid("record source definition cannot be captured for " +
+                         name);
+        definition << ";printed:" << printed.size() << ':' << printed;
+      }
     }
     unsigned index = 0;
     if (!opaque_standard) {

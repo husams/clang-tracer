@@ -673,6 +673,29 @@ void append_failure(clangtracer::v1::ValidationReport &report,
   diagnostic->set_stage(stage);
   diagnostic->set_severity("error");
   diagnostic->set_message(message);
+  // Context analysis ends its errors with " at <file>:<line>:<column>".
+  const auto at = message.rfind(" at ");
+  if (at == std::string::npos) return;
+  const auto location = message.substr(at + 4);
+  const auto column_colon = location.rfind(':');
+  const auto line_colon = column_colon == std::string::npos
+                              ? std::string::npos
+                              : location.rfind(':', column_colon - 1);
+  if (line_colon == std::string::npos || line_colon == 0) return;
+  const auto file = location.substr(0, line_colon);
+  const auto line = location.substr(line_colon + 1, column_colon - line_colon - 1);
+  const auto column = location.substr(column_colon + 1);
+  const auto digits = [](const std::string &text) {
+    return !text.empty() && text.size() < 10 &&
+           std::all_of(text.begin(), text.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; });
+  };
+  if (!digits(line) || !digits(column) ||
+      file.find_first_of(" \t\r\n:") != std::string::npos)
+    return;
+  diagnostic->set_file(file);
+  diagnostic->set_line(static_cast<std::uint32_t>(std::stoul(line)));
+  diagnostic->set_column(static_cast<std::uint32_t>(std::stoul(column)));
 }
 
 void append_diagnostic_text(std::string &error, const std::string &message) {
