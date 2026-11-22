@@ -67,7 +67,14 @@ const std::string prepare_summary =
         "Use --metadata-only to skip the separate C++ adapter files. ") +
     limit_summary +
     "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
-    "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.";
+    "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method. "
+    "A callable that passes or returns a class by value (for example 'extra::Plain(int)' or "
+    "'std::string()') needs the definitions of those types: add --include HEADER and --compdb PATH to "
+    "--signature or to an indexed preparation with --module-index. The headers define the types and "
+    "need not declare the callable; the compilation database gives them their language options, target "
+    "and include paths. A generated bundle (--generated) cannot be combined with --include. "
+    "An indexed selector written without ABI tags selects the callable that carries them when exactly one "
+    "does; the package keeps the tagged selector and the selector without tags can be used to inject it.";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -248,7 +255,8 @@ const CommandTopic commands[] = {
      "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
      "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]\n"
      "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
-     "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
+     "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY"
+     "\n  or add --include HEADER --compdb PATH [--translation-unit FILE] [EXTRA COMPILER ARGUMENTS] to a --signature or --module-index form to supply the type definitions of records passed by value",
      prepare_summary,
      R"example(%probe prepare "HFW::Item::create()" --include item.hpp --include item-impl.hpp --include item-snapshot-policy.hpp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",

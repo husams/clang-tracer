@@ -233,7 +233,17 @@ functions) are one callable, so a lookup by name returns the one with debug
 information instead of reporting `ambiguous_symbol`. The index preserves missing
 type and layout information. Symbols with incomplete signatures can still be
 looked up. Supported indexed signatures use scalar, pointer and borrowed
-reference parameters and results. The generated `views.hpp` contains read-only
+reference parameters and results. A record passed or returned by value is
+prepared with a type context: `--include HEADER --compdb PATH` (and optionally
+`--translation-unit FILE` and compiler arguments) on `%probe prepare`, or the
+`includes`, `compilation_database`, `translation_unit` and `extra_arguments` of
+`prepare_probe`. The headers define the types and need not declare the callable.
+The preparer compiles the indexed parameter and result types in that context, checks
+each by-value record against the size recorded in the debug information, and
+builds the typed adapter that source preparation builds. Without a context the
+error names the record that needs its definition. A selector written without ABI
+tags selects the unique callable that carries them; the package keeps the tagged
+selector. The generated `views.hpp` contains read-only
 accessors for supported fixed-offset fields, and the manifest lists omitted
 fields. `--generated` is optional. The preparer can regenerate the checked C++
 from the index.

@@ -89,7 +89,23 @@ int main() {
   require(parse_command("%module types --index 'my index.sqlite' --format json")
               .option("--index") == "my index.sqlite");
   require(parse_command("%module symbols --exported --limit 10").has("--exported"));
-  bad("%probe prepare f --include original.hpp --module-index types.sqlite --output prepared");
+  // Headers are a type context for an indexed or explicit-signature preparation.
+  const auto indexed_context = parse_command(
+      "%probe prepare f --module-index types.sqlite --include types.hpp --compdb build "
+      "--translation-unit src/api.cpp --output prepared");
+  require(indexed_context.kind == CommandKind::prepare && indexed_context.has("--include") &&
+          indexed_context.has("--module-index") && indexed_context.has("--compdb"));
+  require(parse_command("%probe prepare f --signature 'app::Item(int)' --module app "
+                        "--include types.hpp --compdb build --output prepared")
+              .has("--include"));
+  // An index chosen by --id (default search) takes the headers as a type context too.
+  require(parse_command("%probe prepare f --include types.hpp --id s1 --compdb build "
+                        "--output prepared").has("--id"));
+  bad("%probe prepare f --module-index types.sqlite --include types.hpp --generated out "
+      "--output prepared");
+  bad("%probe prepare f --signature 'int(int)' --module app --module-index types.sqlite "
+      "--output prepared");
+  bad("%probe prepare f --signature 'int(int)' --module app --compdb build --output prepared");
   bad("%probe prepare f --module-index types.sqlite");
   for (const auto *probe : {"%probe prepare f --include h --output out",
                             "%probe resolve f",

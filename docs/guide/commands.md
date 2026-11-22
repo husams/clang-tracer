@@ -87,7 +87,8 @@ file paths and prints JSON for index metadata and queries.
 | --- | --- |
 | `%probe prepare "add(int, int)" --include add.hpp --output prepared` | Generate a reusable local package. The first `--include HEADER` supplies the declaration and additional includes supply types. `--output NEW_DIR` must be new. `--compdb PATH` selects the compilation database, defaulting to the command's directory. `--translation-unit FILE` selects an explicit command. `--module ELF` pins ELF identity. `--metadata-only` skips adapter files. `--no-automatic-members` disables automatic pointer-member selection. `--follow-depth`, `--follow-members`, `--string-bytes` and the other followed-member limits are listed with defaults and ranges in [Followed-member limits](../native-repl.md#followed-member-limits). Accepts extra compiler arguments and `--cwd`. |
 | `%probe prepare "add(int, int)" --module-index target.sqlite --output prepared-add` | Prepare from an index using the recorded ELF path, or pass `--module ELF` to verify an explicit path to the same build. Use `--id ID` to disambiguate a matching selector and `--generated DIR` to reuse a verified emitted bundle. Accepts `--cwd` and `--metadata-only`. |
-| `%probe prepare "add(int, int)" --signature "int(int, int)" --module ./target --output prepared-explicit` | Prepare from a user-supplied function type and ELF. Use `--member` for an unqualified instance method. Accepts `--cwd` and `--metadata-only`. |
+| `%probe prepare "add(int, int)" --signature "int(int, int)" --module ./target --output prepared-explicit` | Prepare from a user-supplied function type and ELF. Use `--member` for an unqualified instance method. Accepts `--cwd` and `--metadata-only`. A selector written without ABI tags selects the one callable that carries them. |
+| `%probe prepare "make(int)" --signature "app::Item(int)" --module ./target --include types.hpp --compdb compile_commands.json --output prepared-item` | Prepare a callable that passes or returns a class by value. The headers are a type context: they define `app::Item` and need not declare `make`. `--compdb PATH`, `--translation-unit FILE` and extra compiler arguments work as for source preparation, and the same form applies to `--module-index`. |
 | `%probe resolve "add(int, int)"` | Show resolved signature, ABI and target metadata. Accepts resolution options below. |
 | `%probe validate "add(int, int)" --callback hook.cpp` | Compile and link the local callback without installing it. Accepts resolution options. |
 | `%probe inject "add(int, int)" --callback hook.cpp --stack-depth 16` | Install or replace the probe. Accepts resolution and deployment options. |
@@ -110,7 +111,15 @@ an ambiguous selector lists the symbols. `%trace preview` and `%trace apply` cov
 every entry point, and a prepared package binds the complete-object entry point
 (`C1`/`D1`). See [Observe constructors and destructors](../native-repl.md#observe-constructors-and-destructors).
 
-For indexed preparation, supply neither headers nor an explicit signature.
+For indexed preparation, supply neither headers nor an explicit signature unless a
+signature or result passes a record by value. A record value needs its complete
+definition, which the index does not keep: add `--include HEADER` and `--compdb PATH` as a
+type context (not combinable with `--generated`). The preparer compiles the indexed
+types in that context and rejects it when a by-value record is incomplete or its size
+differs from the size recorded in the debug information. A selector without ABI tags
+(`extra::tagged(int)`) selects the unique callable that carries them
+(`extra::tagged[abi:v1](int)`); an exact selector wins, and several callables with
+different tagged spellings are reported as `ambiguous_symbol` with their tagged selectors.
 The search order is `--module-index INDEX`, then `<ELF>.tracer.sqlite` when
 `--module ELF` is given, then the index selected with `%module index` or
 `%module use`, then `module-index.sqlite` in the command's working directory.
@@ -261,8 +270,8 @@ clang-tracer-prepare-injectors-native --selector "add(int, int)" \
 | --- | --- |
 | `--help` | Show usage. |
 | `--selector SELECTOR` | Required exact C++ selector. |
-| `--include HEADER` | Declaration header for source preparation. Repeat for supporting types. |
-| `--compdb FILE_OR_DIR` | Required compilation database for source preparation. |
+| `--include HEADER` | Declaration header for source preparation. Repeat for supporting types. With `--signature` or `--module-index` the headers are a type context: they define the records the callable passes or returns by value and need not declare it. |
+| `--compdb FILE_OR_DIR` | Required compilation database for source preparation or a type context. |
 | `--translation-unit FILE` | Select an explicit entry. Otherwise preparation tries the first include's recorded command, then an adjacent source. |
 | `--output NEW_DIRECTORY` | Required new output directory. |
 | `--module ELF` | Pin the package to an ELF build. |
@@ -270,6 +279,17 @@ clang-tracer-prepare-injectors-native --selector "add(int, int)" \
 | `--module-index INDEX`, `--id ID`, `--generated DIR` | Prepare from a saved index, optionally selecting the symbol by ID and reusing an emitted bundle. With no explicit index, the CLI tries the module sidecar and then `module-index.sqlite`. |
 | `--metadata-only` | Skip separate C++ adapter files. |
 | `--extra-arg ARG` | Append one compiler argument. Repeat as needed. |
+
+A callable that passes or returns a class by value is prepared from its ELF symbol or index entry together with the headers that define the class:
+
+```bash
+clang-tracer-prepare-injectors-native --selector "make(int)" --signature "app::Item(int)" \
+  --module ./target --include types.hpp --compdb build/compile_commands.json --output prepared-item
+clang-tracer-prepare-injectors-native --selector "make(int)" --module-index target.sqlite \
+  --module ./target --include types.hpp --compdb build/compile_commands.json --output prepared-item
+```
+
+The preparer compiles the supplied or indexed types with the compilation command's options, rejects an incomplete record or one whose size differs from the size recorded in the debug information, and verifies the generated adapter before it writes the package. `--generated` cannot be combined with `--include`.
 
 The REPL starts `clang-tracer-repl-check` internally for syntax checks, completion, reflection, and replay-type validation. The REPL's `%complete`, `%type`, `%cpp generate`, and recording commands manage that protocol.
 

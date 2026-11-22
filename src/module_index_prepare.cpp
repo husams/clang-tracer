@@ -10,13 +10,17 @@ namespace tracer::module_index {
 
 std::filesystem::path prepare_indexed(const ModuleIndex &index, const std::string &symbol_id,
     const std::filesystem::path &module, const std::filesystem::path &output,
-    const std::filesystem::path &generated, bool metadata_only) {
+    const std::filesystem::path &generated, bool metadata_only,
+    const client::TypeContext *context) {
   const auto image = fs::canonical(module.empty() ? fs::path(index.identity().image) : module);
   const auto directory = fs::absolute(output);
   if (fs::exists(directory) || fs::is_symlink(directory))
     throw std::invalid_argument("output already exists; choose a new directory");
   const auto symbol = index.get_symbol(symbol_id);
-  auto cpp = indexed_cpp(index, symbol);
+  if (context && !generated.empty())
+    throw std::invalid_argument(
+        "--generated supplies recovered declarations and cannot be combined with a type context");
+  auto cpp = indexed_cpp(index, symbol, context != nullptr);
   if (!generated.empty()) {
     const auto manifest = read_file(generated / "manifest.json");
     auto parsed = llvm::json::parse(manifest);
@@ -45,15 +49,17 @@ std::filesystem::path prepare_indexed(const ModuleIndex &index, const std::strin
       throw std::invalid_argument("generated bundle differs from the module index");
     cpp.preamble = expected.preamble;
   }
-  const tracer::client::IndexedElfSignature evidence{cpp.preamble, symbol.linkage,
-                                                       symbol.address, symbol.size};
+  const tracer::client::IndexedElfSignature evidence{
+      cpp.preamble, symbol.linkage, symbol.address, symbol.size, cpp.result_type,
+      cpp.argument_types, cpp.result_size, cpp.argument_sizes};
   std::optional<client::ResolvedCallable> resolved;
   const auto hash = inspect_elf(image, [&](const Elf &elf) {
     resolved = client::resolve_elf_signature(elf, symbol.selector, cpp.signature, symbol.member,
-                                             &evidence);
+                                             &evidence, context);
   }, index.identity().sha256);
   client::write_prepared_package(*resolved, symbol.selector, image, llvm::fromHex(hash),
-                                 directory, metadata_only);
+                                 directory, metadata_only, resolved->translation_unit,
+                                 resolved->cl_driver);
   return directory;
 }
 

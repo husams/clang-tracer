@@ -1,5 +1,8 @@
 #include "prepare_elf_signature.hpp"
 
+#include "abi_tags.hpp"
+#include "type_text.hpp"
+
 #include "prepared_contract.hpp"
 #include "prepared_types.hpp"
 #include "tracer/compat.hpp"
@@ -7,7 +10,9 @@
 #include "tracer/protocol.hpp"
 #include "tracer_runtime_config.hpp"
 
+#include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Frontend/ASTUnit.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringExtras.h>
@@ -15,9 +20,11 @@
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Support/Error.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -42,13 +49,22 @@ struct ElfCallable {
   std::string receiver;
   std::uint64_t address;
   std::uint64_t size;
+  std::string display;  // the demangled spelling, ABI tags included
 };
 
+// An exact selector keeps precedence. A selector written without ABI tags may name the one
+// callable that carries them: the second pass compares spellings that differ only in tag
+// annotations, and callables with different tagged spellings stay ambiguous even at one address.
 ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
                           const std::string &selector, bool member,
-                          const IndexedElfSignature *indexed) {
+                          const IndexedElfSignature *indexed, bool ignore_tags = false) {
   auto wanted = compact(selector);
   if (::tracer::compat::starts_with(wanted, "::")) wanted.erase(0, 2);
+  // Tags are removed from the demangled text and the request alike; the first pass is exact.
+  const auto key = [&](std::string_view text) {
+    return ignore_tags ? ::tracer::strip_abi_tags(compact(text)) : compact(text);
+  };
+  if (ignore_tags) wanted = ::tracer::strip_abi_tags(wanted);
   std::optional<ElfCallable> match;
   bool ambiguous_indexed_linkage = false;
   const auto visit = [&](const llvm::object::SymbolRef &symbol) {
@@ -68,7 +84,9 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
       return;
     }
     const auto linkage = name->str();
-    if (linkage.size() > 511 || linkage.find_first_not_of(
+    // Candidates are judged by their characters, not their length: a long mangled name (nested
+    // templates, long namespaces) is a candidate like any other and must not be skipped.
+    if (linkage.find_first_not_of(
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != linkage.npos)
       return;
     auto address = symbol.getAddress();
@@ -86,7 +104,7 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     llvm::ItaniumPartialDemangler demangler;
     if (demangler.partialDemangle(linkage.c_str())) {
       if (indexed && !member && linkage.rfind("_Z", 0) != 0)
-        match = ElfCallable{linkage, "", "", "", *address, elf.getSize()};
+        match = ElfCallable{linkage, "", "", "", *address, elf.getSize(), linkage};
       return;
     }
     // Constructors and destructors are ordinary callables here. Their entry points (C1/C2,
@@ -96,7 +114,7 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     using Text = std::unique_ptr<char, decltype(&std::free)>;
     std::size_t capacity = 0;
     const Text qualified(demangler.getFunctionName(nullptr, &capacity), &std::free);
-    if (!qualified || (!indexed && !::tracer::compat::starts_with(wanted, compact(qualified.get()) + "(")))
+    if (!qualified || (!indexed && !::tracer::compat::starts_with(wanted, key(qualified.get()) + "(")))
       return;
     const Text params(demangler.getFunctionParameters(nullptr, &capacity), &std::free);
     const Text full(demangler.finishDemangle(nullptr, &capacity), &std::free);
@@ -105,13 +123,17 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     const std::string base = std::string(qualified.get()) + params.get();
     const std::string_view display(full.get());
     const auto start = display.find(base);
-    if (start == display.npos || (!indexed && compact(display.substr(start)) != wanted))
+    if (start == display.npos || (!indexed && key(display.substr(start)) != wanted))
       return;
     if (match) {
       // Two names for the same code (C1/C2 or D1/D2 aliases) are one callable; different code
       // is ambiguous and is selected by linkage name.
       if (match->address != *address || match->size != elf.getSize())
         throw std::invalid_argument("selector matches multiple ELF function symbols");
+      if (ignore_tags && match->display != std::string(display.substr(start)))
+        throw std::invalid_argument(
+            "selector matches ELF symbols with different ABI tags: " + match->display + ", " +
+            std::string(display.substr(start)));
       return;
     }
     const Text result(demangler.getFunctionReturnType(nullptr, &capacity), &std::free);
@@ -123,7 +145,8 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
       receiver += "void*";
     }
     match = ElfCallable{linkage, params.get(), result ? result.get() : "",
-                        std::move(receiver), *address, elf.getSize()};
+                        std::move(receiver), *address, elf.getSize(),
+                        std::string(display.substr(start))};
   };
   for (const auto &symbol : image.symbols())
     visit(symbol);
@@ -131,15 +154,30 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     visit(symbol);
   if (ambiguous_indexed_linkage)
     throw std::invalid_argument("prepared function has no unique concrete ELF symbol");
-  if (!match)
+  if (!match) {
+    if (!indexed && !ignore_tags && selector.find("[abi:") == selector.npos)
+      return select_symbol(image, selector, member, indexed, true);
     throw std::invalid_argument("no defined C++ ELF function matches the full selector");
+  }
   return std::move(*match);
 }
 
-bool type_text(std::string_view text) {
-  return !text.empty() && text.size() <= 4096 && text.find_first_not_of(
-      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_()*,& \t") == text.npos;
-}
+// Keeps the first compiler error so a failure can say what Clang could not resolve.
+class FirstError final : public clang::TextDiagnosticPrinter {
+public:
+  explicit FirstError(clang::DiagnosticOptions &options)
+      : clang::TextDiagnosticPrinter(llvm::errs(), options) {}
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic &diagnostic) override {
+    if (level >= clang::DiagnosticsEngine::Error && message.empty()) {
+      llvm::SmallString<256> text;
+      diagnostic.FormatDiagnostic(text);
+      message = text.str().str();
+    }
+    clang::TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
+  }
+  std::string message;
+};
 
 clang::QualType alias(clang::ASTContext &ast, llvm::StringRef name) {
   for (const auto *decl : ast.getTranslationUnitDecl()->lookup(&ast.Idents.get(name)))
@@ -148,24 +186,69 @@ clang::QualType alias(clang::ASTContext &ast, llvm::StringRef name) {
   throw std::invalid_argument("invalid C++ signature");
 }
 
-void require_scalar(clang::QualType type) {
+// Without a type context only builtin types can be compiled: nothing defines a class.
+void require_scalar(clang::QualType type, const std::string &selector, const std::string &role,
+                    clang::ASTContext &ast) {
+  const auto written = type;
   type = type.getNonReferenceType();
   while (type->isPointerType())
     type = type->getPointeeType();
   if (!type->isBuiltinType())
-    throw std::invalid_argument("ELF signature mode requires builtin types, pointers, or references");
+    throw std::invalid_argument(
+        selector + ": " + role + " type '" + tracer::prepared::type_name(ast, written) +
+        "' is not a builtin type, pointer or reference to one; its complete definition is "
+        "needed as a type context (--include HEADER --compdb FILE)");
+}
+// A callable requested without its ABI tags is recorded with them, as an indexed package is.
+bool indexed_has_tags(const std::string &text) { return text.find("[abi:") != text.npos; }
+
+std::string tagged_selector(const std::string &requested, const ElfCallable &target) {
+  if (indexed_has_tags(requested) || target.display == ::tracer::strip_abi_tags(target.display) ||
+      target.display.find('(') == target.display.npos)
+    return {};
+  return target.display;
 }
 } // namespace
 
 ResolvedCallable resolve_elf_signature(
     const llvm::object::ELF64LEObjectFile &image, const std::string &selector,
-    const std::string &signature, bool member, const IndexedElfSignature *indexed) {
-  if (!indexed && !type_text(signature))
-    throw std::invalid_argument("--signature requires a C++ function type such as 'const int&()'");
+    const std::string &signature, bool member, const IndexedElfSignature *indexed,
+    const TypeContext *context) {
+  if (!indexed && !tracer::spliceable_type_text(signature))
+    throw std::invalid_argument(
+        "--signature requires a C++ function type such as 'const int&()' (it must not contain " +
+        std::string(tracer::unspliceable_text) + ")");
   const auto target = select_symbol(image, selector, member, indexed);
-  if (!indexed && (!type_text(target.parameters) ||
-      (!target.result.empty() && !type_text(target.result))))
-    throw std::invalid_argument("ELF signature mode requires builtin types, pointers, or references");
+  // The agent's install request carries the linkage name in a fixed 512-byte field, so a
+  // package for a longer name could be written but never installed.
+  if (target.symbol.size() > 511)
+    throw std::invalid_argument(
+        selector + ": the symbol's linkage name is " + std::to_string(target.symbol.size()) +
+        " bytes, and a probe can be installed only on a symbol of at most 511 bytes");
+  if (context) {
+    SymbolContract contract;
+    contract.symbol = target.symbol;
+    contract.display = selector;
+    contract.signature = signature;
+    contract.encoded_parameters = target.parameters;
+    contract.encoded_result = target.result;
+    contract.receiver = target.receiver;
+    if (indexed) {
+      contract.result_type = indexed->result_type;
+      contract.argument_types = indexed->argument_types;
+      contract.declarations = indexed->preamble;
+      contract.result_size = indexed->result_size;
+      contract.argument_sizes = indexed->argument_sizes;
+    }
+    auto resolved = resolve_symbol_in_type_context(contract, *context);
+    resolved.package_selector = tagged_selector(selector, target);
+    return resolved;
+  }
+  if (!indexed && (!tracer::spliceable_type_text(target.parameters) ||
+      (!target.result.empty() && !tracer::spliceable_type_text(target.result))))
+    throw std::invalid_argument(
+        selector + ": the symbol's parameter or result types cannot be compiled without a type "
+        "context (--include HEADER --compdb FILE)");
 
   ResolvedCallable resolved;
   resolved.requires_typed_adapter = true;
@@ -178,11 +261,23 @@ ResolvedCallable resolve_elf_signature(
       package, {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
                                      "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
-  const auto parse = [&](const std::string &source) {
+  // The units keep a pointer to their diagnostic consumer, so each one is kept alive with them.
+  struct Diagnostics {
+    clang::DiagnosticOptions options;
+    FirstError consumer{options};
+  };
+  std::deque<Diagnostics> consumers;
+  const auto parse = [&](const std::string &source, const char *what = "signature") {
+    auto &diagnostics = consumers.emplace_back().consumer;
     auto unit = clang::tooling::buildASTFromCodeWithArgs(
-        source, tracer::clang_driver_arguments(arguments), "elf-signature.cc");
+        source, tracer::clang_driver_arguments(arguments), "elf-signature.cc", "clang-tool",
+        std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
     if (!unit || unit->getDiagnostics().hasErrorOccurred())
-      throw std::invalid_argument("Clang rejected the C++ signature");
+      throw std::invalid_argument(
+          selector + ": Clang cannot compile the " + what + " (" + diagnostics.message +
+          ")" + (indexed ? "" : "; a class or other named type needs its definition supplied as "
+          "a type context (--include HEADER --compdb FILE)"));
     return unit;
   };
 
@@ -206,7 +301,7 @@ ResolvedCallable resolve_elf_signature(
     throw std::invalid_argument("signature result differs from the ELF symbol");
 
   const auto result = supplied->getReturnType();
-  if (!indexed) require_scalar(result);
+  if (!indexed) require_scalar(result, selector, "result", ast);
   llvm::SHA256 identity;
   identity.update(target.symbol + ":" + target.receiver + ":" + compact(signature));
   const auto digest = identity.final();
@@ -219,7 +314,7 @@ ResolvedCallable resolve_elf_signature(
     const auto type = supplied->getParamType(i);
     if (!ast.hasSameType(type, encoded->getParamType(i)))
       throw std::invalid_argument("signature parameters differ from the ELF symbol");
-    if (!indexed) require_scalar(type);
+    if (!indexed) require_scalar(type, selector, "argument " + std::to_string(i), ast);
     const auto argument = "Arg" + std::to_string(i);
     declarations += "using " + argument + " = " + tracer::prepared::type_name(ast, type) + ";\n";
     if (!parameters.empty()) parameters += ", ";
@@ -246,6 +341,7 @@ ResolvedCallable resolve_elf_signature(
   package.set_target_triple(adapter_ast.getTargetInfo().getTriple().str());
   package.set_adapter_declarations(std::move(declarations));
   resolved.declaration = tracer::prepared::type_name(ast, result) + " " + selector;
+  resolved.package_selector = tagged_selector(selector, target);
   return resolved;
 }
 } // namespace tracer::client

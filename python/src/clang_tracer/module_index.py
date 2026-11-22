@@ -195,7 +195,17 @@ class ModuleIndex:
     def prepare_probe(
         self, symbol_id: str, *, output: PathLike, module: PathLike | None = None,
         generated: PathLike | None = None, metadata_only: bool = False,
+        includes: Iterable[PathLike] = (), compilation_database: PathLike | None = None,
+        translation_unit: PathLike | None = None, extra_arguments: Iterable[str] = (),
     ) -> Path:
+        """Create a prepared package for an indexed symbol.
+
+        ``includes``, ``compilation_database``, ``translation_unit`` and ``extra_arguments``
+        supply the type definitions of a function that passes or returns records by value.
+        The headers define the types (they need not declare the function) and the compilation
+        database gives them their language options, target and include paths. A type context
+        cannot be combined with ``generated``.
+        """
         symbol = self.get_symbol(symbol_id)
         path = Path(output).absolute()
         args = ["--selector", symbol.selector, "--id", symbol.id,
@@ -206,5 +216,13 @@ class ModuleIndex:
             args += ["--generated", os.fspath(generated)]
         if metadata_only:
             args += ["--metadata-only"]
+        for header in includes:
+            args += ["--include", os.fspath(Path(header).absolute())]
+        if compilation_database is not None:
+            args += ["--compdb", os.fspath(Path(compilation_database).absolute())]
+        if translation_unit is not None:
+            args += ["--translation-unit", os.fspath(Path(translation_unit).absolute())]
+        for argument in extra_arguments:
+            args += ["--extra-arg", argument]
         _run(os.environ.get("TRACER_PREPARE_EXECUTABLE", "clang-tracer-prepare-injectors-native"), *args)
         return path

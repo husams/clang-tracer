@@ -388,17 +388,22 @@ Command parse_command(std::string input) {
   if (command.kind == K::prepare) {
     const bool elf_mode = command.has("--signature");
     const bool source_mode = command.has("--include");
+    const bool indexed_mode = command.has("--module-index") || command.has("--generated") ||
+                              command.has("--id");
     if (command.option("--output").empty())
       throw std::invalid_argument("%probe prepare requires --output");
-    if (elf_mode && (command.option("--signature").empty() || command.option("--module").empty() ||
-                     source_mode || command.has("--compdb") || command.has("--translation-unit")))
-      throw std::invalid_argument("--signature requires a C++ type, --module and no source options");
+    if (elf_mode && (command.option("--signature").empty() || command.option("--module").empty()))
+      throw std::invalid_argument("--signature requires a C++ type and --module");
     if (!elf_mode && command.has("--member"))
       throw std::invalid_argument("--member requires --signature");
-    if ((source_mode || elf_mode) &&
-        (command.has("--module-index") || command.has("--generated") || command.has("--id")))
-      throw std::invalid_argument("indexed preparation options cannot be combined with headers or a signature");
-    if (!elf_mode && !source_mode &&
+    if (elf_mode && indexed_mode)
+      throw std::invalid_argument("--signature cannot be combined with --module-index, --generated or --id");
+    // Headers are a type context for a callable selected by ELF symbol or index entry, or the
+    // declaration source of a source-prepared one. A generated bundle already carries its own
+    // declarations, so it cannot also take definitions from headers.
+    if (source_mode && command.has("--generated"))
+      throw std::invalid_argument("--generated supplies recovered declarations and cannot be combined with --include");
+    if (!source_mode &&
         (command.has("--compdb") || command.has("--translation-unit") ||
          !command.extra_compile_argument_inputs.empty()))
       throw std::invalid_argument("source preparation requires --include");

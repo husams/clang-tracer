@@ -1,3 +1,4 @@
+#include "abi_tags.hpp"
 #include "module_index_internal.hpp"
 #include "module_index_format.hpp"
 
@@ -274,6 +275,8 @@ std::string normalize_selector(std::string_view value) {
   return out;
 }
 
+std::string strip_abi_tags(std::string_view value) { return ::tracer::strip_abi_tags(value); }
+
 std::string read_file(const fs::path &path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) throw std::runtime_error("cannot read " + path.string());
@@ -390,6 +393,26 @@ ModuleType ModuleIndex::find_type(const std::string &name) const {
       name, type, "type");
 }
 
+namespace {
+// An untagged selector has no exact match when the callable carries ABI tags. The candidates are
+// every symbol whose selector or name differs from the request only in its tag annotations; the
+// scan is over the whole table, so no page or row limit can hide a second candidate.
+std::vector<ModuleSymbol> tag_insensitive_symbols(sqlite3 *db, const std::string &name) {
+  const auto wanted = normalize_selector(strip_abi_tags(name));
+  std::vector<ModuleSymbol> rows;
+  auto stmt = statement(db,
+      "SELECT data FROM symbols WHERE instr(selector,'[abi:')>0 OR instr(name,'[abi:')>0 "
+      "OR instr(linkage,'[abi:')>0 ORDER BY rowid");
+  while (step(stmt.get())) {
+    auto row = decode(column(stmt.get(), 0), symbol);
+    if (normalize_selector(strip_abi_tags(row.selector)) == wanted ||
+        normalize_selector(strip_abi_tags(row.name)) == wanted)
+      rows.push_back(std::move(row));
+  }
+  return rows;
+}
+} // namespace
+
 ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
   // Names for one address and kind (identical C1/C2 or D1/D2 bodies, folded or aliased
   // functions) are one callable, not an ambiguity: pick the name that has debug information,
@@ -402,6 +425,11 @@ ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
   sql_bind(stmt.get(), 2, normalize_selector(name));
   std::vector<ModuleSymbol> rows;
   while (step(stmt.get())) rows.push_back(decode(column(stmt.get(), 0), symbol));
+  // Exact matches keep precedence. Only a request with no exact match may name a unique
+  // ABI-tagged callable by its untagged spelling.
+  // A request that spells any tag must match that spelling exactly.
+  const bool by_tag = rows.empty() && name.find("[abi:") == name.npos;
+  if (by_tag) rows = tag_insensitive_symbols(db.get(), name);
   if (rows.empty()) throw std::invalid_argument("unknown symbol: " + name);
   // A bodyless declaration (kind "declaration") only answers when nothing with code matches:
   // a bare name shared by a defined overload and a pure one selects the defined overload.
@@ -410,15 +438,25 @@ ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
                               [](const ModuleSymbol &row) { return row.kind == "declaration"; }),
                rows.end());
   if (rows.size() > 1) {
-    const bool aliases = std::all_of(rows.begin(), rows.end(), [&](const ModuleSymbol &row) {
-      return row.address != 0 && row.address == rows.front().address &&
-             row.kind == rows.front().kind;
-    });
-    if (!aliases) {
-      std::string ids = rows.front().id;
-      for (std::size_t i = 1; i < rows.size(); ++i) ids += ", " + rows[i].id;
-      throw std::invalid_argument("ambiguous_symbol: " + name + " (" + ids + ")");
-    }
+    const auto list = [&] {
+      std::string ids = by_tag ? rows.front().id + " " + rows.front().selector : rows.front().id;
+      for (std::size_t i = 1; i < rows.size(); ++i)
+        ids += ", " + rows[i].id + (by_tag ? " " + rows[i].selector : std::string());
+      return ids;
+    };
+    // Different tagged spellings are different contracts even when code folding gives them one
+    // address; only one spelling reached through several linkage names (C1/C2 aliases) merges.
+    const bool contracts = by_tag && std::any_of(rows.begin(), rows.end(),
+        [&](const ModuleSymbol &row) {
+          return normalize_selector(row.selector) != normalize_selector(rows.front().selector);
+        });
+    const bool aliases = !contracts && std::all_of(rows.begin(), rows.end(),
+        [&](const ModuleSymbol &row) {
+          return row.address != 0 && row.address == rows.front().address &&
+                 row.kind == rows.front().kind;
+        });
+    if (!aliases)
+      throw std::invalid_argument("ambiguous_symbol: " + name + " (" + list() + ")");
     std::stable_sort(rows.begin(), rows.end(), [](const ModuleSymbol &l, const ModuleSymbol &r) {
       if (l.has_debug != r.has_debug) return l.has_debug;
       return l.id < r.id;
@@ -437,7 +475,8 @@ ModuleSymbol ModuleIndex::get_symbol(const std::string &id) const {
 
 std::filesystem::path ModuleIndex::prepare_probe(const std::string &symbol_id,
     const std::filesystem::path &module, const std::filesystem::path &output,
-    const std::filesystem::path &generated, bool metadata_only) const {
+    const std::filesystem::path &generated, bool metadata_only,
+    const ModulePrepareContext &context) const {
   const auto symbol = get_symbol(symbol_id);
   std::string executable = "clang-tracer-prepare-injectors-native";
   if (const char *configured = std::getenv("TRACER_PREPARE_EXECUTABLE"); configured && *configured) {
@@ -456,6 +495,14 @@ std::filesystem::path ModuleIndex::prepare_probe(const std::string &symbol_id,
   if (!module.empty()) command.insert(command.end(), {"--module", module.string()});
   if (!generated.empty()) command.insert(command.end(), {"--generated", generated.string()});
   if (metadata_only) command.push_back("--metadata-only");
+  for (const auto &header : context.includes)
+    command.insert(command.end(), {"--include", fs::absolute(header).string()});
+  if (!context.compilation_database.empty())
+    command.insert(command.end(), {"--compdb", fs::absolute(context.compilation_database).string()});
+  if (!context.translation_unit.empty())
+    command.insert(command.end(), {"--translation-unit", fs::absolute(context.translation_unit).string()});
+  for (const auto &argument : context.extra_arguments)
+    command.insert(command.end(), {"--extra-arg", argument});
   std::vector<llvm::StringRef> argv(command.begin(), command.end());
   if (llvm::sys::ExecuteAndWait(*program, argv) != 0)
     throw std::runtime_error("indexed probe preparation failed");

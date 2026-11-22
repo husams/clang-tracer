@@ -3,6 +3,7 @@
 #include <llvm/BinaryFormat/Dwarf.h>
 
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
@@ -74,6 +75,9 @@ class Generator {
   std::set<std::string> active_;
   llvm::json::Array omitted_;
   std::string views_;
+  // With a supplied type context the headers define every named type, so a type is spelled by
+  // its qualified name and no declaration or view is generated for it.
+  bool context_ = false;
 
   const ModuleType &get(const std::string &id) {
     if (const auto found = types_.find(id); found != types_.end()) return found->second;
@@ -104,7 +108,15 @@ class Generator {
     const auto &type = get(id);
     if (type.kind == "void") return "void";
     if (type.kind == "scalar") return scalar(type);
-    if (type.kind == "alias") return spelling(type.target_id, behind_pointer);
+    if (type.kind == "alias") {
+      // An unnamed record or enum is known to the headers only by its typedef name.
+      bool is_volatile = false;
+      const auto &target = unqualified(type.target_id, is_volatile);
+      if (context_ && !type.name.empty() && target.name.empty() &&
+          (record(target) || target.kind == "enum"))
+        return "::" + type.name;
+      return spelling(type.target_id, behind_pointer);
+    }
     if (type.kind == "const" || type.kind == "volatile")
       return spelling(type.target_id, behind_pointer) + " " + type.kind;
     if (indirect(type)) {
@@ -113,11 +125,40 @@ class Generator {
       const auto suffix = type.kind == "pointer" ? "*" : type.kind == "reference" ? "&" : "&&";
       return spelling(type.target_id, true) + suffix;
     }
+    if (context_ && (record(type) || type.kind == "enum") && !type.name.empty()) {
+      // A record reached only through a pointer or reference needs a declaration, not a
+      // definition, so one that can be forward declared is, in case the headers leave it
+      // out. Any other (a std, template or nested record) must come from the headers.
+      if (record(type) && behind_pointer) {
+        try {
+          forward(type);
+        } catch (const std::invalid_argument &) {
+        }
+      }
+      return "::" + type.name;
+    }
     if (record(type) && behind_pointer) {
       forward(type);
       return "::" + type.name;
     }
+    if (record(type) && context_)
+      throw std::invalid_argument(
+          "unsupported_call_abi: an unnamed " + type.kind + " is passed or returned by value "
+          "and no typedef names it for the supplied type context");
+    if (record(type))
+      throw std::invalid_argument(
+          "unsupported_call_abi: " + type.kind + " " + type.name + " is passed or returned by "
+          "value, which needs its complete definition; supply the headers that define it as a "
+          "type context (--include HEADER --compdb FILE)");
     throw std::invalid_argument("unsupported_call_abi: " + type.kind + " " + type.name);
+  }
+
+  // The size debug information records for a record that is passed or returned by value.
+  std::optional<std::uint64_t> value_size(const std::string &id) {
+    bool is_volatile = false;
+    const auto &type = unqualified(id, is_volatile);
+    if (record(type) && type.size) return *type.size;
+    return std::nullopt;
   }
 
   const ModuleType &unqualified(std::string id, bool &is_volatile, bool follow_indirect = false) {
@@ -190,7 +231,21 @@ class Generator {
   }
 
 public:
-  explicit Generator(const ModuleIndex &index) : index_(index) {}
+  explicit Generator(const ModuleIndex &index, bool type_context = false)
+      : index_(index), context_(type_context) {}
+
+  // The forward declarations the last signature() calls needed.
+  std::string forward_declarations() const {
+    std::string text;
+    for (const auto &[name, declaration] : declarations_) text += declaration;
+    return text;
+  }
+
+  // Role types and recorded sizes of the last signature() call.
+  std::string result_type;
+  std::vector<std::string> argument_types;
+  std::optional<std::uint64_t> result_size;
+  std::vector<std::optional<std::uint64_t>> argument_sizes;
 
   std::string signature(const ModuleSymbol &symbol) {
     if (symbol.kind == "declaration")
@@ -199,12 +254,18 @@ public:
           "body in this module; select a concrete override by its full selector");
     if (symbol.kind != "function" || !symbol.has_debug || !symbol.diagnostic.empty())
       throw std::invalid_argument("unsupported_call_abi: " + symbol.selector + " " + symbol.diagnostic);
-    auto result = spelling(symbol.type_id) + "(";
+    result_type = spelling(symbol.type_id);
+    result_size = value_size(symbol.type_id);
+    argument_types.clear();
+    argument_sizes.clear();
+    auto result = result_type + "(";
     for (std::size_t i = 0; i < symbol.parameters.size(); ++i) {
       if (i) result += ", ";
       const auto argument = spelling(symbol.parameters[i].type_id);
       if (argument == "void")
         throw std::invalid_argument("missing debug parameter type: " + symbol.parameters[i].name);
+      argument_types.push_back(argument);
+      argument_sizes.push_back(value_size(symbol.parameters[i].type_id));
       result += argument;
     }
     return result + ")";
@@ -260,11 +321,17 @@ HeaderBundle headers(const ModuleIndex &index, const ModuleSelection &selection)
   return Generator(index).generate(selection, false);
 }
 
-IndexedCpp indexed_cpp(const ModuleIndex &index, const ModuleSymbol &symbol) {
-  Generator generator(index);
+IndexedCpp indexed_cpp(const ModuleIndex &index, const ModuleSymbol &symbol,
+                       bool type_context) {
+  Generator generator(index, type_context);
   auto signature = generator.signature(symbol);
-  auto bundle = generator.generate({{symbol.id}, {}}, true);
-  return {std::move(signature), std::move(bundle.preamble)};
+  IndexedCpp result{std::move(signature), {}, generator.result_type, generator.argument_types,
+                    generator.result_size, generator.argument_sizes};
+  // A type context supplies the definitions, so no recovered views are needed; only records
+  // reached through a pointer are declared, after the supplied headers.
+  result.preamble = type_context ? generator.forward_declarations()
+                                 : generator.generate({{symbol.id}, {}}, true).preamble;
+  return result;
 }
 
 } // namespace tracer::module_index

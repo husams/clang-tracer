@@ -65,6 +65,10 @@ int main(int argc, char **argv) {
                      "--module ELF --output NEW_DIRECTORY [--member] [--metadata-only]\n"
                      "Indexed preparation: --selector SELECTOR --module-index INDEX "
                      "--output NEW_DIRECTORY [--module ELF] [--id ID] [--generated DIR]\n"
+                     "ELF and indexed preparation take a type context for records passed by "
+                     "value: --include HEADER... --compdb FILE [--translation-unit FILE] "
+                     "[--extra-arg ARG]... The headers define the types; they need not "
+                     "declare the callable.\n"
                      "Uses the first include's unique compile command if recorded, "
                      "or the first command for a source beside it. "
                      "--module pins the package to an ELF image.\n";
@@ -147,8 +151,11 @@ int main(int argc, char **argv) {
       if (!options.count(option))
         throw std::runtime_error(std::string("missing required option: ") +
                                  option);
-    if (!options.count("--module-index") && headers.empty() && !options.count("--signature") &&
-        !options.count("--compdb") && !options.count("--translation-unit")) {
+    // An index entry named by --id is prepared from an index even when headers supply a type
+    // context; otherwise headers or compiler options select source preparation.
+    if (!options.count("--module-index") && !options.count("--signature") &&
+        (options.count("--id") || (headers.empty() && !options.count("--compdb") &&
+                                   !options.count("--translation-unit")))) {
       if (const auto image = options.find("--module"); image != options.end()) {
         const auto sidecar = image->second + ".tracer.sqlite";
         if (fs::is_regular_file(sidecar)) options.emplace("--module-index", sidecar);
@@ -158,24 +165,51 @@ int main(int argc, char **argv) {
       if (!options.count("--module-index"))
         throw std::invalid_argument("no default module index; pass --module-index INDEX");
     }
+    // Headers and the compilation command that gives them meaning define the types of a
+    // callable that is selected by its ELF symbol or index entry instead of by a declaration.
+    tracer::client::TypeContext type_context;
+    const auto fill_type_context = [&] {
+      if (!options.count("--compdb"))
+        throw std::runtime_error("missing required option: --compdb");
+      type_context.headers = headers;
+      type_context.compilation_database = options.at("--compdb");
+      if (options.count("--translation-unit"))
+        type_context.translation_unit = options.at("--translation-unit");
+      type_context.extra_arguments = extra_arguments;
+      type_context.limits = limits;
+      type_context.no_automatic_members = no_automatic_members;
+      type_context.receiver_storage = receiver_storage;
+    };
+    const auto require_context_options = [&] {
+      if (headers.empty() && (options.count("--compdb") || options.count("--translation-unit") ||
+                              !extra_arguments.empty()))
+        throw std::invalid_argument(
+            "--compdb, --translation-unit and --extra-arg need --include HEADER: the headers "
+            "supply the type definitions");
+    };
     if (const auto indexed = options.find("--module-index"); indexed != options.end()) {
-      if (!headers.empty() || !extra_arguments.empty() || member ||
-          options.count("--compdb") || options.count("--translation-unit") ||
-          options.count("--signature"))
-        throw std::invalid_argument("--module-index is incompatible with source or signature options");
+      if (member || options.count("--signature"))
+        throw std::invalid_argument("--module-index is incompatible with --signature and --member");
+      require_context_options();
+      if (!headers.empty()) fill_type_context();
       const auto index = tracer_module::ModuleIndex::open(indexed->second);
       const auto &selector = options.at("--selector");
       const auto symbol = options.count("--id") ? index.get_symbol(options.at("--id"))
                                                : index.find_symbol(selector);
+      // An untagged selector may name a callable that carries ABI tags; any other mismatch
+      // between --id and the selector is an error.
       if (tracer::module_index::normalize_selector(selector) !=
               tracer::module_index::normalize_selector(symbol.selector) &&
+          tracer::module_index::normalize_selector(selector) !=
+              tracer::module_index::normalize_selector(
+                  tracer::module_index::strip_abi_tags(symbol.selector)) &&
           selector != symbol.name && selector != symbol.linkage &&
           options.count("--id"))
         throw std::invalid_argument("--id does not match the requested selector");
       const auto output = tracer::module_index::prepare_indexed(index, symbol.id,
           options.count("--module") ? options.at("--module") : "",
           options.at("--output"), options.count("--generated") ? options.at("--generated") : "",
-          metadata_only);
+          metadata_only, headers.empty() ? nullptr : &type_context);
       std::cout << "prepared " << output << "\nsymbol=" << symbol.linkage << '\n';
       return 0;
     }
@@ -186,9 +220,8 @@ int main(int argc, char **argv) {
     if (elf_mode) {
       if (!options.count("--module"))
         throw std::invalid_argument("--signature requires --module");
-      if (!headers.empty() || options.count("--compdb") ||
-          options.count("--translation-unit") || !extra_arguments.empty())
-        throw std::invalid_argument("--signature cannot be combined with source or compiler options");
+      require_context_options();
+      if (!headers.empty()) fill_type_context();
     } else {
       if (member)
         throw std::invalid_argument("--member requires --signature");
@@ -214,14 +247,18 @@ int main(int argc, char **argv) {
       digest = image_digest(module, [&](const auto &object) {
         if (elf_mode)
           elf_callable = tracer::client::resolve_elf_signature(
-              object, options.at("--selector"), signature_option->second, member);
+              object, options.at("--selector"), signature_option->second, member, nullptr,
+              headers.empty() ? nullptr : &type_context);
       }, receiver_storage && !elf_mode);
     }
     std::string translation_unit;
     bool cl_driver = false;
     const auto resolved = [&] {
-      if (elf_callable)
+      if (elf_callable) {
+        translation_unit = elf_callable->translation_unit;
+        cl_driver = elf_callable->cl_driver;
         return std::move(*elf_callable);
+      }
 
       const auto unit = options.find("--translation-unit");
       auto command = tracer::client::resolve_prepared_header_command(
@@ -233,42 +270,16 @@ int main(int argc, char **argv) {
           extra_arguments, command.arguments, command.directory);
       for (const auto &argument : supplemental)
         command.arguments.push_back(cl_driver ? "/clang:" + argument : argument);
-      const auto resolve_adapter = [&](bool pointer_layouts, int member_level) {
-        auto callable = tracer::client::resolve_header_callable(
-            options.at("--selector"), context, command, pointer_layouts, member_level, limits, receiver_storage);
-        auto &adapter = *callable.spec.mutable_prepared();
-        tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
-                                                callable, pointer_layouts);
-        return callable;
-      };
-      struct Step {
-        bool pointer_layouts;
-        int member_level;
-        const char *what;
-      };
-      // Each step captures less than the one before, so a package that cannot
-      // be built with the fuller captures still gets the narrower ones.
-      const std::vector<Step> steps = no_automatic_members
-          ? std::vector<Step>{{true, 0, "no automatic member captures"},
-                              {false, 0, "address-only pointers"}}
-          : std::vector<Step>{{true, 3, "automatic member captures"},
-                              {true, 2, "opaque implementation pointer captures"},
-                              {true, 1, "derived-class member captures"},
-                              {false, 1, "address-only pointers"}};
-      std::vector<std::string> failures;
-      for (const auto &step : steps) {
-        try {
-          auto callable = resolve_adapter(step.pointer_layouts, step.member_level);
-          for (std::size_t i = 0; i < failures.size(); ++i)
-            std::cerr << "prepare: without " << steps[i].what << ": " << failures[i] << '\n';
-          if (!failures.empty())
-            std::cerr << "prepare: retaining " << step.what << '\n';
-          return callable;
-        } catch (const std::runtime_error &error) {
-          failures.emplace_back(error.what());
-        }
-      }
-      throw std::runtime_error(failures.front());
+      return tracer::client::resolve_with_capture_steps(
+          no_automatic_members, [&](bool pointer_layouts, int member_level) {
+            auto callable = tracer::client::resolve_header_callable(
+                options.at("--selector"), context, command, pointer_layouts, member_level, limits,
+                receiver_storage);
+            auto &adapter = *callable.spec.mutable_prepared();
+            tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
+                                                    callable, pointer_layouts);
+            return callable;
+          });
     }();
     if (!resolved.pure_virtual_overrides.empty()) {
       // A pure virtual method can have a body. The module decides: without a defined function
@@ -308,8 +319,9 @@ int main(int argc, char **argv) {
       }
     }
     const auto prepared = tracer::client::write_prepared_package(
-        resolved, options.at("--selector"), module, digest, output, metadata_only,
-        translation_unit, cl_driver);
+        resolved, resolved.package_selector.empty() ? options.at("--selector")
+                                                     : resolved.package_selector,
+        module, digest, output, metadata_only, translation_unit, cl_driver);
     std::cout << "prepared " << output << "\n"
               << resolved.declaration << "\nsymbol=" << prepared.symbol()
               << "\n";

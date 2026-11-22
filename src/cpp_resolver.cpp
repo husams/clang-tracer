@@ -3,6 +3,7 @@
 #include "prepared_types.hpp"
 #include "snapshot_limits.hpp"
 #include "snapshot_members.hpp"
+#include "type_text.hpp"
 #include "prepared_adapter.hpp"
 #include "prepared_contract.hpp"
 #include "prepared_header_search.hpp"
@@ -25,6 +26,8 @@
 #include <filesystem>
 #include <iterator>
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <deque>
 #include <map>
 #include <memory>
@@ -1032,20 +1035,34 @@ struct FrozenInvocation {
 
 class PrepareDiagnostics final : public clang::TextDiagnosticPrinter {
 public:
-  explicit PrepareDiagnostics(clang::DiagnosticOptions& options)
-      : clang::TextDiagnosticPrinter(llvm::errs(), options) {}
+  // A quiet consumer records errors without printing them, for an attempt that has a fallback.
+  explicit PrepareDiagnostics(clang::DiagnosticOptions& options, bool quiet = false)
+      : clang::TextDiagnosticPrinter(llvm::errs(), options), quiet_(quiet) {}
 
   void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
                         const clang::Diagnostic& diagnostic) override {
+    if (level >= clang::DiagnosticsEngine::Error && first_error_.empty()) {
+      llvm::SmallString<256> text;
+      diagnostic.FormatDiagnostic(text);
+      first_error_ = text.str().str();
+    }
     had_error_ |= level >= clang::DiagnosticsEngine::Error;
+    if (quiet_) {
+      clang::DiagnosticConsumer::HandleDiagnostic(level, diagnostic);
+      return;
+    }
     clang::TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
   }
 
   // A ToolInvocation can continue into the frontend after a driver error.
   bool had_error() const { return had_error_; }
+  // The first compiler error, for a diagnostic that names the callable and role it concerns.
+  const std::string& first_error() const { return first_error_; }
 
 private:
+  bool quiet_ = false;
   bool had_error_ = false;
+  std::string first_error_;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -1901,24 +1918,24 @@ std::vector<api::ObjectWatchRequest::SourceWriter> discover_object_writers(
   return result;
 }
 
-ResolvedCallable resolve_header_callable(const std::string& name,
-                                         const api::ProbeSpec& headers,
-                                         const PreparedHeaderCommand& command,
-                                         bool pointer_layouts, int member_level,
-                                         const api::SnapshotLimits& limits, bool receiver_storage) {
-  const auto selector = parse_selector(name);
-  if (cdtor_linkage_symbol(selector.qualified_name))
-    throw std::invalid_argument(
-        "a prepared package binds the complete-object constructor or destructor (C1/D1) of a C++ "
-        "selector; the deleting destructor (D0) and base-object (C2/D2) entry points cannot be "
-        "prepared from source. Probe them by linkage symbol on the DWARF path "
-        "(%probe inject SYMBOL)");
-  if (!selector.has_parameters || headers.include_headers().empty())
-    throw std::runtime_error("prepared generation requires an explicit selector and header context");
+namespace {
+// The compiler arguments and recorded toolchain profile that a donor compile command yields.
+// Only driver and toolchain selection is carried; application include paths, forced headers
+// and defines are not.
+struct HeaderToolchain {
+  std::vector<std::string> arguments;
+  api::PreparedInjector profile;
+  bool clang_cl = false;
+};
+
+HeaderToolchain header_toolchain(const PreparedHeaderCommand& command) {
+  HeaderToolchain toolchain;
+  auto &arguments = toolchain.arguments;
   // Use the SDK fallback unless the database names a different installed
   // compiler by path or explicitly selects a toolchain.
-  std::vector<std::string> arguments{"--no-default-config"};
+  arguments.push_back("--no-default-config");
   const bool clang_cl = command.driver_mode == "cl";
+  toolchain.clang_cl = clang_cl;
   std::error_code path_error;
   const bool installed_driver = fs::path(command.driver).is_absolute() &&
       fs::is_regular_file(command.driver, path_error);
@@ -1929,8 +1946,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
     const auto builtin = fs::canonical(TRACER_PREPARE_BUILD_CXX, path_error);
     return !path_error && selected != builtin;
   }();
-  FrozenInvocation invocation;
-  auto &profile = invocation.prepared_profile;
+  auto &profile = toolchain.profile;
   profile.set_format_version(tracer::prepared::typed_version);
   profile.add_adapter_toolchain_options("--no-default-config");
   profile.add_adapter_toolchain_options("--driver-mode=" + command.driver_mode);
@@ -1984,6 +2000,30 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   arguments.insert(arguments.end(), command.arguments.begin(), command.arguments.end());
   arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
   arguments.insert(arguments.end(), {"-fsyntax-only", "-x", "c++"});
+  return toolchain;
+}
+
+} // namespace
+
+ResolvedCallable resolve_header_callable(const std::string& name,
+                                         const api::ProbeSpec& headers,
+                                         const PreparedHeaderCommand& command,
+                                         bool pointer_layouts, int member_level,
+                                         const api::SnapshotLimits& limits, bool receiver_storage) {
+  const auto selector = parse_selector(name);
+  if (cdtor_linkage_symbol(selector.qualified_name))
+    throw std::invalid_argument(
+        "a prepared package binds the complete-object constructor or destructor (C1/D1) of a C++ "
+        "selector; the deleting destructor (D0) and base-object (C2/D2) entry points cannot be "
+        "prepared from source. Probe them by linkage symbol on the DWARF path "
+        "(%probe inject SYMBOL)");
+  if (!selector.has_parameters || headers.include_headers().empty())
+    throw std::runtime_error("prepared generation requires an explicit selector and header context");
+  auto toolchain = header_toolchain(command);
+  auto &arguments = toolchain.arguments;
+  const bool clang_cl = toolchain.clang_cl;
+  FrozenInvocation invocation;
+  invocation.prepared_profile = std::move(toolchain.profile);
   const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
   std::string code;
   for (const auto& header : headers.include_headers())
@@ -2060,9 +2100,476 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   return select_cpp_candidate(std::move(candidates), selector, name);
 }
 
+ResolvedCallable resolve_with_capture_steps(
+    bool no_automatic_members, const std::function<ResolvedCallable(bool, int)> &resolve) {
+  struct Step {
+    bool pointer_layouts;
+    int member_level;
+    const char *what;
+  };
+  // Each step captures less than the one before, so a package that cannot
+  // be built with the fuller captures still gets the narrower ones.
+  const std::vector<Step> steps = no_automatic_members
+      ? std::vector<Step>{{true, 0, "no automatic member captures"},
+                          {false, 0, "address-only pointers"}}
+      : std::vector<Step>{{true, 3, "automatic member captures"},
+                          {true, 2, "opaque implementation pointer captures"},
+                          {true, 1, "derived-class member captures"},
+                          {false, 1, "address-only pointers"}};
+  std::vector<std::string> failures;
+  for (const auto &step : steps) {
+    try {
+      auto callable = resolve(step.pointer_layouts, step.member_level);
+      for (std::size_t i = 0; i < failures.size(); ++i)
+        llvm::errs() << "prepare: without " << steps[i].what << ": " << failures[i] << '\n';
+      if (!failures.empty())
+        llvm::errs() << "prepare: retaining " << step.what << '\n';
+      return callable;
+    } catch (const std::runtime_error &error) {
+      failures.emplace_back(error.what());
+    }
+  }
+  throw std::runtime_error(failures.front());
+}
+
+namespace {
+constexpr const char *probe_scope = "tracer_symbol_probe";
+
+// Aliases of the generated scope. Type text written by the user or printed for a type is
+// looked up from inside that scope, where an alias would hide a global declaration of the same
+// name, so the probe rejects a type context that declares one of them.
+std::string probe_alias(const std::string &role) { return "TracerProbe" + role; }
+std::string probe_argument(std::size_t index) { return probe_alias("Arg" + std::to_string(index)); }
+
+// Generated declarations follow the supplied headers, which may already declare the same
+// records with another class key or inside an inline namespace.
+std::string guarded_declarations(const std::string &declarations) {
+  if (declarations.empty()) return {};
+  return "#pragma clang diagnostic push\n"
+         "#pragma clang diagnostic ignored \"-Wmismatched-tags\"\n"
+         "#pragma clang diagnostic ignored \"-Winline-namespace-reopened-noninline\"\n" +
+         declarations + "#pragma clang diagnostic pop\n";
+}
+
+// What the type-checking pass learned about a contract in the supplied context.
+struct SymbolProbe {
+  std::string scope;
+  std::string includes;           // the headers and generated declarations that compiled
+  std::string declarations;       // the namespace that declares the target function
+  std::string failure;            // a contract violation, already worded
+};
+
+class SymbolProbeConsumer final : public clang::ASTConsumer {
+public:
+  SymbolProbeConsumer(clang::CompilerInstance &compiler, const SymbolContract &contract,
+                      SymbolProbe &probe)
+      : compiler_(compiler), contract_(contract), probe_(probe) {}
+
+  void HandleTranslationUnit(clang::ASTContext &ast) override {
+    try {
+      inspect(ast);
+    } catch (const std::exception &error) {
+      probe_.failure = error.what();
+    }
+  }
+
+private:
+  [[noreturn]] void fail(const std::string &reason) const {
+    throw std::invalid_argument(contract_.display + ": " + reason);
+  }
+
+  void inspect(clang::ASTContext &ast) {
+    const clang::NamespaceDecl *space = nullptr;
+    for (const auto *decl : ast.getTranslationUnitDecl()->lookup(&ast.Idents.get(probe_scope)))
+      if ((space = llvm::dyn_cast<clang::NamespaceDecl>(decl)))
+        break;
+    if (!space)
+      fail("the supplied type context did not produce the signature probe");
+    const bool roles = contract_.result_type.has_value();
+    const std::size_t expected = 1 + (roles ? 1 + contract_.argument_types.size() : 0) +
+        (contract_.encoded_parameters.empty() ? 0 : 1) + (contract_.encoded_result.empty() ? 0 : 1);
+    if (static_cast<std::size_t>(std::distance(space->decls_begin(), space->decls_end())) != expected)
+      fail("the signature text does not form exactly one function type");
+    const auto alias = [&](const std::string &name) -> const clang::TypeAliasDecl * {
+      for (const auto *decl : space->lookup(&ast.Idents.get(name)))
+        if (const auto *type = llvm::dyn_cast<clang::TypeAliasDecl>(decl))
+          return type;
+      return nullptr;
+    };
+    std::vector<std::string> names{probe_alias("Supplied")};
+    if (!contract_.encoded_parameters.empty()) names.push_back(probe_alias("Encoded"));
+    if (!contract_.encoded_result.empty()) names.push_back(probe_alias("EncodedResult"));
+    if (roles) {
+      names.push_back(probe_alias("Result"));
+      for (std::size_t i = 0; i < contract_.argument_types.size(); ++i)
+        names.push_back(probe_argument(i));
+    }
+    // A compile error leaves aliases without a usable type; the caller reports the error then.
+    for (const auto &name : names) {
+      const auto *type = alias(name);
+      if (!type || type->isInvalidDecl() || type->getUnderlyingType().isNull())
+        fail("the supplied type context did not produce the type '" + name + "'");
+    }
+    const auto *supplied =
+        alias(probe_alias("Supplied"))->getUnderlyingType()->getAs<clang::FunctionProtoType>();
+    if (!supplied)
+      fail("the signature is not a function type");
+    // The adapter declares a result and one alias per parameter on either route.
+    names.push_back(probe_alias("Result"));
+    for (unsigned i = 0; i < supplied->getNumParams(); ++i) names.push_back(probe_argument(i));
+    for (const auto &name : names)
+      if (!ast.getTranslationUnitDecl()->lookup(&ast.Idents.get(name)).empty())
+        fail("the supplied type context declares '::" + name + "', a name the generated "
+             "adapter uses for its own types");
+    if (supplied->isVariadic() || supplied->getCallConv() != clang::CC_C ||
+        !supplied->getMethodQuals().empty() || supplied->getRefQualifier() != clang::RQ_None ||
+        supplied->hasExtParameterInfos() ||
+        supplied->getExtInfo() != clang::FunctionType::ExtInfo{})
+      fail("the signature requires a fixed-arity default-ABI function type");
+    const clang::FunctionProtoType *encoded = supplied;
+    if (!contract_.encoded_parameters.empty()) {
+      encoded = alias(probe_alias("Encoded"))->getUnderlyingType()->getAs<clang::FunctionProtoType>();
+      if (!encoded || encoded->isVariadic())
+        fail("signature parameters differ from the ELF symbol (the symbol is variadic)");
+      if (supplied->getNumParams() != encoded->getNumParams())
+        fail("signature parameters differ from the ELF symbol (" +
+             std::to_string(supplied->getNumParams()) + " supplied, " +
+             std::to_string(encoded->getNumParams()) + " encoded)");
+    }
+    if (!contract_.encoded_result.empty() &&
+        !ast.hasSameType(supplied->getReturnType(),
+                         alias(probe_alias("EncodedResult"))->getUnderlyingType()))
+      fail("signature result differs from the ELF symbol");
+    if (roles && contract_.argument_sizes.size() != supplied->getNumParams())
+      fail("the debug information lists a different number of parameters than the signature");
+
+    auto &sema = compiler_.getSema();
+    const auto location = space->getLocation();
+    const auto role_name = [&](int index) {
+      return index < 0 ? std::string("result") : "argument " + std::to_string(index);
+    };
+    const auto check = [&](clang::QualType type, int index,
+                           const std::optional<std::uint64_t> &recorded) {
+      const auto spelled = tracer::prepared::type_name(ast, type);
+      if (!type->isRecordType())
+        return;
+      if (type->isIncompleteType() && !sema.isCompleteType(location, type))
+        fail(role_name(index) + " type '" + spelled + "' is incomplete in the supplied type "
+             "context; the headers must define every record passed or returned by value");
+      if (recorded) {
+        const auto actual = static_cast<std::uint64_t>(ast.getTypeSizeInChars(type).getQuantity());
+        if (actual != *recorded)
+          fail(role_name(index) + " type '" + spelled + "' is " + std::to_string(actual) +
+               " bytes in the supplied type context but " + std::to_string(*recorded) +
+               " bytes in the target's debug information; the headers or ABI macros do not "
+               "match the build");
+      }
+    };
+    check(supplied->getReturnType(), -1, contract_.result_size);
+    for (unsigned i = 0; i < supplied->getNumParams(); ++i) {
+      if (!ast.hasSameType(supplied->getParamType(i), encoded->getParamType(i)))
+        fail("signature parameters differ from the ELF symbol (" + role_name(static_cast<int>(i)) +
+             ": supplied '" + tracer::prepared::type_name(ast, supplied->getParamType(i)) +
+             "', encoded '" + tracer::prepared::type_name(ast, encoded->getParamType(i)) + "')");
+      check(supplied->getParamType(i), static_cast<int>(i),
+            roles ? contract_.argument_sizes[i] : std::optional<std::uint64_t>());
+    }
+
+    probe_.declarations = "namespace " + probe_.scope + " {\nusing " + probe_alias("Result") +
+        " = " + tracer::prepared::type_name(ast, supplied->getReturnType()) + ";\n";
+    std::string parameters = contract_.receiver.empty() ? "" : contract_.receiver + " receiver";
+    for (unsigned i = 0; i < supplied->getNumParams(); ++i) {
+      const auto argument = probe_argument(i);
+      probe_.declarations += "using " + argument + " = " +
+          tracer::prepared::type_name(ast, supplied->getParamType(i)) + ";\n";
+      if (!parameters.empty()) parameters += ", ";
+      parameters += argument + " arg" + std::to_string(i);
+    }
+    probe_.declarations += probe_alias("Result") + " target(" + parameters + ") __asm__(\"" +
+                           contract_.symbol + "\");\n}\n";
+  }
+
+  clang::CompilerInstance &compiler_;
+  const SymbolContract &contract_;
+  SymbolProbe &probe_;
+};
+
+class SymbolProbeAction final : public clang::ASTFrontendAction {
+public:
+  SymbolProbeAction(const SymbolContract &contract, SymbolProbe &probe)
+      : contract_(contract), probe_(probe) {}
+  std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance &compiler,
+                                                        llvm::StringRef) override {
+    return std::make_unique<SymbolProbeConsumer>(compiler, contract_, probe_);
+  }
+
+private:
+  const SymbolContract &contract_;
+  SymbolProbe &probe_;
+};
+
+class SymbolProbeFactory final : public clang::tooling::FrontendActionFactory {
+public:
+  SymbolProbeFactory(const SymbolContract &contract, SymbolProbe &probe)
+      : contract_(contract), probe_(probe) {}
+  std::unique_ptr<clang::FrontendAction> create() override {
+    return std::make_unique<SymbolProbeAction>(contract_, probe_);
+  }
+
+private:
+  const SymbolContract &contract_;
+  SymbolProbe &probe_;
+};
+
+std::string probe_source(const std::string &includes, const SymbolContract &contract) {
+  std::string code = includes + "namespace " + probe_scope + " {\n";
+  // The demangled text is unqualified, so it is declared before any alias it could name.
+  if (!contract.encoded_parameters.empty())
+    code += "using " + probe_alias("Encoded") + " = void" + contract.encoded_parameters + ";\n";
+  if (!contract.encoded_result.empty())
+    code += "using " + probe_alias("EncodedResult") + " = " + contract.encoded_result + ";\n";
+  if (contract.result_type) {
+    code += "using " + probe_alias("Result") + " = " + *contract.result_type + ";\n";
+    std::string arguments;
+    for (std::size_t i = 0; i < contract.argument_types.size(); ++i) {
+      code += "using " + probe_argument(i) + " = " + contract.argument_types[i] + ";\n";
+      arguments += (i ? ", " : "") + probe_argument(i);
+    }
+    code += "using " + probe_alias("Supplied") + " = " + probe_alias("Result") + "(" + arguments +
+            ");\n";
+  } else {
+    code += "using " + probe_alias("Supplied") + " = " + contract.signature + ";\n";
+  }
+  return code + "}\n";
+}
+
+// Compiles one type spelling in the supplied context and returns the compiler's first error,
+// or nothing when it compiles. Only the failure path pays for the extra parse.
+std::string type_error(const PreparedHeaderCommand &command,
+                       const std::vector<std::string> &arguments, const std::string &includes,
+                       const std::string &spelling) {
+  const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
+  clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
+  clang::tooling::ClangTool tool(database, {source});
+  tool.clearArgumentsAdjusters();
+  tool.setDiagnosticConsumer(&diagnostics);
+  const auto code = includes + "using TracerRole = " + spelling + ";\n";
+  tool.mapVirtualFile(source, code);
+  const auto factory = clang::tooling::newFrontendActionFactory<clang::SyntaxOnlyAction>();
+  tool.run(factory.get());
+  return diagnostics.had_error() ? diagnostics.first_error() : std::string();
+}
+
+// The probe failed to compile. Name the headers when they do not compile on their own, the
+// role or encoded type that does not, or the headers again when every part compiles alone.
+// `headers` is the supplied context and `includes` adds the generated declarations.
+std::string explain_context_failure(const PreparedHeaderCommand &command,
+                                    const std::vector<std::string> &arguments,
+                                    const std::string &headers, std::string includes,
+                                    const SymbolContract &contract,
+                                    const std::string &first_error) {
+  const auto unparsed = [&](const std::string &error) {
+    return "Clang reported an error while parsing the supplied type context for " +
+           contract.display + ": " + error;
+  };
+  const auto missing = [&](const std::string &role, const std::string &spelling,
+                           const std::string &error) {
+    return contract.display + ": " + role + " '" + spelling + "' cannot be compiled in the "
+           "supplied type context (" + error + "); supply headers that declare and define it";
+  };
+  // A header that does not compile fails every role, so it is reported as itself.
+  if (const auto error = type_error(command, arguments, headers, "void"); !error.empty())
+    return unparsed(error);
+  // Generated declarations that the headers reject are left out of the per-role checks.
+  if (includes != headers && !type_error(command, arguments, includes, "void").empty())
+    includes = headers;
+  if (!contract.result_type) {
+    if (const auto error = type_error(command, arguments, includes, contract.signature);
+        !error.empty())
+      return missing("the signature", contract.signature, error);
+  } else {
+    if (const auto error = type_error(command, arguments, includes, *contract.result_type);
+        !error.empty())
+      return missing("result type", *contract.result_type, error);
+    for (std::size_t i = 0; i < contract.argument_types.size(); ++i)
+      if (const auto error = type_error(command, arguments, includes, contract.argument_types[i]);
+          !error.empty())
+        return missing("argument " + std::to_string(i) + " type", contract.argument_types[i],
+                       error);
+  }
+  // What the symbol's mangled name encodes is spelled by the demangler, not by the user.
+  const auto encoded = [&](const std::string &what, const std::string &spelling,
+                           const std::string &error) {
+    return contract.display + ": the " + what + " the ELF symbol encodes, '" + spelling +
+           "', cannot be compiled in the supplied type context (" + error + ")";
+  };
+  if (!contract.encoded_parameters.empty())
+    if (const auto error = type_error(command, arguments, includes,
+                                      "void" + contract.encoded_parameters); !error.empty())
+      return encoded("parameter list", contract.encoded_parameters, error);
+  if (!contract.encoded_result.empty())
+    if (const auto error = type_error(command, arguments, includes, contract.encoded_result);
+        !error.empty())
+      return encoded("result type", contract.encoded_result, error);
+  return unparsed(first_error);
+}
+
+// Compiles the probe with `includes`. Returns the compiler's first error, or nothing when the
+// probe compiled (its findings, including a contract violation, are then in `probe`).
+std::string run_symbol_probe(const PreparedHeaderCommand &command,
+                             const std::vector<std::string> &arguments,
+                             const std::string &includes, const SymbolContract &contract,
+                             SymbolProbe &probe, bool quiet) {
+  const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
+  clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options, quiet);
+  clang::tooling::ClangTool tool(database, {source});
+  tool.clearArgumentsAdjusters();
+  tool.setDiagnosticConsumer(&diagnostics);
+  // The tool maps the text without copying it.
+  const auto code = probe_source(includes, contract);
+  tool.mapVirtualFile(source, code);
+  probe.failure.clear();
+  probe.declarations.clear();
+  probe.includes = includes;
+  SymbolProbeFactory factory(contract, probe);
+  const auto result = tool.run(&factory);
+  if (diagnostics.had_error()) return diagnostics.first_error();
+  if (probe.failure.empty() && (result != 0 || probe.declarations.empty()))
+    throw std::runtime_error("cannot parse the supplied type context for " + contract.display);
+  return {};
+}
+
+SymbolProbe probe_symbol_types(const PreparedHeaderCommand &command,
+                               const std::vector<std::string> &arguments,
+                               const std::string &headers, const SymbolContract &contract,
+                               const std::string &scope) {
+  SymbolProbe probe;
+  probe.scope = scope;
+  // Records reached only through a pointer are declared after the headers. Headers that
+  // cannot take those declarations are tried on their own before the failure is explained.
+  const auto includes = headers + guarded_declarations(contract.declarations);
+  const bool fallback = includes != headers;
+  auto error = run_symbol_probe(command, arguments, includes, contract, probe, fallback);
+  if (!error.empty() && fallback)
+    error = run_symbol_probe(command, arguments, headers, contract, probe, false);
+  if (!error.empty())
+    throw std::invalid_argument(
+        explain_context_failure(command, arguments, headers, includes, contract, error));
+  if (!probe.failure.empty())
+    throw std::invalid_argument(probe.failure);
+  return probe;
+}
+
+ResolvedCallable compile_typed_adapter(const PreparedHeaderCommand &command,
+                                       const HeaderToolchain &toolchain, const SymbolProbe &probe,
+                                       const SymbolContract &contract, const TypeContext &context,
+                                       bool pointer_layouts, int member_level) {
+  FrozenInvocation invocation;
+  invocation.prepared_profile = toolchain.profile;
+  invocation.adapter_symbol = contract.symbol;
+  invocation.pointer_layouts = pointer_layouts;
+  invocation.member_level = member_level;
+  invocation.limits = context.limits;
+  invocation.receiver_storage = context.receiver_storage;
+  invocation.prepared_headers = context.headers;
+  const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
+  clang::tooling::FixedCompilationDatabase database(command.directory, toolchain.arguments);
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
+  clang::tooling::ClangTool tool(database, {source});
+  tool.clearArgumentsAdjusters();
+  tool.setDiagnosticConsumer(&diagnostics);
+  const auto code = probe.includes + probe.declarations;
+  tool.mapVirtualFile(source, code);
+  tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments &args,
+                                   llvm::StringRef filename) {
+    invocation.arguments = args;
+    invocation.arguments.front() = command.driver;
+    invocation.source_argument = filename.str();
+    return invocation.arguments;
+  });
+  std::vector<Candidate> candidates;
+  std::string target_error, invocation_error;
+  const std::string qualified = probe.scope + "::target";
+  ActionFactory factory(candidates, target_error, qualified, invocation, invocation_error, true);
+  const auto result = tool.run(&factory);
+  if (diagnostics.had_error())
+    throw std::invalid_argument("Clang reported an error while parsing the supplied type context "
+                                "for " + contract.display + ": " + diagnostics.first_error());
+  if (!target_error.empty() || !invocation_error.empty() || result != 0)
+    throw std::runtime_error("cannot parse the supplied type context: " + target_error +
+                             invocation_error);
+  const auto found = std::find_if(candidates.begin(), candidates.end(), [&](const Candidate &item) {
+    return item.spec.symbol() == contract.symbol || item.symbol == contract.symbol;
+  });
+  if (found == candidates.end())
+    throw std::runtime_error("the generated adapter declaration for " + contract.display +
+                             " was not found");
+  if (!found->unsupported_reason.empty())
+    throw std::runtime_error(contract.display + " is unsupported: " + found->unsupported_reason);
+  ResolvedCallable resolved;
+  resolved.spec = std::move(found->spec);
+  resolved.declaration = resolved.spec.debug_info().result_cpp_type() + " " + contract.display;
+  resolved.requires_typed_adapter = true;
+  resolved.adapter_selector = probe.scope + "::target()";
+  resolved.translation_unit = command.translation_unit;
+  resolved.cl_driver = command.driver_mode == "cl";
+  return resolved;
+}
+} // namespace
+
+ResolvedCallable resolve_symbol_in_type_context(const SymbolContract &contract,
+                                                const TypeContext &context) {
+  if (context.headers.empty())
+    throw std::invalid_argument("a type context requires at least one --include header");
+  if (!tracer::spliceable_type_text(contract.signature.empty() && contract.result_type
+                                ? *contract.result_type : contract.signature) ||
+      (!contract.encoded_parameters.empty() && !tracer::spliceable_type_text(contract.encoded_parameters)) ||
+      (!contract.encoded_result.empty() && !tracer::spliceable_type_text(contract.encoded_result)))
+    throw std::invalid_argument(contract.display + ": the signature text is empty or contains "
+        "text that cannot be part of a C++ type (" + std::string(tracer::unspliceable_text) + ")");
+  for (const auto &type : contract.argument_types)
+    if (!tracer::spliceable_type_text(type))
+      throw std::invalid_argument(contract.display + ": a parameter type spelling is not a C++ type");
+  std::string headers;
+  for (const auto &header : context.headers) {
+    if (header.find_first_of("\"\r\n") != std::string::npos)
+      throw std::invalid_argument("invalid header path");
+    headers += "#include \"" + header + "\"\n";
+  }
+  auto command = resolve_prepared_header_command(context.headers.front(),
+                                                  context.compilation_database,
+                                                  context.translation_unit);
+  const bool cl_driver = command.driver_mode == "cl";
+  for (const auto &argument : tracer::normalize_extra_compile_arguments(
+           context.extra_arguments, command.arguments, command.directory))
+    command.arguments.push_back(cl_driver ? "/clang:" + argument : argument);
+  auto toolchain = header_toolchain(command);
+  llvm::SHA256 identity;
+  identity.update(contract.symbol + ":" + contract.receiver + ":" + compact(contract.signature));
+  const auto digest = identity.final();
+  const auto scope = "tracer_elf_adapter_" +
+      llvm::toHex(llvm::ArrayRef<std::uint8_t>(digest).take_front(16), true);
+  const auto probe = probe_symbol_types(command, toolchain.arguments, headers, contract, scope);
+  return resolve_with_capture_steps(context.no_automatic_members,
+      [&](bool pointer_layouts, int member_level) {
+        auto callable = compile_typed_adapter(command, toolchain, probe, contract, context,
+                                              pointer_layouts, member_level);
+        verify_prepared_adapter(contract.display, callable.spec.prepared(), callable,
+                                pointer_layouts);
+        return callable;
+      });
+}
+
+
 void verify_prepared_adapter(const std::string &name, const api::PreparedInjector &adapter,
                              const ResolvedCallable &original, bool pointer_layouts) {
-  const auto selector = parse_selector(name);
+  const auto selector = parse_selector(
+      original.adapter_selector.empty() ? name : original.adapter_selector);
   auto arguments = tracer::prepared::toolchain_arguments(adapter,
       {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
