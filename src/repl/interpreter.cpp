@@ -458,7 +458,12 @@ void collect_adapter_definitions(const clang::DeclContext &scope, const std::str
     // SnapshotTypeN is numbered per adapter, so two adapters reuse the names.
     const bool snapshot_alias = alias &&
         alias->getQualifiedNameAsString().rfind("tracer_prepared::SnapshotType", 0) == 0;
-    if (!definition && !snapshot_alias)
+    // An unnamed tag is defined by the typedef that names it for linkage.
+    const auto *unnamed = alias ? alias->getUnderlyingType()->getAsTagDecl() : nullptr;
+    const bool typedef_definition = unnamed && !unnamed->getIdentifier() &&
+        unnamed->isThisDeclarationADefinition() && unnamed->getTypedefNameForAnonDecl() &&
+        unnamed->getTypedefNameForAnonDecl()->getCanonicalDecl() == alias->getCanonicalDecl();
+    if (!definition && !snapshot_alias && !typedef_definition)
       continue;
     const auto range = decl->getSourceRange();
     const auto last = clang::Lexer::getLocForEndOfToken(range.getEnd(), 0, sources,
