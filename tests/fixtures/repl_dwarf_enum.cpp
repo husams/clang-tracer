@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/prctl.h>
+#include <system_error>
 #include <unistd.h>
 
 #ifndef PR_SET_PTRACER
@@ -22,9 +23,10 @@
 
 namespace enums {
 
-// Supported: the underlying type is int, long long or unsigned long, which have an exact
-// DWARF trace value type (int32, int64, uint64).
+// Supported: the underlying type is int, long long, unsigned long or bool, which have an exact
+// DWARF trace value type (int32, int64, uint64, bool).
 enum Sign { Minus = -1, Plus = 1 };
+enum class Flag : bool { No, Yes };
 enum class Wide : long long { Low = -5, High = 1LL << 40 };
 enum class Big : unsigned long { Small = 1, Huge = 1UL << 63 };
 
@@ -47,6 +49,9 @@ struct Order {
 NOINLINE Sign flip(Sign s) { return s == Minus ? Plus : Minus; }
 NOINLINE Wide widen(Wide w) { return w == Wide::Low ? Wide::High : Wide::Low; }
 NOINLINE int big(Big b) { return b == Big::Huge ? 2 : 1; }
+NOINLINE int flag(Flag f) { return f == Flag::Yes ? 1 : 0; }
+// A standard-library enumeration: its header is chosen automatically.
+NOINLINE int code(std::errc e) { return static_cast<int>(e); }
 NOINLINE Color paint(Color c) { return c == Red ? Green : Red; }
 NOINLINE Narrow narrow(Narrow n) { return n == Narrow::Idle ? Narrow::Busy : Narrow::Idle; }
 // Unsupported: a pointer to a member function.
@@ -80,6 +85,8 @@ void run_once(int pass) {
   check(widen(Wide::High) == Wide::Low, "widen(High)", pass);
   check(big(Big::Huge) == 2, "big(Huge)", pass);
   check(big(Big::Small) == 1, "big(Small)", pass);
+  check(flag(Flag::Yes) == 1, "flag", pass);
+  check(code(std::errc::invalid_argument) == 22, "code", pass);
   check(paint(Red) == Green, "paint", pass);
   check(narrow(Narrow::Idle) == Narrow::Busy, "narrow", pass);
   check(order.read(&Order::total) == 17, "read", pass);

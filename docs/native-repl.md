@@ -1567,9 +1567,19 @@ from DWARF like the template-argument enumerations above: its qualified name, `e
 `enum`, and underlying type, without enumerators, at namespace scope or inside the class it is
 nested in. An enumeration nested in the receiver's class is declared inside that class, which is
 still one recovered class. A by-value enumeration is captured through the carrier of its
-underlying type: `int` (int32), `long`/`long long` (int64) or `unsigned long`/`unsigned long long`
-(uint64). An `Interceptor<Signature>` must name the same enumeration; `int` in its place is
-rejected.
+underlying type: `int` (int32), `long`/`long long` (int64), `unsigned long`/`unsigned long long`
+(uint64) or `bool`. An `Interceptor<Signature>` must name the same enumeration; `int` in its
+place is rejected.
+
+A standard-library enumeration (`std::errc`, `std::launch`, `std::ios_base::fmtflags`,
+`std::memory_order`, ...) is not rebuilt: on the automatic route its real header is chosen from
+the signature, like the header of a standard-library record (`<system_error>` for `std::errc`),
+and `--std-header std::NAME=<header>` maps one the table lacks. A callback's own `#include`s do
+not disable the declarations of the program's enumerations: the ones its headers do not declare
+are still declared from DWARF. If an enumeration the signature names is not declared for the
+callback after all (a standard header that was not included, a program header that lacks it),
+the error names it and says which header to add, instead of reporting that the `Interceptor`
+argument is not a function signature.
 
 The table lists what is supported and what is not. A rejected type gets a message that names it,
 its role and its callable (`unsupported debug enumeration enums::Color for the result of
@@ -1578,8 +1588,8 @@ previews as `UNSUPPORTED`:
 
 | Type | Result |
 |---|---|
-| An enumeration over `int`, `long`, `long long`, `unsigned long` or `unsigned long long` | supported by value, pointer and reference |
-| An enumeration by value over any other underlying type (`unsigned int`, `unsigned char`, `short`, `bool`) | rejected: no exact trace value type (the same gap as the integer types of the same width); behind a pointer or reference it is still declared |
+| An enumeration over `int`, `long`, `long long`, `unsigned long`, `unsigned long long` or `bool` | supported by value, pointer and reference |
+| An enumeration by value over any other underlying type (`unsigned int`, `unsigned char`, `short`) | rejected: no exact trace value type (the same gap as the integer types of the same width); behind a pointer or reference it is still declared |
 | An enumeration without a name, in an anonymous namespace, in an unnamed class, in a function, in a class template specialization, or whose underlying type DWARF does not record | rejected with the reason |
 | A pointer to a data member or to a member function | rejected: `pointer to data member int shop::Order::*` or `pointer to member function int (shop::Order::*)(int)` |
 

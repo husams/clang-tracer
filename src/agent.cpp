@@ -1628,6 +1628,7 @@ struct StandardRecordUse {
   std::string name;
   std::string role;
   bool nested = false;  // Reached only as a template argument of another standard record.
+  bool enumeration = false;  // An enumeration the signature names, not a record.
 };
 
 void collect_standard_records(const clangtracer::v1::DebugInfo &info, const std::string &role,
@@ -1678,6 +1679,19 @@ std::vector<StandardRecordUse> callable_standard_records(const clangtracer::v1::
                                "argument " + std::to_string(argument.index()), uses);
   if (info.has_result_object_type())
     collect_standard_records(info.result_object_type(), "result", uses);
+  // A standard-library enumeration is named by the signature itself; its header is not
+  // recovered from DWARF (an opaque redeclaration inside std is not an option).
+  const auto enumeration = [&](const clangtracer::v1::DebugTemplateType &type,
+                               const std::string &role) {
+    if (type.kind() == clangtracer::v1::DebugTemplateType::ENUM &&
+        ::tracer::standard_headers::standard_library_scope(type.name()))
+      uses.push_back({type.name(), role, false, true});
+  };
+  for (const auto &argument : info.arguments())
+    if (argument.has_enum_type())
+      enumeration(argument.enum_type(), "argument " + std::to_string(argument.index()));
+  if (info.has_result_enum_type())
+    enumeration(info.result_enum_type(), "result");
   return uses;
 }
 
@@ -1740,7 +1754,8 @@ bool automatic_standard_headers(const clangtracer::v1::ProbeSpec &spec, std::str
       // Left to the header of the record that names it; see unmapped_argument_records().
       if (use.nested)
         continue;
-      error = "standard-library record " + key + " (" + use.role +
+      error = std::string("standard-library ") + (use.enumeration ? "enumeration " : "record ") +
+              key + " (" + use.role +
               ") has no header mapping: map it with --std-header " + key +
               "=<header>, or supply its real header with --include or an #include in the "
               "callback";
@@ -2989,14 +3004,16 @@ std::string argument_enum_declarations(const clangtracer::v1::ProbeSpec &spec) {
 }
 
 // The enumerations the callable's arguments and result name, once each. A standard-library
-// enumeration is not rebuilt: its real header supplies it, as for standard-library records.
+// enumeration is not rebuilt (`include_standard` lists it anyway): its real header supplies it,
+// as for standard-library records.
 std::vector<const clangtracer::v1::DebugTemplateType *> callable_enums(
-    const clangtracer::v1::ProbeSpec &spec) {
+    const clangtracer::v1::ProbeSpec &spec, bool include_standard = false) {
   std::vector<const clangtracer::v1::DebugTemplateType *> enums;
   std::unordered_set<std::string> seen;
   const auto add = [&](const clangtracer::v1::DebugTemplateType &type) {
     if (type.kind() == clangtracer::v1::DebugTemplateType::ENUM && !type.name().empty() &&
-        !standard_library_record_name(type.name()) && seen.insert(type.name()).second)
+        (include_standard || !standard_library_record_name(type.name())) &&
+        seen.insert(type.name()).second)
       enums.push_back(&type);
   };
   const auto &info = spec.debug_info();
@@ -3410,6 +3427,35 @@ bool ast_has_debug_record(clang::ASTContext &context,
   return finder.found;
 }
 
+// The qualified names of the enumerations and the records an AST declares. A standard-library
+// name is kept without its inline ABI namespaces (libc++ spells std::__1::errc).
+struct DeclaredNames {
+  std::unordered_set<std::string> enums, records;
+};
+
+std::string declared_name(const std::string &name) {
+  return ::tracer::standard_headers::standard_library_scope(name)
+             ? ::tracer::standard_headers::primary_name(name)
+             : name;
+}
+
+DeclaredNames declared_names(clang::ASTContext &context) {
+  class Finder : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    bool VisitEnumDecl(clang::EnumDecl *declaration) {
+      names.enums.insert(declared_name(declaration->getQualifiedNameAsString()));
+      return true;
+    }
+    bool VisitCXXRecordDecl(clang::CXXRecordDecl *declaration) {
+      names.records.insert(declared_name(declaration->getQualifiedNameAsString()));
+      return true;
+    }
+    DeclaredNames names;
+  } finder;
+  finder.TraverseDecl(context.getTranslationUnitDecl());
+  return std::move(finder.names);
+}
+
 // The enumerations of the callable that the headers in the AST do not declare. An enumeration
 // nested in a class cannot be added to a class that the headers already define, so that case is
 // reported instead of declaring a second class with the same name.
@@ -3418,22 +3464,10 @@ std::vector<const clangtracer::v1::DebugTemplateType *> missing_callable_enums(
   const auto enums = callable_enums(spec);
   if (enums.empty())
     return {};
-  class Finder : public clang::RecursiveASTVisitor<Finder> {
-  public:
-    bool VisitEnumDecl(clang::EnumDecl *declaration) {
-      this->enums.insert(declaration->getQualifiedNameAsString());
-      return true;
-    }
-    bool VisitCXXRecordDecl(clang::CXXRecordDecl *declaration) {
-      this->records.insert(declaration->getQualifiedNameAsString());
-      return true;
-    }
-    std::unordered_set<std::string> enums, records;
-  } finder;
-  finder.TraverseDecl(context.getTranslationUnitDecl());
+  const auto declared = declared_names(context);
   std::vector<const clangtracer::v1::DebugTemplateType *> missing;
   for (const auto *type : enums) {
-    if (finder.enums.count(type->name()))
+    if (declared.enums.count(type->name()))
       continue;
     // The outermost enclosing class, qualified; nothing nested can exist without it.
     std::string scope;
@@ -3442,7 +3476,7 @@ std::vector<const clangtracer::v1::DebugTemplateType *> missing_callable_enums(
          ++i) {
       scope += (scope.empty() ? "" : "::") + parts[static_cast<std::size_t>(i)];
       if (type->scopes(i) != clangtracer::v1::RECORD_SCOPE_NAMESPACE) {
-        if (finder.records.count(scope))
+        if (declared.records.count(scope))
           throw std::runtime_error("enumeration " + type->name() + " is not declared by the "
                                    "headers, but its enclosing class " + scope + " is; "
                                    "declare the enumeration in that class");
@@ -5261,8 +5295,10 @@ bool debug_enum_type_matches(clang::ASTContext &context, clang::QualType actual,
   if (!enum_type)
     return false;
   const auto *enum_decl = enum_type->getDecl();
-  if (normalized_cpp_type(enum_decl->getQualifiedNameAsString()) !=
-      normalized_cpp_type(enumeration.name()))
+  // A standard-library enumeration is named without its inline ABI namespace by Clang and with
+  // it by libc++'s DWARF (std::__1::errc).
+  if (normalized_cpp_type(declared_name(enum_decl->getQualifiedNameAsString())) !=
+      normalized_cpp_type(declared_name(enumeration.name())))
     return false;
   const auto integer = enum_decl->getIntegerType();
   if (integer.isNull() || !integer->isIntegerType() ||
@@ -5417,6 +5453,40 @@ bool debug_type_matches(clang::ASTContext &context, clang::QualType actual,
                              expected.getCanonicalType());
 }
 
+// Why an enumeration the target signature names is not declared for the callback, or empty
+// when every one is. Without it `tracer::ResolvedSignature` cannot be formed, and the callback
+// only sees that its signature is not a function type.
+std::string undeclared_enum_diagnostic(clang::ASTContext &context,
+                                       const clangtracer::v1::ProbeSpec &spec) {
+  const auto enums = callable_enums(spec, true);
+  if (enums.empty())
+    return {};
+  const auto declared = declared_names(context);
+  for (const auto *type : enums) {
+    if (declared.enums.count(declared_name(type->name())))
+      continue;
+    std::string remedy;
+    if (::tracer::standard_headers::standard_library_scope(type->name())) {
+      std::vector<::tracer::standard_headers::Entry> user_entries;
+      std::string ignored, key;
+      parse_standard_header_entries(spec, user_entries, ignored);
+      if (const auto *entry =
+              ::tracer::standard_headers::find_entry(type->name(), user_entries, key)) {
+        auto line = ::tracer::standard_headers::include_line(entry->header);
+        line.pop_back();  // The newline.
+        remedy = "add " + line + " to the callback";
+      } else
+        remedy = "supply its header with --include or an #include in the callback, or map it "
+                 "with --std-header " + key + "=<header>";
+    } else {
+      remedy = "supply its header with --include or an #include in the callback";
+    }
+    return "enumeration " + type->name() + " named by the target signature is not declared for "
+           "the callback: " + remedy;
+  }
+  return {};
+}
+
 bool validate_specialized_signature(
     clang::ASTContext &context, const CallbackShape &shape,
     const clangtracer::v1::ProbeSpec &spec, std::string &error) {
@@ -5429,7 +5499,10 @@ bool validate_specialized_signature(
   const auto *function =
       shape.specialized_signature->getAs<clang::FunctionProtoType>();
   if (!function || function->isVariadic()) {
-    error = "Interceptor template argument must be a function signature";
+    // A signature that names an enumeration the callback does not declare is no type at all.
+    error = undeclared_enum_diagnostic(context, spec);
+    if (error.empty())
+      error = "Interceptor template argument must be a function signature";
     return false;
   }
   // Prepared aliases retain the exact Clang type. The generated
@@ -6580,7 +6653,8 @@ bool compile_shared_probe(Probe &p,
                           clangtracer::v1::ValidationReport *report,
                           bool result_sret, bool syntax_only,
                           const tracer::ValueSnapshotCode &snapshots,
-                          const tracer::ValueSnapshotCode *plain_snapshots = nullptr) {
+                          const tracer::ValueSnapshotCode *plain_snapshots = nullptr,
+                          const std::string &enum_declarations = {}) {
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
@@ -6603,7 +6677,7 @@ bool compile_shared_probe(Probe &p,
   activation.source = forced_include_source + callback_includes +
                       requested_header_source +
                       (has_real_headers
-                           ? std::string()
+                           ? enum_declarations
                            : recovered_record_declarations(specification)) +
                       argument_aliases(specification) +
                       interceptor_template_prelude(specification.callback_source()) +
@@ -6614,7 +6688,7 @@ bool compile_shared_probe(Probe &p,
   const auto *wrapper_snapshots = snapshots.arguments.empty() ? nullptr : &snapshots;
   const std::string wrapper_types = !wrapper_snapshots && !typed_prepared ? std::string() :
       callback_includes + requested_header_source +
-      (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
+      (has_real_headers ? enum_declarations : recovered_record_declarations(specification)) +
       receiver_alias + argument_aliases(specification);
   // Followed members must never turn a probe that worked into one that does not
   // compile: when the wrapper fails to compile with them, it is built without.
@@ -7332,7 +7406,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     local_verified_entry = VerifiedDebugEntry{&specification, verified_entry->runtime_entry};
     verified_entry = &*local_verified_entry;
   }
-  const std::string callback_type_declarations =
+  // Declarations recovered from DWARF for the callback. With headers of the caller's only the
+  // enumerations the signature names are declared, and only those the headers lack; see
+  // user_enum_declarations below.
+  std::string callback_type_declarations =
       user_headers_available ? std::string() : recovered_record_declarations(specification);
   if (!typed_prepared && specification.has_debug_info() &&
       !interceptor_template_prelude(source).empty()) {
@@ -7572,14 +7649,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                 snapshot_debug.record_name() +
                 "; }\n#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
           : std::string();
-  const std::string user_source = forced_include_source + prelude + context_prelude +
-                                  callback_header_source +
-                                  callback_type_declarations + receiver_alias +
-                                  tracer::kEmbeddedCallbackHeader +
-                                  argument_aliases(specification) +
-                                  interceptor_template_prelude(source) +
-                                  "#line 1 \"callback_source\"\n" +
-                                  callback_body;
   /*
    * A typed receiver preflight imports the same real Clang declaration into a
    * temporary syntax-only translation unit. This keeps callback validation
@@ -7636,6 +7705,35 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
     return succeeded;
   };
+  // A caller's headers say nothing about an enumeration they do not declare, and an enumeration
+  // carries no layout or ABI evidence that a header could contradict. So the ones the headers
+  // lack are still declared from DWARF. The headers are parsed on their own to find them; a
+  // header that does not parse is left to the parse of the whole callback to report.
+  std::vector<const clangtracer::v1::DebugTemplateType *> header_missing_enums;
+  if (!typed_prepared && user_headers_available && specification.has_debug_info() &&
+      !callable_enums(specification).empty()) {
+    DiagnosticCapture header_capture(nullptr);
+    const auto header_ast = build_callback_ast(
+        forced_include_source + prelude + context_prelude + callback_header_source,
+        "clang-tracer-callback.cc", header_capture);
+    if (header_ast && !header_capture.had_error()) {
+      try {
+        header_missing_enums = missing_callable_enums(header_ast->getASTContext(), specification);
+        callback_type_declarations = recovered_record_group({}, header_missing_enums);
+      } catch (const std::exception &exception) {
+        error = exception.what();
+        return false;
+      }
+    }
+  }
+  const std::string user_source = forced_include_source + prelude + context_prelude +
+                                  callback_header_source +
+                                  callback_type_declarations + receiver_alias +
+                                  tracer::kEmbeddedCallbackHeader +
+                                  argument_aliases(specification) +
+                                  interceptor_template_prelude(source) +
+                                  "#line 1 \"callback_source\"\n" +
+                                  callback_body;
   CallbackShape shape;
   std::string bridge;
   std::string complete_source;
@@ -7643,13 +7741,40 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // An enumeration the signature names but the callback does not declare is the usual reason a
+  // callback that names it fails to parse; the compiler only says the name is unknown.
+  const auto undeclared_enum_hint = [&]() -> std::string {
+    if (!user_ast || typed_prepared || !specification.has_debug_info())
+      return {};
+    try {
+      return undeclared_enum_diagnostic(user_ast->getASTContext(), specification);
+    } catch (const std::exception &) {
+      return {};
+    }
+  };
+  const auto add_undeclared_enum_hint = [&] {
+    const auto hint = undeclared_enum_hint();
+    if (hint.empty())
+      return;
+    if (report) {
+      auto *note = report->add_diagnostics();
+      note->set_stage("syntax");
+      note->set_severity("error");
+      note->set_message(hint);
+    }
+    error += (error.empty() ? "" : "\n") + hint;
+  };
+  const auto report_parse_errors = [&] {
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+    add_undeclared_enum_hint();
+  };
   // Receiver/field inference can repair semantic errors in this plain parse,
   // but cannot repair malformed C++. Keep its diagnostics ahead of ABI checks
   // and AST import, which can otherwise mask the callback's syntax failure.
   if (user_capture.had_syntax_error()) {
-    if (report)
-      append_diagnostics(*report, user_capture, "syntax");
-    error = user_capture.message();
+    report_parse_errors();
     return false;
   }
   if (!typed_prepared &&
@@ -7675,9 +7800,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   const auto prefer_parse_errors = [&] {
     if (!user_capture.had_error())
       return;
-    if (report)
-      append_diagnostics(*report, user_capture, "syntax");
-    error = user_capture.message();
+    report_parse_errors();
   };
   bool shape_valid = false;
   if (user_ast) {
@@ -7740,7 +7863,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
           forced_include_source, receiver_alias,
           signature_assert, error, run_initializers, report, result_sret,
           syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification),
-          &plain_snapshots);
+          &plain_snapshots, callback_type_declarations);
     }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
@@ -7859,6 +7982,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       error = baseline_error.empty()
                   ? "callback source failed Clang syntax validation"
                   : baseline_error;
+      add_undeclared_enum_hint();
       return false;
     }
 
@@ -7932,6 +8056,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       }
     }
 
+    // The typed parse has the receiver class imported from the debug-type AST, with the
+    // enumerations nested in it. Declaring those again would define that class a second time.
+    std::string typed_enum_declarations;
+    if (user_headers_available && !header_missing_enums.empty()) {
+      const auto declared = declared_names(p.interpreter->getASTContext());
+      std::vector<const clangtracer::v1::DebugTemplateType *> remaining;
+      for (const auto *type : header_missing_enums)
+        if (!declared.enums.count(type->name()))
+          remaining.push_back(type);
+      typed_enum_declarations = recovered_record_group({}, remaining);
+    }
     std::string typed_user_source =
         forced_include_source + prelude + context_prelude +
         (receiver_record && p.request.kind == tracer::CallableKind::Method
@@ -7940,7 +8075,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         "#define CLANG_TRACER_FIELD_INFERENCE 1\n" +
         callback_header_source + header_receiver_alias +
         (user_headers_available
-             ? std::string()
+             ? typed_enum_declarations
              : argument_enum_declarations(specification) +
                    missing_recovered_record_declarations(
                        p.interpreter->getASTContext(), specification)) +

@@ -15,6 +15,8 @@ namespace tracer::standard_headers {
 // defines it. The record is named by its primary template: template arguments and the
 // ABI-bearing inline namespaces (std::__cxx11, std::__1, std::_V2, ...) are not part of
 // the key, because the real header selects the namespace through the target's ABI macros.
+// The table also maps standard-library enumerations (std::errc, std::launch, ...), which a
+// callable can take or return by value; they are keyed the same way, by qualified name.
 // The table is a starting point; a caller extends or overrides it with "RECORD=HEADER"
 // entries (see parse_entry()).
 struct Entry {
@@ -103,12 +105,14 @@ inline const std::vector<Entry> &builtin_entries() {
                     "std::recursive_timed_mutex", "std::unique_lock", "std::lock_guard",
                     "std::scoped_lock", "std::once_flag"});
     add("<shared_mutex>", {"std::shared_mutex", "std::shared_timed_mutex", "std::shared_lock"});
-    add("<condition_variable>", {"std::condition_variable", "std::condition_variable_any"});
+    add("<condition_variable>", {"std::condition_variable", "std::condition_variable_any",
+                                 "std::cv_status"});
     add("<thread>", {"std::thread"});
     add("<thread>", {"std::jthread"}, 20);
     add("<stop_token>", {"std::stop_token", "std::stop_source", "std::stop_callback"}, 20);
-    add("<future>", {"std::future", "std::shared_future", "std::promise", "std::packaged_task"});
-    add("<atomic>", {"std::atomic", "std::atomic_flag"});
+    add("<future>", {"std::future", "std::shared_future", "std::promise", "std::packaged_task",
+                     "std::launch", "std::future_errc", "std::future_status"});
+    add("<atomic>", {"std::atomic", "std::atomic_flag", "std::memory_order"});
     add("<chrono>", {"std::chrono::duration", "std::chrono::time_point",
                      "std::chrono::system_clock", "std::chrono::steady_clock",
                      "std::chrono::high_resolution_clock"});
@@ -117,8 +121,12 @@ inline const std::vector<Entry> &builtin_entries() {
     add("<initializer_list>", {"std::initializer_list"});
     add("<typeinfo>", {"std::type_info", "std::bad_cast", "std::bad_typeid"});
     add("<typeindex>", {"std::type_index"});
-    add("<new>", {"std::bad_alloc", "std::bad_array_new_length", "std::nothrow_t"});
-    add("<limits>", {"std::numeric_limits"});
+    add("<new>", {"std::bad_alloc", "std::bad_array_new_length", "std::nothrow_t",
+                  "std::align_val_t"});
+    add("<limits>", {"std::numeric_limits", "std::float_round_style",
+                     "std::float_denorm_style"});
+    add("<cstddef>", {"std::byte"});
+    add("<charconv>", {"std::chars_format"});
     add("<bitset>", {"std::bitset"});
     add("<complex>", {"std::complex"});
     add("<valarray>", {"std::valarray"});
@@ -126,7 +134,8 @@ inline const std::vector<Entry> &builtin_entries() {
     add("<source_location>", {"std::source_location"}, 20);
     add("<compare>", {"std::strong_ordering", "std::weak_ordering", "std::partial_ordering"}, 20);
     add("<expected>", {"std::expected", "std::unexpected", "std::bad_expected_access"}, 23);
-    add("<ios>", {"std::ios_base", "std::basic_ios"});
+    add("<ios>", {"std::ios_base", "std::basic_ios", "std::_Ios_Fmtflags", "std::_Ios_Openmode",
+                  "std::_Ios_Iostate", "std::_Ios_Seekdir", "std::io_errc"});
     add("<streambuf>", {"std::basic_streambuf"});
     add("<ostream>", {"std::basic_ostream"});
     add("<istream>", {"std::basic_istream", "std::basic_iostream"});
@@ -140,13 +149,19 @@ inline const std::vector<Entry> &builtin_entries() {
                         "std::out_of_range", "std::length_error", "std::domain_error",
                         "std::range_error", "std::overflow_error", "std::underflow_error"});
     add("<system_error>", {"std::error_code", "std::error_condition", "std::system_error",
-                           "std::error_category"});
+                           "std::error_category", "std::errc"});
     add("<filesystem>", {"std::filesystem::path", "std::filesystem::directory_entry",
                          "std::filesystem::directory_iterator",
                          "std::filesystem::recursive_directory_iterator",
-                         "std::filesystem::file_status", "std::filesystem::filesystem_error"});
-    add("<locale>", {"std::locale"});
-    add("<regex>", {"std::basic_regex", "std::match_results", "std::sub_match"});
+                         "std::filesystem::file_status", "std::filesystem::filesystem_error",
+                         "std::filesystem::file_type", "std::filesystem::perms",
+                         "std::filesystem::perm_options", "std::filesystem::copy_options",
+                         "std::filesystem::directory_options"});
+    add("<locale>", {"std::locale", "std::codecvt_base::result"});
+    add("<regex>", {"std::basic_regex", "std::match_results", "std::sub_match",
+                    "std::regex_constants::syntax_option_type",
+                    "std::regex_constants::match_flag_type",
+                    "std::regex_constants::error_type"});
     add("<iterator>", {"__gnu_cxx::__normal_iterator", "std::reverse_iterator",
                        "std::move_iterator", "std::back_insert_iterator",
                        "std::front_insert_iterator", "std::insert_iterator"});

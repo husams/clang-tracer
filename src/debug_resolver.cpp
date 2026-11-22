@@ -231,6 +231,24 @@ std::string member_pointer_diagnostic(DWARFDie d) {
          " (DW_TAG_ptr_to_member_type); member pointers are not supported";
 }
 
+// The DIE whose parents are the scopes an enumeration was declared in. A type unit
+// (-fdebug-types-section) leaves a skeleton at compile-unit level that only carries a signature;
+// the definition is the top-level type of the unit, and its specification is the declaration
+// nested in the real namespaces and classes. An out-of-class definition likewise points at its
+// declaration. Attributes of the definition (name, size, type) are found recursively anyway.
+DWARFDie declared_scope_die(DWARFDie d) {
+  for (unsigned hops = 0; d && hops < 8; ++hops) {
+    auto next = d.getAttributeValueAsReferencedDie(dw::DW_AT_signature);
+    if (!next)
+      next = d.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
+    // A type unit has its own offsets, so only the same DIE of the same unit ends the walk.
+    if (!next || next == d)
+      break;
+    d = next;
+  }
+  return d;
+}
+
 // The qualified name of an enumeration the callback translation unit can declare. An enumeration
 // that cannot be named from there (no name, anonymous namespace, unnamed class, function scope,
 // class template specialization scope) is rejected with the reason.
@@ -241,7 +259,7 @@ std::string enumeration_name(DWARFDie d) {
     parts.front() = "(unnamed)";
     reason = "it has no name";
   }
-  for (auto scope = d.getParent(); scope; scope = scope.getParent()) {
+  for (auto scope = declared_scope_die(d).getParent(); scope; scope = scope.getParent()) {
     const auto tag = scope.getTag();
     const auto own = name(scope);
     if (tag == dw::DW_TAG_namespace) {
@@ -300,8 +318,9 @@ Type read_enumeration(DWARFDie d, unsigned depth) {
   }
   Type t{enum_name, size, carrier, {}, false, d, {}};
   // The ABI of the enumeration is the ABI of its underlying integer type, and the detour
-  // carries only these exactly: narrower and unsigned 32-bit integers are not exact.
-  if (carrier != api::INT32 && carrier != api::INT64 && carrier != api::UINT64) {
+  // carries only these exactly: narrower and unsigned 32-bit integers are not exact. bool is.
+  if (carrier != api::INT32 && carrier != api::INT64 && carrier != api::UINT64 &&
+      carrier != api::BOOL) {
     t.value = api::VALUE_TYPE_UNSPECIFIED;
     t.unsupported = UnsupportedDebugType(
         "unsupported debug enumeration " + enum_name,
@@ -853,7 +872,7 @@ std::string type_display_name(DWARFDie die) {
   const auto own = name(die);
   if (own.empty())
     return {};
-  const auto scope = record_display_name(die.getParent());
+  const auto scope = record_display_name(declared_scope_die(die).getParent());
   return scope.empty() ? own : scope + "::" + own;
 }
 
@@ -922,7 +941,7 @@ void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribeP
       element.set_dwarf_encoding(static_cast<std::uint32_t>(number(underlying, dw::DW_AT_encoding)));
     }
     // Enclosing scope kinds, outermost first; left empty when every scope is a namespace.
-    for (auto scope = die.getParent(); scope; scope = scope.getParent()) {
+    for (auto scope = declared_scope_die(die).getParent(); scope; scope = scope.getParent()) {
       const auto tag = scope.getTag();
       if (tag == dw::DW_TAG_namespace)
         out.add_scopes(api::RECORD_SCOPE_NAMESPACE);

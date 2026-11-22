@@ -948,7 +948,7 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-dwarf-enum-target>
           "${_unnamed_receiver_gcc}")
-      set_tests_properties(native_repl_dwarf_enum_gcc PROPERTIES TIMEOUT 300
+      set_tests_properties(native_repl_dwarf_enum_gcc PROPERTIES TIMEOUT 600
         SKIP_RETURN_CODE 77)
       add_executable(repl-virtual-target tests/fixtures/repl_virtual.cpp
         tests/fixtures/repl_virtual_main.cpp)

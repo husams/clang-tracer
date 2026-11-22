@@ -31,6 +31,9 @@ from repl_std_headers import parse_textproto
 
 SKIP = 77
 FLAGS = ["-std=c++17", "-g", "-O0", "-fno-inline", "-no-pie", "-Wl,--build-id=sha1"]
+# GCC puts each type into its own unit: the DIE a parameter reaches carries only a signature, and
+# the namespaces and classes of an enumeration are those of the declaration in that unit.
+TYPE_UNITS = ["-fdebug-types-section"]
 
 PLAIN = "enums::Order::plain(int)"
 SET_STATE = "enums::Order::set_state(enums::Order::State)"
@@ -39,15 +42,18 @@ BY_REF = "enums::Order::by_ref(const enums::Order::State&)"
 FLIP = "enums::flip(enums::Sign)"
 WIDEN = "enums::widen(enums::Wide)"
 BIG = "enums::big(enums::Big)"
+FLAG = "enums::flag(enums::Flag)"
+CODE = "enums::code(std::errc)"
 PAINT = "enums::paint(enums::Color)"
 NARROW = "enums::narrow(enums::Narrow)"
 READ = "enums::Order::read(int enums::Order::*)"
 CALL = "enums::call(enums::Order*, int (enums::Order::*)(int))"
 
-SUPPORTED = (SET_STATE, STATE_OF, BY_REF, FLIP, WIDEN, BIG)
+SUPPORTED = (SET_STATE, STATE_OF, BY_REF, FLIP, WIDEN, BIG, FLAG, CODE)
 UNSUPPORTED = (PAINT, NARROW, READ, CALL)
 
 STATE, SIGN, WIDE, BIG_TYPE = "enums::Order::State", "enums::Sign", "enums::Wide", "enums::Big"
+FLAG_TYPE, ERRC = "enums::Flag", "std::errc"
 
 
 def resolve(session, selector):
@@ -80,6 +86,8 @@ def resolve_phase(session, root):
         FLIP: ("INT32", ["INT32"], SIGN, [SIGN]),
         WIDEN: ("INT64", ["INT64"], WIDE, [WIDE]),
         BIG: ("INT32", ["UINT64"], None, [BIG_TYPE]),
+        FLAG: ("INT32", ["BOOL"], None, [FLAG_TYPE]),
+        CODE: ("INT32", ["INT32"], None, [ERRC]),
         PLAIN: ("INT32", ["INT32"], None, [None]),
     }
     for selector, (result, arguments, result_enum, argument_enums) in expected.items():
@@ -98,7 +106,8 @@ def resolve_phase(session, root):
             if enum_name:
                 enum = one(argument_info, "enum_type")
                 assert one(enum, "name") == enum_name and one(enum, "kind") == "ENUM", enum
-                assert one(enum, "byte_size") == ("8" if enum_name in (WIDE, BIG_TYPE) else "4")
+                size = {WIDE: "8", BIG_TYPE: "8", FLAG_TYPE: "1"}.get(enum_name, "4")
+                assert one(enum, "byte_size") == size, enum
                 scoped = enum_name != SIGN
                 assert ("enum_scoped" in enum) == scoped, (selector, enum)
                 underlying = one(enum, "element")
@@ -179,7 +188,7 @@ def write(root, name, text):
     return path
 
 
-def validate_phase(session, root):
+def validate_phase(session, root, typed_receiver=True):
     """Typed callbacks that name the enums validate; a signature of other types does not."""
     typed = {
         SET_STATE: f"int({STATE})",
@@ -209,6 +218,80 @@ public:
 }};
 """)
     assert validate(session, STATE_OF, callback) is None
+    callback = write(root, "flag.cpp", f"""template <> class Interceptor<int({FLAG_TYPE})> {{
+public:
+  void pre(const Call& call) {{ (void)call.arg<{FLAG_TYPE}>(0); }}
+}};
+""")
+    assert validate(session, FLAG, callback) is None
+
+    # Headers of the callback's own do not disable the declarations of the enumerations the
+    # headers lack, and a standard-library enumeration needs its header.
+    callback = write(root, "included.cpp", f"""#include <cstdio>
+template <> class Interceptor<tracer::ResolvedSignature> {{
+public:
+  void pre(const Call& call) {{ std::printf("%d", static_cast<int>(call.arg<{STATE}>(0))); }}
+}};
+""")
+    assert validate(session, SET_STATE, callback) is None
+    callback = write(root, "included_typed.cpp", f"""#include <cstdio>
+template <> class Interceptor<int({STATE})> {{
+public:
+  void pre(const Call& call) {{ (void)call; std::printf("x"); }}
+}};
+""")
+    assert validate(session, SET_STATE, callback) is None
+    # The typed receiver brings its class with the nested enumeration: it is not declared twice.
+    # With type units the receiver's fields are not recovered at all, with or without an
+    # enumeration, so there is no typed receiver to check there.
+    if typed_receiver:
+        callback = write(root, "included_self.cpp", f"""#include <cstdio>
+template <> class Interceptor<int({STATE})> {{
+public:
+  void pre(const Call& call) {{
+    call.field("total", call.self()->total);
+    call.field("state", static_cast<int>(call.arg<{STATE}>(0)));
+  }}
+}};
+""")
+        assert validate(session, SET_STATE, callback) is None
+    callback = write(root, "included_result.cpp", f"""#include <cstdio>
+template <> class Interceptor<{STATE}(int)> {{
+public:
+  void post(const Call& call) {{ (void)call.result<{STATE}>(); std::printf("x"); }}
+}};
+""")
+    assert validate(session, STATE_OF, callback) is None
+    callback = write(root, "errc_missing.cpp", f"""#include <cstdio>
+template <> class Interceptor<int({ERRC})> {{
+public:
+  void pre(const Call& call) {{ (void)call; }}
+}};
+""")
+    error = validate(session, CODE, callback)
+    assert error and ERRC in error and "<system_error>" in error, error
+    callback = write(root, "errc_missing_resolved.cpp", """#include <cstdio>
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call& call) { (void)call; }
+};
+""")
+    error = validate(session, CODE, callback)
+    assert error and ERRC in error and "<system_error>" in error, error
+    callback = write(root, "errc.cpp", f"""#include <system_error>
+template <> class Interceptor<int({ERRC})> {{
+public:
+  void pre(const Call& call) {{ (void)call.arg<{ERRC}>(0); }}
+}};
+""")
+    assert validate(session, CODE, callback) is None
+    # Without a callback of its own the header is chosen from the signature.
+    callback = write(root, "errc_default.cpp", """template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call& call) { (void)call; }
+};
+""")
+    assert validate(session, CODE, callback) is None
 
     # The enumeration is not its underlying type, its address or its reference, and the other way
     # round. Only the callable's own enumerations are declared for the callback.
@@ -229,16 +312,17 @@ public:
 
 def inject_phase(session, root):
     """The callbacks see exact enum values at entry and at return."""
-    def callback(name, signature, pre="", post=""):
-        return write(root, name, f"""template <> class Interceptor<{signature}> {{
+    def callback(name, signature, pre="", post="", include=""):
+        return write(root, name, f"""{include}template <> class Interceptor<{signature}> {{
 public:
   void pre(const Call& call) {{ {pre} }}
   void post(const Call& call) {{ {post} }}
 }};
 """)
 
+    # A callback with a header of its own still has the enumeration declared.
     set_state, _ = session.inject(f'"{SET_STATE}"', "--callback", str(callback(
-        "set_state.cpp", f"int({STATE})",
+        "set_state.cpp", f"int({STATE})", include="#include <cstdio>\n",
         pre=f'call.field("state", static_cast<int>(call.arg<{STATE}>(0)));')))
     state_of, _ = session.inject(f'"{STATE_OF}"', "--callback", str(callback(
         "state_of.cpp", f"{STATE}(int)",
@@ -255,6 +339,10 @@ public:
         "big.cpp", f"int({BIG_TYPE})",
         pre=f'call.field("size", static_cast<unsigned long long>(call.arg<{BIG_TYPE}>(0)));')))
     by_ref, _ = session.inject(f'"{BY_REF}"')
+    # The default observer, no callback: a bool enumeration and a standard-library enumeration
+    # whose header is chosen from the signature.
+    flag, _ = session.inject(f'"{FLAG}"')
+    code, _ = session.inject(f'"{CODE}"')
     session.run_passes()
     n = PASSES
 
@@ -278,6 +366,12 @@ public:
     pairs = sorted((argument(e, "b"), int(e["result"]["signedValue"])) for e in events)
     assert pairs == [(1, 1)] * n + [(1 << 63, 2)] * n, pairs
     assert all("unsignedValue" in e["namedArguments"][0]["value"] for e in events), events
+    events = post(flag, n, "flag")
+    assert [argument(e, "f") for e in events] == [1] * n, events
+    assert [int(e["result"]["signedValue"]) for e in events] == [1] * n, events
+    events = post(code, n, "code")
+    assert [argument(e, "e") for e in events] == [22] * n, events
+    assert [int(e["result"]["signedValue"]) for e in events] == [22] * n, events
     # A reference to the enumeration is its address.
     events = post(by_ref, n, "by-ref")
     assert all(argument(e, "s") != 0 and int(e["result"]["signedValue"]) == 11 for e in events), \
@@ -313,7 +407,7 @@ def bulk_phase(session, root, bytes_at):
     rows, summary = preview(session, f'%trace preview {exact} --save "{manifest}"')
     assert set(rows) == set(SUPPORTED + (PLAIN,)), rows
     assert all(status == "DWARF_SUPPORTED" for status, _ in rows.values()), rows
-    assert "dwarf_supported=7" in summary, summary
+    assert "dwarf_supported=9" in summary, summary
     session.output.expect(r"^manifest=")
 
     session.command(f'%trace apply --manifest "{manifest}"')
@@ -356,54 +450,62 @@ def bulk_phase(session, root, bytes_at):
     session.detach()
 
 
-def build_with_gcc(gcc, source, root):
-    fixture = root / "repl-dwarf-enum-gcc-target"
-    subprocess.run([gcc, *FLAGS, str(source), "-o", str(fixture)], check=True)
+def build_with_gcc(gcc, source, root, name, *extra):
+    fixture = root / name
+    subprocess.run([gcc, *FLAGS, *extra, str(source), "-o", str(fixture)], check=True)
     return fixture
+
+
+def observe(repl, server, agent, fixture, label):
+    """Every phase on one build of the fixture."""
+    nm = subprocess.run(["nm", str(fixture)], check=True, capture_output=True, text=True)
+    entries = {}
+    for name, symbol in (("set_state", "_ZN5enums5Order9set_stateENS0_5StateE"),
+                         ("state_of", "_ZN5enums5Order8state_ofEi"),
+                         ("flip", "_ZN5enums4flipENS_4SignE"),
+                         ("widen", "_ZN5enums5widenENS_4WideE"),
+                         ("big", "_ZN5enums3bigENS_3BigE"),
+                         ("flag", "_ZN5enums4flagENS_4FlagE"),
+                         ("plain", "_ZN5enums5Order5plainEi")):
+        match = re.search(rf"^([0-9a-f]+) [TW] {symbol}$", nm.stdout, re.M)
+        assert match, symbol
+        entries[name] = int(match.group(1), 16)
+    # A fixture process per phase: an agent keeps a fixed number of probe slots per process.
+    for phase in ("resolve", "inject", "bulk"):
+        with tempfile.TemporaryDirectory(prefix="ct-enum-run-") as directory, ExitStack() as stack:
+            root = Path(directory)
+            target = Target(str(fixture), stack)
+            session = Session(repl, server, agent, target, stack, root)
+            if phase == "resolve":
+                resolve_phase(session, root)
+                preview_phase(session)
+                validate_phase(session, root, typed_receiver="type units" not in label)
+                session.detach()
+            elif phase == "inject":
+                inject_phase(session, root)
+            else:
+                bulk_phase(session, root, entries)
+            send(target.process, "q")
+            target.process.wait(timeout=10)
+    print(f"enumerations observed ({label}): resolve, preview, validate, inject, bulk")
 
 
 def main(repl, server, agent, fixture, gcc=None):
     os.environ.pop("CLANG_TRACER_ENDPOINT", None)
     source = Path(__file__).resolve().parent / "fixtures" / "repl_dwarf_enum.cpp"
     with ExitStack() as cleanup:
-        if gcc:
-            version = subprocess.run([gcc, "--version"], capture_output=True, text=True).stdout
-            if "clang" in version.lower() or "gcc" not in version.lower():
-                print("skipped: the GCC variant needs a GCC compiler")
-                sys.exit(SKIP)
-            build = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="ct-enum-")))
-            fixture = build_with_gcc(gcc, source, build)
-        fixture = Path(fixture).resolve()
-        nm = subprocess.run(["nm", str(fixture)], check=True, capture_output=True, text=True)
-        entries = {}
-        for name, symbol in (("set_state", "_ZN5enums5Order9set_stateENS0_5StateE"),
-                             ("state_of", "_ZN5enums5Order8state_ofEi"),
-                             ("flip", "_ZN5enums4flipENS_4SignE"),
-                             ("widen", "_ZN5enums5widenENS_4WideE"),
-                             ("big", "_ZN5enums3bigENS_3BigE"),
-                             ("plain", "_ZN5enums5Order5plainEi")):
-            match = re.search(rf"^([0-9a-f]+) [TW] {symbol}$", nm.stdout, re.M)
-            assert match, symbol
-            entries[name] = int(match.group(1), 16)
-        # A fixture process per phase: an agent keeps a fixed number of probe slots per process.
-        for phase in ("resolve", "inject", "bulk"):
-            with tempfile.TemporaryDirectory(prefix="ct-enum-run-") as directory, \
-                    ExitStack() as stack:
-                root = Path(directory)
-                target = Target(str(fixture), stack)
-                session = Session(repl, server, agent, target, stack, root)
-                if phase == "resolve":
-                    resolve_phase(session, root)
-                    preview_phase(session)
-                    validate_phase(session, root)
-                    session.detach()
-                elif phase == "inject":
-                    inject_phase(session, root)
-                else:
-                    bulk_phase(session, root, entries)
-                send(target.process, "q")
-                target.process.wait(timeout=10)
-    print("enumerations observed: resolve, preview, validate, inject, bulk")
+        if not gcc:
+            observe(repl, server, agent, Path(fixture).resolve(), "project compiler")
+            return
+        version = subprocess.run([gcc, "--version"], capture_output=True, text=True).stdout
+        if "clang" in version.lower() or "gcc" not in version.lower():
+            print("skipped: the GCC variant needs a GCC compiler")
+            sys.exit(SKIP)
+        build = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="ct-enum-")))
+        observe(repl, server, agent, build_with_gcc(gcc, source, build, "gcc-target"), "GCC")
+        observe(repl, server, agent,
+                build_with_gcc(gcc, source, build, "gcc-type-units-target", *TYPE_UNITS),
+                "GCC, type units")
 
 
 if __name__ == "__main__":
