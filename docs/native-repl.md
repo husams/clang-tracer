@@ -1560,6 +1560,46 @@ record but not the program types it is instantiated with, so those come from DWA
 For the rejected cases the remedy is the explicit route: the program's real header through
 `--include` with `--compdb`, or an `#include` in the callback.
 
+**Enumerations and member pointers in the signature itself.** A DWARF-resolved callable may take
+or return an enumeration, by value or behind a pointer or reference (`State set(State)`,
+`int by_ref(const State&)`). The callback source needs the enumeration's name, so it is declared
+from DWARF like the template-argument enumerations above: its qualified name, `enum class` or
+`enum`, and underlying type, without enumerators, at namespace scope or inside the class it is
+nested in. An enumeration nested in the receiver's class is declared inside that class, which is
+still one recovered class. A by-value enumeration is captured through the carrier of its
+underlying type, as the integer type is (see
+[Narrow integers in DWARF signatures](#narrow-integers-in-dwarf-signatures)): a signed type up to
+32 bits as int32, a signed 64-bit type as int64, an unsigned type of any width as uint64, and
+`bool` as bool. The generated wrapper declares the enumeration at the width of its underlying
+type (an enumeration over `unsigned char` is a byte, over `unsigned int` four bytes), not at the
+carrier's, so the call keeps the target's ABI. An `Interceptor<Signature>` must name the same
+enumeration; `int` in its place is rejected.
+
+A standard-library enumeration (`std::errc`, `std::launch`, `std::ios_base::fmtflags`,
+`std::memory_order`, ...) is not rebuilt: on the automatic route its real header is chosen from
+the signature, like the header of a standard-library record (`<system_error>` for `std::errc`),
+and `--std-header std::NAME=<header>` maps one the table lacks. A callback's own `#include`s do
+not disable the declarations of the program's enumerations: the ones its headers do not declare
+are still declared from DWARF. If an enumeration the signature names is not declared for the
+callback after all (a standard header that was not included, a program header that lacks it),
+the error names it and says which header to add, instead of reporting that the `Interceptor`
+argument is not a function signature.
+
+The table lists what is supported and what is not. A rejected type gets a message that names it,
+its role and its callable (`unsupported debug type for parameter 0 'field' of shop::Order::read:
+pointer to data member int shop::Order::* (DW_TAG_ptr_to_member_type); member pointers are not
+supported`), and the callable previews as `UNSUPPORTED`:
+
+| Type | Result |
+|---|---|
+| An enumeration over any integer type of the previous section (`int`, `long`, `long long`, `short`, `unsigned char`, `unsigned int`, `unsigned long`, `char16_t`, `bool`, ...) | supported by value, pointer and reference |
+| An enumeration whose underlying type has no carrier (a size that is not the LP64 size of its spelling, an unsupported builtin) | rejected by value: `underlying type X (N bytes) has no exact DWARF trace value type`; behind a pointer or reference it is still declared |
+| An enumeration without a name, in an anonymous namespace, in an unnamed class, in a function, in a class template specialization, or whose underlying type DWARF does not record | rejected with the reason |
+| A pointer to a data member or to a member function | rejected: `pointer to data member int shop::Order::*` or `pointer to member function int (shop::Order::*)(int)` |
+
+A class that the callback's real headers already define cannot gain an enumeration: if the
+headers lack the enumeration the callable names, the error names both.
+
 **Language mode.** The automatic headers are compiled as C++20, or as a newer standard when the
 target is known to use one: its `DW_AT_producer` names it (GCC writes `GNU C++23 ...`; a recorded
 command line has `-std=`), or it uses a record that only exists from that standard on (the
