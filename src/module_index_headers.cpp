@@ -138,6 +138,10 @@ class Generator {
       return "::" + type.name;
     }
     if (record(type) && behind_pointer) {
+      if (type.name.empty())
+        throw std::invalid_argument(
+            "unsupported_call_abi: an unnamed " + type.kind + " is reached through a pointer "
+            "or reference and the debug information names no typedef for it on the way");
       forward(type);
       return "::" + type.name;
     }
