@@ -29,7 +29,7 @@ constexpr string_view stream_options =
     "--phase PRE|POST|EXCEPTION --name SELECTOR --session ID | --all";
 constexpr string_view resolution_options =
     "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
-    "--module TEXT --compile-option FLAG\n"
+    "--module TEXT --compile-option FLAG --std-header RECORD=HEADER\n"
     "--prepared DIRECTORY --prepared-mode off|prefer|require";
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"

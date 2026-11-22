@@ -240,7 +240,7 @@ public:
         "--trace-exceptions", "--reclaimable", "--snapshot-return-pointee",
         "--no-automatic-members", "--snapshot-receiver-at-return", "--no-values",
         "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls", "--dwarf-writers"};
-    const std::set<std::string> repeated = {"--include", "--compile-option",
+    const std::set<std::string> repeated = {"--include", "--compile-option", "--std-header",
                                            "--name", "--type", "--arg", "--env", "--key", "--method", "--bind", "--from-scan"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",

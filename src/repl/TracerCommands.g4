@@ -44,7 +44,7 @@ limitOption : ('--follow-depth' | '--follow-members' | '--record-members' | '--n
               | '--string-bytes' | '--vector-elements' | '--checked-reads' | '--snapshot-reserve'
               | '--snapshot-arena' | '--snapshot-slice') (UINT | WORD);
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
-                | '--prepared' | '--prepared-mode') value
+                | '--std-header' | '--prepared' | '--prepared-mode') value
               | extraCompileOption;
 validateOption : resolveOption | limitOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
                | '--reclaimable' | '--allow-call-original' | '--trace-exceptions';

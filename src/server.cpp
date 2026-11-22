@@ -1624,6 +1624,8 @@ public:
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
+      for (const auto &mapping : request->standard_headers())
+        resolved.spec.add_standard_headers(mapping);
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
       if (!resolved.spec.has_header_context())
@@ -1687,6 +1689,8 @@ public:
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
+      for (const auto &mapping : request->standard_headers())
+        resolved.spec.add_standard_headers(mapping);
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
       if (!resolved.spec.has_header_context())

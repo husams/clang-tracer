@@ -7,6 +7,7 @@
 #include "../prepared_contract.hpp"
 #include "../snapshot_limits.hpp"
 #include "../preparer_diagnostics.hpp"
+#include "../standard_headers.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -312,6 +313,16 @@ void resolution_options(api::ResolveProbeRequest &request,
   if (options != command.options.end()) {
     for (const auto &value : options->second) {
       request.add_compile_options(value);
+    }
+  }
+  if (const auto mappings = command.options.find("--std-header");
+      mappings != command.options.end()) {
+    for (const auto &value : mappings->second) {
+      tracer::standard_headers::Entry entry;
+      if (const auto problem = tracer::standard_headers::parse_entry(value, entry);
+          !problem.empty())
+        throw std::invalid_argument("--std-header " + value + ": " + problem);
+      request.add_standard_headers(value);
     }
   }
   if (command.has("--translation-unit") &&
@@ -3654,6 +3665,7 @@ public:
     const auto callback = probe_path(command, command.option("--callback"));
     request.set_callback_source(named ? drafts_.at(args.at(0)) : read_source(callback));
     *request.mutable_include_headers() = resolution.include_headers();
+    *request.mutable_standard_headers() = resolution.standard_headers();
     *request.mutable_compile_options() = resolution.compile_options();
     *request.mutable_extra_compile_arguments() = resolution.extra_compile_arguments();
     request.set_module(resolution.module());
