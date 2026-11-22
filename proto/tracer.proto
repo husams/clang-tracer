@@ -190,14 +190,22 @@ message DebugTemplateType {
   string name = 2;              // BUILTIN: DW_AT_name. RECORD/ENUM: qualified display name.
   bool is_const = 3;
   bool is_volatile = 4;
-  DebugTemplateType element = 5;       // POINTER/REFERENCE/ARRAY target; FUNCTION result.
+  // POINTER/REFERENCE/ARRAY target; FUNCTION result; ENUM underlying builtin type when the
+  // debug data names one.
+  DebugTemplateType element = 5;
+  // ARRAY: one message per dimension, outermost first (int[2][3] is an array of 2 whose
+  // element is an array of 3). has_array_count is unset for an array of unknown bound (int[]).
   bool has_array_count = 6;
-  uint64 array_count = 7;              // ARRAY: element count when DWARF bounds give one.
+  uint64 array_count = 7;
   repeated DebugTemplateType parameters = 8; // FUNCTION parameter types.
   bool function_variadic = 9;
   uint64 byte_size = 10;               // BUILTIN/ENUM/RECORD size.
   uint32 dwarf_encoding = 11;          // BUILTIN DW_AT_encoding.
   DebugInfo record = 12;               // RECORD: its description, when it could be described.
+  // ENUM: one entry per enclosing scope of `name`, outermost first. Empty means every scope is
+  // a namespace.
+  repeated RecordScopeKind scopes = 13;
+  bool enum_scoped = 14;               // ENUM: DW_AT_enum_class (enum class / enum struct).
 }
 message DebugMethod {
   string name = 1;

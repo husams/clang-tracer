@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sh = tracer::standard_headers;
 
@@ -56,6 +57,24 @@ int main() {
           "<chrono>");
   require(header("std::uniform_real_distribution<double>") == nullptr,
           "a record outside the table has no mapping");
+  require(header("std::ratio<1, 1000>") && *header("std::ratio<1, 1000>") == "<ratio>", "<ratio>");
+  require(header("std::chrono::_V2::system_clock") &&
+              *header("std::chrono::_V2::system_clock") == "<chrono>",
+          "the clocks come from <chrono>");
+  require(header("std::basic_string_view<char>") &&
+              *header("std::basic_string_view<char>") == "<string_view>",
+          "<string_view>");
+  // A record that only a later standard has says which one.
+  {
+    std::string scratch;
+    const auto *expected = sh::find_entry("std::expected<int, std::error_code>", {}, scratch);
+    require(expected && expected->header == "<expected>" && expected->standard == 23,
+            "std::expected needs C++23");
+    const auto *span = sh::find_entry("std::span<int, 18446744073709551615>", {}, scratch);
+    require(span && span->header == "<span>" && span->standard == 20, "std::span is C++20");
+    const auto *vector = sh::find_entry("std::vector<int>", {}, scratch);
+    require(vector && vector->standard == 0, "std::vector needs no newer standard");
+  }
 
   // A caller's entry extends the table, and overrides a built-in one.
   sh::Entry extra;
@@ -87,6 +106,59 @@ int main() {
   rejected("std::vector=<vec\"tor>", "must be <name> or an absolute path");
   rejected("std::vector=relative/vector.hpp", "must be <name> or an absolute path");
   rejected("std::vector=\"/abs/vector.hpp\"", "must be <name> or an absolute path");
+
+  // Which libstdc++ string ABI a DWARF type name shows: only the classes libstdc++ keeps in
+  // two ABIs count, wherever they appear in the name.
+  const auto abi = [](const std::string &name) {
+    bool seen_new = false, seen_old = false;
+    sh::note_dual_abi_names(name, seen_new, seen_old);
+    return std::string(seen_new ? "new" : "") + (seen_old ? "old" : "");
+  };
+  require(abi("std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >") == "new",
+          "std::__cxx11::basic_string is the C++11 ABI");
+  require(abi("std::basic_string<char, std::char_traits<char>, std::allocator<char> >") == "old",
+          "std::basic_string is the old ABI");
+  require(abi("std::vector<std::__cxx11::basic_string<char>, std::allocator<std::__cxx11::basic_string<char> > >") == "new",
+          "a string inside a container counts");
+  require(abi("std::__cxx11::list<int, std::allocator<int> >") == "new", "std::list is dual-ABI");
+  require(abi("std::basic_string_view<char, std::char_traits<char> >").empty(),
+          "std::string_view is not a dual-ABI class");
+  require(abi("std::vector<std::basic_string_view<char>, std::allocator<std::basic_string_view<char> > >").empty(),
+          "a string_view inside a container says nothing either");
+  require(abi("std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >").empty(),
+          "libc++'s std::__1::basic_string is not libstdc++'s old ABI");
+  require(abi("app::basic_string<char>").empty() && abi("app::std::list<int>").empty(),
+          "a program type of the same name does not count");
+  require(abi("std::vector<int, std::allocator<int> >").empty(), "no string, no evidence");
+
+  // Which _GLIBCXX_USE_CXX11_ABI the caller's options set: the macro itself, in every form.
+  using Options = std::vector<std::string>;
+  require(sh::explicit_cxx11_abi(Options{}) == -1, "no option");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI=0"}) == 0, "=0");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI=1"}) == 1, "=1");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI"}) == 1, "defined is 1");
+  require(sh::explicit_cxx11_abi(Options{"-D", "_GLIBCXX_USE_CXX11_ABI=0"}) == 0, "split -D");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI=2"}) == -2, "another value");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI_OTHER=0"}) == -1,
+          "a longer macro name is another macro");
+  require(sh::explicit_cxx11_abi(Options{"-DX_GLIBCXX_USE_CXX11_ABI=0", "-O2"}) == -1,
+          "a name that merely contains the macro is another macro");
+  require(sh::explicit_cxx11_abi(Options{"-D_GLIBCXX_USE_CXX11_ABI=0", "-U_GLIBCXX_USE_CXX11_ABI"}) == -1,
+          "-U leaves the choice to the library again");
+  require(sh::explicit_cxx11_abi(Options{"-U_GLIBCXX_USE_CXX11_ABI", "-D_GLIBCXX_USE_CXX11_ABI=0"}) == 0,
+          "the last option wins");
+  require(sh::explicit_cxx11_abi(Options{"-D"}) == -1, "a dangling -D is not a definition");
+
+  // The C++ standard a producer string names.
+  require(sh::producer_cxx_standard("GNU C++17 8.5.0 -mtune=generic -march=x86-64 -g -std=gnu++17") == 17,
+          "GCC names the standard");
+  require(sh::producer_cxx_standard("GNU C++23 15.1.1 -mtune=generic -g") == 23, "GNU C++23");
+  require(sh::producer_cxx_standard("GNU C++14 8.5.0 -g -std=c++2a") == 20, "-std= wins");
+  require(sh::producer_cxx_standard("clang version 21.1.8") == 0, "Clang does not say");
+  require(sh::producer_cxx_standard("clang version 21.1.8 -std=c++2b") == 23,
+          "a recorded command line does");
+  require(sh::producer_cxx_standard("GNU C17 8.5.0 -g") == 0, "C is not C++");
+  require(sh::producer_cxx_standard("") == 0, "no producer");
 
   require(sh::include_line("<vector>") == "#include <vector>\n", "angled include");
   require(sh::include_line("/opt/vendor/v.hpp") == "#include \"/opt/vendor/v.hpp\"\n", "path include");

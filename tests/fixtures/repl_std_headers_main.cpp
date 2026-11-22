@@ -26,7 +26,20 @@ static long run_once(int pass) {
   const auto gadget = stdh::make_gadget();
   sum += stdh::inspect(gadget);
   const std::uniform_real_distribution<double> range(2.0, 6.0);
-  return sum + static_cast<long>(stdh::midpoint(range));
+  sum += static_cast<long>(stdh::midpoint(range));
+  sum += stdh::make_longs(3).back() + static_cast<long>(stdh::make_sizes(2).back()) +
+         static_cast<long>(stdh::view_size("four")) + stdh::make_delay(pass).count() +
+         stdh::make_stamp(pass).time_since_epoch().count() +
+         stdh::call_twice([](long value) { return value + 1; }, pass) +
+         static_cast<long>(stdh::make_modes(2).size()) + *stdh::make_level(pass) +
+         static_cast<long>(stdh::make_named(2).size()) + stdh::find_named(pass)->rank;
+  const std::ratio<1, 200> ratio;
+  std::unique_ptr<int[]> values(new int[3]{1, 2, 3});
+  const std::array<int[2][3], 1> grid{{{{1, 2, 3}, {4, 5, 6}}}};
+  const std::map<int, int (*)(int)> handlers{{1, [](int value) { return value * 2; }},
+                                             {2, [](int value) { return value + 5; }}};
+  return sum + stdh::ratio_den(ratio) + stdh::sum_array(values, 3) + stdh::grid_sum(grid) +
+         stdh::apply_all(handlers, pass);
 }
 
 int main() {

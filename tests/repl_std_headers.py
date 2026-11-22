@@ -5,11 +5,17 @@ The fixture (tests/fixtures/repl_std_headers.*) is built with the GCC 8.5 g++ th
 ships (the test falls back to the project compiler without one) in its two libstdc++ string ABIs.
 It returns and takes std::string, std::vector<Person>, std::array<int, 4>, a map with a
 non-default comparator and nested specializations, and has a program-defined template that uses
-every template-argument kind DWARF has. One "g" byte makes the fixture do one exact pass.
+every template-argument kind DWARF has. It also has the argument types whose DWARF spelling is
+not the compiler's (long, std::size_t), a std::string_view-only signature, <chrono> types,
+program enumerations and an opaque program record inside standard containers, a signed
+constant above 127, an array of unknown bound, a multi-dimensional array and a pointer to
+function. One "g" byte makes the fixture do one exact pass.
 
 Checked here:
   * probes install with no header given, and their results are the target's values;
-  * the explicit header route still works and the headers it names are used as before;
+  * a program type the route cannot declare is named, with the header route as the remedy;
+  * the explicit header route still works, through --include, a callback #include and a forced
+    include, and the headers it names are used as before;
   * an unmapped record names the exact --std-header entry that maps it, and that entry works;
   * both libstdc++ string ABIs are selected from the target's DWARF, an option that disagrees
     with the target is reported, and so is a header option that selects a different type;
@@ -22,6 +28,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,7 +40,7 @@ FIXTURES = ("repl_std_headers.hpp", "repl_std_headers.cpp", "repl_std_headers_ma
 
 
 def varints(payload):
-    """The (field, value) pairs of a protobuf message holding only varint and bytes fields."""
+    """The (field, value) pairs of a protobuf message; fixed-width values stay as bytes."""
     fields, index = [], 0
     while index < len(payload):
         key, index = read_varint(payload, index)
@@ -41,6 +48,9 @@ def varints(payload):
             value, index = read_varint(payload, index)
         elif key & 7 == 2:
             length, index = read_varint(payload, index)
+            value, index = payload[index:index + length], index + length
+        elif key & 7 in (1, 5):
+            length = 8 if key & 7 == 1 else 4
             value, index = payload[index:index + length], index + length
         else:
             raise AssertionError(f"unexpected wire type in {payload!r}")
@@ -82,7 +92,10 @@ def build(compiler, link_flags, root, name, *options):
 
 def start(repl, server, agent, executable, stack, root):
     target = Target(str(executable), stack)
-    session = Session(repl, server, agent, target, stack, root)
+    # Each session exports into a directory of its own: an export never overwrites a file, so
+    # a name reused by a later session must not find an earlier session's events.
+    exports = Path(tempfile.mkdtemp(prefix="session-", dir=root))
+    session = Session(repl, server, agent, target, stack, exports)
     # The fixture exports no dynamic symbols, so the resolver is told which image to search.
     session.module = str(executable)
     return session
@@ -120,8 +133,11 @@ def automatic_phase(session):
         base = int(event["arguments"][0]["signedValue"])
         values = [zigzag(v) for field, v in varints(payload(event)) if field == 1]
         assert values == [base + i for i in range(4)], (base, values)
-    people = post("people")
-    assert len(people) == PASSES and all(payload(e) for e in people)
+    for event in post("people"):
+        # One element message per Person: id (signed) and score (a double).
+        people = [dict(varints(value)) for field, value in varints(payload(event)) if field == 1]
+        assert [zigzag(p[1]) for p in people] == [1, 2, 3], people
+        assert [struct.unpack("<d", p[2])[0] for p in people] == [0.0, 1.5, 3.0], people
     # The nested specialization is recovered whole; whether its value can also be decoded is the
     # snapshot encoder's business, so only the type identity is checked.
     for event in post("pairs"):
@@ -135,6 +151,65 @@ def automatic_phase(session):
         assert snapshot["status"] == "UNSUPPORTED" and "comparator" in snapshot["detail"], snapshot
     sums = post("sum")
     assert all(e["result"]["signedValue"] == "6" for e in sums), sums
+    session.detach()
+
+
+def scalar(event):
+    result = event["result"]
+    return int(result.get("signedValue", result.get("unsignedValue", 0)))
+
+
+def spelling_phase(session):
+    """Types whose DWARF spelling is not the compiler's, and arguments beyond plain types."""
+    probes = {}
+    for key, selector in (
+            ("longs", '"stdh::make_longs(int)"'), ("sizes", '"stdh::make_sizes(int)"'),
+            ("view", '"stdh::view_size"'), ("delay", '"stdh::make_delay(int)"'),
+            ("stamp", '"stdh::make_stamp(int)"'), ("twice", '"stdh::call_twice"'),
+            ("modes", '"stdh::make_modes(int)"'), ("level", '"stdh::make_level(int)"'),
+            ("named", '"stdh::make_named(int)"'), ("ratio", '"stdh::ratio_den"'),
+            ("unbound", '"stdh::sum_array"'), ("grid", '"stdh::grid_sum"'),
+            ("apply", '"stdh::apply_all"')):
+        try:
+            probes[key], _ = inject(session, selector)
+        except AssertionError as error:
+            raise AssertionError(f"{selector}: {error}") from None
+    session.run_passes()
+
+    def post(key):
+        return session.events(probes[key], "POST", PASSES, key)
+
+    # long and std::size_t elements: DWARF says "long int" and "long unsigned int".
+    for event in post("longs"):
+        values = [zigzag(v) for field, v in varints(payload(event)) if field == 1]
+        assert values == [1000, 2000, 3000], values
+    for event in post("sizes"):
+        assert [v for field, v in varints(payload(event)) if field == 1] == [7, 8], payload(event)
+    # A std::string_view and nothing else: not a statement about the std::string ABI.
+    assert [scalar(e) for e in post("view")] == [4] * PASSES
+    # <chrono> supplies std::ratio and the clock its own types name.
+    for key, name in (("delay", "std::chrono::duration<"), ("stamp", "std::chrono::time_point<")):
+        for event in post(key):
+            assert event["result"]["snapshot"]["cppType"].startswith(name), event["result"]
+    assert sorted(scalar(e) for e in post("twice")) == [2, 3, 4]
+    # Program enumerations are declared from DWARF: scoped with a fixed type, and unscoped.
+    for event in post("modes"):
+        assert event["result"]["snapshot"]["cppType"] == "std::vector<stdh::Mode>", event["result"]
+        assert payload(event)
+    for event in post("level"):
+        assert event["result"]["snapshot"]["cppType"] == "std::optional<stdh::Level>", event["result"]
+        assert payload(event)
+    # A vector only points at its elements, so an opaque program record is enough for it.
+    assert len(post("named")) == PASSES
+    # A signed constant above 127, T[], T[2][3] and a pointer to function as arguments.
+    assert [scalar(e) for e in post("ratio")] == [200] * PASSES
+    assert [scalar(e) for e in post("unbound")] == [6] * PASSES
+    assert [scalar(e) for e in post("grid")] == [21] * PASSES
+    assert sorted(scalar(e) for e in post("apply")) == [5, 7, 9]
+    # Held by value, the opaque record must be complete: the probe says which type it needs.
+    error = inject_error(session, '"stdh::find_named(int)"')
+    assert "std::optional<stdh::Named>" in error and "template argument stdh::Named" in error, error
+    assert "opaque" in error and "--include" in error, error
     session.detach()
 
 
@@ -176,10 +251,33 @@ def explicit_header_phase(session, root, compiler, link_flags):
     session.run_passes()
     assert {payload_text(e) for e in session.events(label, "POST", PASSES, "xl")} == {"rec7"}
     assert len(session.events(make_label, "POST", PASSES, "xm")) == PASSES
+    # A signed constant above 127 and an array of unknown bound are the header's own types.
+    ratio, _ = inject(session, '"stdh::ratio_den"', *options)
+    unbound, _ = inject(session, '"stdh::sum_array"', *options)
+    longs, _ = inject(session, '"stdh::make_longs(int)"', *options)
+    # The same headers named by the callback itself, and forced on the command line.
+    hook = root / "hook.cpp"
+    hook.write_text(f'#include "{header}"\n'
+                    "struct Interceptor { void pre(const Call&) {} void post(const Call&) {} };\n")
+    # The grammar takes --callback directly after the selector.
+    included, _ = session.inject('"stdh::view_size"', "--callback", str(hook),
+                                 "--module", session.module)
+    forced, _ = inject(session, '"stdh::make_delay(int)"', "--compile-option", "-include",
+                       "--compile-option", str(header))
+    session.run_passes()
+    assert [scalar(e) for e in session.events(ratio, "POST", PASSES, "xr")] == [200] * PASSES
+    assert [scalar(e) for e in session.events(unbound, "POST", PASSES, "xu")] == [6] * PASSES
+    assert len(session.events(longs, "POST", PASSES, "xg")) == PASSES
+    assert [scalar(e) for e in session.events(included, "POST", PASSES, "xi")] == [4] * PASSES
+    assert len(session.events(forced, "POST", PASSES, "xf")) == PASSES
     # Selecting the other string ABI is reported against what the target's DWARF says.
     error = inject_error(session, '"stdh::make_label(int)"', *options,
                                  "--compile-option", "-D_GLIBCXX_USE_CXX11_ABI=0")
     assert "libstdc++ ABI mismatch" in error and "_GLIBCXX_USE_CXX11_ABI=0" in error, error
+    # A header mapping belongs to the automatic route only: it is not silently ignored.
+    error = inject_error(session, '"stdh::make_label(int)"', *options,
+                                 "--std-header", "std::basic_string=<string>")
+    assert "--std-header" in error and "without headers of its own" in error, error
     session.detach()
 
 
@@ -194,6 +292,15 @@ def mismatch_phase(session):
     assert "headers chosen automatically: <array>" in error, error
     assert "libstdc++ release" in error and "target built by 'GNU C++17" in error, error
     assert "--std-header" in error, error
+    # Only the macro itself counts: the split -D form sets it, a longer name does not, and -U
+    # leaves the choice to the target's DWARF again.
+    error = inject_error(session, '"stdh::make_label(int)"', "--compile-option", "-D",
+                         "--compile-option", "_GLIBCXX_USE_CXX11_ABI=0")
+    assert "libstdc++ ABI mismatch" in error, error
+    inject(session, '"stdh::make_label(int)"', "--compile-option",
+           "-D_GLIBCXX_USE_CXX11_ABI_OTHER=0")
+    inject(session, '"stdh::Record::label() const"', "--compile-option",
+           "-D_GLIBCXX_USE_CXX11_ABI=0", "--compile-option", "-U_GLIBCXX_USE_CXX11_ABI")
     session.detach()
 
 
@@ -206,6 +313,13 @@ def old_abi_phase(session):
                                  "--compile-option", "-D_GLIBCXX_USE_CXX11_ABI=1")
     assert "libstdc++ ABI mismatch" in error and "pre-C++11" in error, error
     assert "-D_GLIBCXX_USE_CXX11_ABI=0" in error, error
+    # The option the selection added for this target is part of what a validation reports.
+    hook = session.root / "hook.cpp"
+    hook.write_text("struct Interceptor { void pre(const Call&) {} void post(const Call&) {} };\n")
+    session.command(f'%probe validate "stdh::make_label(int)" --callback {hook} '
+                    f"--module {session.module}")
+    session.output.expect(r"^success: true$")
+    session.output.expect(r'^effective_options: "-D_GLIBCXX_USE_CXX11_ABI=0"$')
     session.detach()
 
 
@@ -310,9 +424,16 @@ class Dwarf:
         if tag == "DW_TAG_enumeration_type":
             return {"kind": "ENUM", "name": self.qualified(die)}
         if tag == "DW_TAG_array_type":
-            bound = next(c for c in die["children"] if c["tag"] == "DW_TAG_subrange_type")
-            return {"kind": "ARRAY", "element": self.type_of(self.ref(die)),
-                    "count": self.number(bound, "DW_AT_upper_bound") + 1}
+            # One subrange per dimension, outermost first; none of them bounded for T[].
+            result = self.type_of(self.ref(die))
+            for bound in reversed([c for c in die["children"]
+                                   if c["tag"] == "DW_TAG_subrange_type"]):
+                result = {"kind": "ARRAY", "element": result}
+                if "DW_AT_count" in bound["attrs"]:
+                    result["count"] = self.number(bound, "DW_AT_count")
+                elif "DW_AT_upper_bound" in bound["attrs"]:
+                    result["count"] = self.number(bound, "DW_AT_upper_bound") + 1
+            return result
         if tag == "DW_TAG_subroutine_type":
             return {"kind": "FUNCTION", "element": self.type_of(self.ref(die)),
                     "parameters": [self.type_of(self.ref(c)) for c in die["children"]
@@ -375,7 +496,8 @@ def wire_type(message):
         result["element"] = wire_type(message["element"][0])
     elif kind == "ARRAY":
         result["element"] = wire_type(message["element"][0])
-        result["count"] = int(message["array_count"][0])
+        if message.get("has_array_count") == ["true"]:
+            result["count"] = int(message.get("array_count", ["0"])[0])
     elif kind == "FUNCTION":
         result["element"] = wire_type(message["element"][0])
         result["parameters"] = [wire_type(p) for p in message.get("parameters", [])]
@@ -440,6 +562,18 @@ def metadata_checks(repl, server, agent, executable, dwarfdump, root, stack):
     assert name.startswith("std::map<int, int, std::greater<int>"), name
     assert [a["kind"] for a in ordered] == ["TYPE"] * 4, ordered
     assert ordered[2]["type"]["name"] == "std::greater<int>", ordered
+    # A signed constant that needs more than seven bits is read through its type, not its form.
+    name, ratio = metadata_phase(session, dwarfdump, executable, "stdh::ratio_den", False)
+    assert name == "std::ratio<1, 200>" and [a["value"] for a in ratio] == ["1", "200"], ratio
+    # An array of unknown bound, and every dimension of a multi-dimensional one.
+    _, unbound = metadata_phase(session, dwarfdump, executable, "stdh::sum_array", False)
+    assert unbound[0]["type"] == {"kind": "ARRAY", "element": {
+        "kind": "BUILTIN", "name": "int", "size": 4, "encoding": 5}}, unbound
+    _, grid = metadata_phase(session, dwarfdump, executable, "stdh::grid_sum", False)
+    assert grid[0]["type"]["count"] == 2 and grid[0]["type"]["element"]["count"] == 3, grid
+    assert grid[0]["type"]["element"]["element"]["kind"] == "BUILTIN", grid
+    _, modes = metadata_phase(session, dwarfdump, executable, "stdh::make_modes(int)", True)
+    assert modes[0]["type"] == {"kind": "ENUM", "name": "stdh::Mode"}, modes
     session.detach()
 
 
@@ -456,10 +590,14 @@ def main():
         # The project-built fixture: whichever compiler built the tracer.
         session = start(repl, server, agent, project_exe, stack, root)
         automatic_phase(session)
+        session = start(repl, server, agent, project_exe, stack, root)
+        spelling_phase(session)
         # The fixture built by the GCC the tracer SDK ships, in both string ABIs.
         modern = build(compiler, link_flags, root, "target-cxx11")
         session = start(repl, server, agent, modern, stack, root)
         automatic_phase(session)
+        session = start(repl, server, agent, modern, stack, root)
+        spelling_phase(session)
         session = start(repl, server, agent, modern, stack, root)
         unmapped_phase(session)
         session = start(repl, server, agent, modern, stack, root)
@@ -469,10 +607,12 @@ def main():
         legacy = build(compiler, link_flags, root, "target-cxx98", "-D_GLIBCXX_USE_CXX11_ABI=0")
         session = start(repl, server, agent, legacy, stack, root)
         old_abi_phase(session)
-        if dwarfdump != "-":
-            metadata_checks(repl, server, agent, modern, dwarfdump, root, stack)
-        else:
-            print("SKIPPED metadata comparison: no llvm-dwarfdump")
+        if dwarfdump == "-":
+            # Everything above passed, but the comparison with the DWARF tags did not run:
+            # report the test as skipped (ctest SKIP_RETURN_CODE) rather than as passed.
+            print("SKIPPED metadata comparison: no llvm-dwarfdump; the other phases passed")
+            sys.exit(77)
+        metadata_checks(repl, server, agent, modern, dwarfdump, root, stack)
     print("standard headers and DWARF template arguments passed")
 
 

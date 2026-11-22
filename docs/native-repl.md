@@ -1513,11 +1513,10 @@ chooses the real standard headers itself:
   (`std::__cxx11`, `std::__1`), so the header's own ABI macros pick the namespace;
 - the headers are compiled with the agent's own toolchain, as a plain `#include` in the callback
   source, then the compiler's specialization is compared with the DWARF description (template
-  arguments by kind, layout, size) before it is used. A program's own record that appears only
-  as a template argument (the `Person` of `std::vector<Person>`) is recovered from DWARF as for
-  any other program record; standard-library records are never recovered that way.
+  arguments by kind, layout, size) before it is used.
 
-A record the table does not cover is reported with the exact entry that maps it:
+A record the callable names directly (its receiver, an argument or its result) must have a
+mapping. One the table does not cover is reported with the exact entry that maps it:
 
 ```text
 error: ... standard-library record std::uniform_real_distribution (argument 0) has no header
@@ -1525,34 +1524,80 @@ mapping: map it with --std-header std::uniform_real_distribution=<header>, or su
 header with --include or an #include in the callback
 ```
 
-`--std-header RECORD=HEADER` (repeatable, accepted wherever `--include` is) extends or overrides the
-table for one probe. `RECORD` is a qualified record name without template arguments or inline ABI
-namespaces, in `std::`, `__gnu_cxx::` or `__cxxabiv1::`; `HEADER` is `<name>` or an absolute path.
+A standard-library record that is only a template argument does not need an entry of its own:
+the header of the record that names it normally defines it (`<chrono>` defines the clock of a
+`time_point` and the `std::ratio` of a `duration`). If the type cannot be built after all, the
+message lists the argument records without a mapping, each with its `--std-header` entry.
 
-The libstdc++ string ABI follows the target: DWARF that shows `std::__cxx11::basic_string` selects
-`_GLIBCXX_USE_CXX11_ABI=1` and DWARF that shows `std::basic_string` selects `0`, whatever the agent's
-own default is. A `--compile-option -D_GLIBCXX_USE_CXX11_ABI=...` that disagrees with the
-target, an option such as `-D_GLIBCXX_DEBUG` that makes the headers define a different type, or a
-standard library whose definition differs from the target's all end in a message that names
-the headers chosen, the agent toolchain (libstdc++ release, default ABI, runtime), the compiler
-that built the target and the ways out: the target's own headers through `--include` with
-`--compdb`, or a different `--std-header`. A header the agent's toolchain does not have is
-reported as a missing standard header, not as a type mismatch.
+`--std-header RECORD=HEADER` (repeatable) extends or overrides the table for one probe. `RECORD`
+is a qualified record name without template arguments or inline ABI namespaces, in `std::`,
+`__gnu_cxx::` or `__cxxabiv1::`; `HEADER` is `<name>` or an absolute path. It is accepted by
+`%probe resolve`, `%probe inject`, `%probe validate` and `%interceptor validate|upload`, not by
+`%probe prepare`. It belongs to the automatic selection only: a probe that has headers of its
+own (`--include`, `--compdb`, a forced include, an `#include` in the callback, or a prepared
+context) rejects it instead of ignoring it.
 
-Explicit headers are the unchanged baseline: with `--include`, an `#include` in the callback or a
-forced include, nothing is chosen automatically and the same checks (including
-the libstdc++ ABI check against the headers' own `_GLIBCXX_USE_CXX11_ABI`) apply.
+**The program's own types as template arguments.** The standard headers supply the standard
+record but not the program types it is instantiated with, so those come from DWARF:
+
+| Argument | What happens |
+|---|---|
+| A record DWARF describes in full (`std::vector<Person>`, `Person` holding builtin members) | recovered from DWARF, as for any other program record |
+| An enumeration at namespace scope (`std::vector<Status>`, `std::optional<Level>`) | declared from DWARF with its name, `enum class` or `enum`, and underlying type; its enumerators are not declared |
+| A record DWARF describes only as opaque (it has a `std::string`, a base class, ...) | declared, not defined: enough where the standard type only points at it (`std::vector<Order>`, `std::shared_ptr<Order>`, `std::unique_ptr<Order>` by reference or as a result); a type that holds it by value (`std::optional<Order>`, `std::pair<int, Order>`, a by-value `std::vector<Order>` argument) is rejected with a message that names `Order` |
+| A class template specialization (`std::vector<Box<int>>`), a type in an anonymous namespace, an enumeration declared inside a class | rejected with a message that names the type |
+
+For the rejected cases the remedy is the explicit route: the program's real header through
+`--include` with `--compdb`, or an `#include` in the callback.
+
+**Language mode.** The automatic headers are compiled as C++20, or as a newer standard when the
+target is known to use one: its `DW_AT_producer` names it (GCC writes `GNU C++23 ...`; a recorded
+command line has `-std=`), or it uses a record that only exists from that standard on (the
+table marks `std::expected` as C++23, `std::span` as C++20, ...). `--compile-option -std=c++NN`
+always wins. A record newer than the agent's own standard library has no header there and is
+reported as a missing standard header; such a target needs the explicit route with its own
+headers.
+
+**libstdc++ string ABI.** It follows the target: DWARF that shows `std::__cxx11::basic_string`
+(or another class libstdc++ keeps in two ABIs: `std::list`, the string streams) selects
+`_GLIBCXX_USE_CXX11_ABI=1`, and DWARF that shows `std::basic_string` selects `0`, whatever the
+agent's own default is. A callable that uses none of these classes (only `std::string_view`,
+say) says nothing about the ABI and nothing is selected or checked for it. A
+`--compile-option -D_GLIBCXX_USE_CXX11_ABI=...` that disagrees with the target, an option such
+as `-D_GLIBCXX_DEBUG` that makes the headers define a different type, or a standard library
+whose definition differs from the target's all end in a message that names the headers chosen,
+the agent toolchain (libstdc++ release, default ABI, runtime), the compiler that built the
+target and the ways out: the target's own headers through `--include` with `--compdb`, or a
+different `--std-header`. A header the agent's toolchain does not have is reported as a missing
+standard header, not as a type mismatch. Options the selection adds (`-D_GLIBCXX_USE_CXX11_ABI=`,
+`-std=`) are listed with the effective options of `%probe validate`.
+
+Explicit headers remain the baseline: with `--include`, an `#include` in the callback or a
+forced include, nothing is chosen automatically, no option is added, and the same checks
+(including the libstdc++ ABI check against the headers' own `_GLIBCXX_USE_CXX11_ABI`) apply.
+The identity check of a standard-library specialization is the structured one on this route
+too, so a header type is matched by its template arguments rather than by its printed name.
 
 `%probe resolve` prints what the resolver read from DWARF. For a template specialization the
 record carries `template_arguments`, one entry per DW_TAG_template_type_parameter,
 DW_TAG_template_value_parameter (with its type and integral value),
 DW_TAG_GNU_template_template_param and DW_TAG_GNU_template_parameter_pack (with its elements).
-Types are described structurally: builtin, enumeration, record (itself described the same way),
-pointer, reference, array and function types keep their qualifiers and shape. The identity check
-that selects the compiler's record compares these by kind; a record whose arguments DWARF does not
-describe (for example only a declaration of it exists in the program) is compared by its display
-name as before. `DebugInfo.template_arguments` and `DebugInfo.producer` are new, optional fields:
-an older consumer ignores them.
+Types are described structurally: builtin, enumeration (with its underlying type and whether it
+is scoped), record (itself described the same way), pointer, reference, array and function
+types keep their qualifiers and shape. An array has one level per dimension and no count when
+its bound is unknown (`int[]`). An integral value is read through the parameter's type: its
+signedness and width come from the type, not from the DWARF form, which only says how many
+bytes the producer needed to write it. The identity check that selects the compiler's record
+compares these by kind; a record whose arguments DWARF does not describe (for example only a
+declaration of it exists in the program) is compared by its display name, in which the
+spellings of one builtin type (`long int` and `long`, `long unsigned int` and `unsigned long`)
+are the same type.
+
+`DebugInfo.template_arguments` and `DebugInfo.producer` describe the records a probe is built
+from. They are not part of an entry's ABI contract: two definitions of one function are
+compared without them, as are the discovery commands. On the wire they are optional fields, but
+a server and an agent must still come from the same build, as for any change to `DebugInfo`:
+the agent resolves the callable again and compares its whole description with the server's.
 
 ### Probe working directory
 

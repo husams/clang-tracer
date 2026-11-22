@@ -974,7 +974,8 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-std-headers-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${_std_headers_gxx}"
           "${_std_headers_link_flags}" "${_std_headers_dwarfdump}")
-      set_tests_properties(native_repl_std_headers PROPERTIES TIMEOUT 900)
+      # Exit 77: no llvm-dwarfdump, so the comparison with the DWARF template tags did not run.
+      set_tests_properties(native_repl_std_headers PROPERTIES TIMEOUT 1500 SKIP_RETURN_CODE 77)
       add_executable(repl-variadic-target tests/fixtures/repl_variadic.cpp)
       set_target_properties(repl-variadic-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-variadic-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer

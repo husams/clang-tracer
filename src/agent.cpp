@@ -1568,6 +1568,22 @@ std::string normalized_cpp_type(llvm::StringRef text) {
       std::string_view(text.data(), text.size()));
 }
 
+// Pointer levels of a record type's own declarator in a DWARF type spelling. A `*` inside the
+// record's template arguments (std::map<int, int (*)(int)>&, std::vector<Node*>) belongs to an
+// argument, not to the pointer chain that leads to the record.
+std::size_t record_pointer_levels(std::string_view type) {
+  std::size_t depth = 0, levels = 0;
+  for (const char c : type) {
+    if (c == '<')
+      ++depth;
+    else if (c == '>' && depth)
+      --depth;
+    else if (c == '*' && depth == 0)
+      ++levels;
+  }
+  return levels;
+}
+
 bool standard_library_record_name(llvm::StringRef name) {
   return ::tracer::compat::starts_with(name, "std::") ||
          ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
@@ -1611,18 +1627,19 @@ bool has_automatic_headers(const std::string &includes) {
 struct StandardRecordUse {
   std::string name;
   std::string role;
+  bool nested = false;  // Reached only as a template argument of another standard record.
 };
 
 void collect_standard_records(const clangtracer::v1::DebugInfo &info, const std::string &role,
-                              std::vector<StandardRecordUse> &uses);
+                              std::vector<StandardRecordUse> &uses, bool nested = false);
 
 void collect_standard_records(const clangtracer::v1::DebugTemplateType &type,
                               const std::string &role, std::vector<StandardRecordUse> &uses) {
   if (type.kind() == clangtracer::v1::DebugTemplateType::RECORD) {
     if (type.has_record())
-      collect_standard_records(type.record(), role, uses);
+      collect_standard_records(type.record(), role, uses, true);
     else
-      uses.push_back({type.name(), role});
+      uses.push_back({type.name(), role, true});
   }
   if (type.has_element())
     collect_standard_records(type.element(), role, uses);
@@ -1639,33 +1656,19 @@ void collect_standard_records(const clangtracer::v1::DebugTemplateArgument &argu
 }
 
 void collect_standard_records(const clangtracer::v1::DebugInfo &info, const std::string &role,
-                              std::vector<StandardRecordUse> &uses) {
+                              std::vector<StandardRecordUse> &uses, bool nested) {
   if (!info.record_name().empty())
-    uses.push_back({info.record_name(), role});
+    uses.push_back({info.record_name(), role, nested});
   // Only a standard-library record brings its arguments' headers with it. A program template
   // that merely has a standard type as an argument keeps the headerless recovery it always had.
   if (::tracer::standard_headers::standard_library_scope(info.record_name()))
     for (const auto &argument : info.template_arguments())
-      collect_standard_records(argument, role + " template argument", uses);
+      collect_standard_records(argument, nested ? role : role + " template argument", uses);
 }
 
-// The real standard headers the callable's records need, as a block of #include lines framed by
-// the automatic-header markers; empty when it uses no standard-library record. A record with no
-// mapping is reported with the exact entry that would map it. `known` is the lookup used for
-// names, so a caller can extend it per probe (ProbeSpec.standard_headers).
-bool automatic_standard_headers(const clangtracer::v1::ProbeSpec &spec, std::string &block,
-                                std::string &error) {
-  block.clear();
-  std::vector<::tracer::standard_headers::Entry> user_entries;
-  for (const auto &text : spec.standard_headers()) {
-    ::tracer::standard_headers::Entry entry;
-    if (const auto problem = ::tracer::standard_headers::parse_entry(text, entry);
-        !problem.empty()) {
-      error = "invalid standard header mapping '" + text + "': " + problem;
-      return false;
-    }
-    user_entries.push_back(std::move(entry));
-  }
+// Every standard-library record the callable names: receiver, arguments, result and, through
+// their structured template arguments, the records those name.
+std::vector<StandardRecordUse> callable_standard_records(const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
   std::vector<StandardRecordUse> uses;
   collect_standard_records(info, "receiver", uses);
@@ -1675,20 +1678,76 @@ bool automatic_standard_headers(const clangtracer::v1::ProbeSpec &spec, std::str
                                "argument " + std::to_string(argument.index()), uses);
   if (info.has_result_object_type())
     collect_standard_records(info.result_object_type(), "result", uses);
+  return uses;
+}
+
+bool parse_standard_header_entries(const clangtracer::v1::ProbeSpec &spec,
+                                   std::vector<::tracer::standard_headers::Entry> &entries,
+                                   std::string &error) {
+  for (const auto &text : spec.standard_headers()) {
+    ::tracer::standard_headers::Entry entry;
+    if (const auto problem = ::tracer::standard_headers::parse_entry(text, entry);
+        !problem.empty()) {
+      error = "invalid standard header mapping '" + text + "': " + problem;
+      return false;
+    }
+    entries.push_back(std::move(entry));
+  }
+  return true;
+}
+
+// Standard-library records that are only template arguments and have no header mapping. They
+// do not stop a probe: the header of the record that names them normally defines them
+// (<chrono> defines the clock a time_point names). They are listed when the type cannot be
+// built after all, with the entry that would map each.
+std::string unmapped_argument_records(const clangtracer::v1::ProbeSpec &spec) {
+  std::vector<::tracer::standard_headers::Entry> user_entries;
+  std::string ignored;
+  if (!parse_standard_header_entries(spec, user_entries, ignored))
+    return {};
+  std::set<std::string> keys;
+  for (const auto &use : callable_standard_records(spec)) {
+    std::string key;
+    if (use.nested && ::tracer::standard_headers::standard_library_scope(use.name) &&
+        !::tracer::standard_headers::find_entry(use.name, user_entries, key))
+      keys.insert(key);
+  }
+  std::string result;
+  for (const auto &key : keys)
+    result += (result.empty() ? "" : ", ") + key + " (--std-header " + key + "=<header>)";
+  return result;
+}
+
+// The real standard headers the callable's records need, as a block of tagged #include lines;
+// empty when it uses no standard-library record. A record the callable names directly must
+// have a mapping, and one without is reported with the exact entry that would map it. A caller
+// extends or overrides the table per probe (ProbeSpec.standard_headers). `standard` receives
+// the newest C++ standard any of the records needs (0 when none is newer than C++20).
+bool automatic_standard_headers(const clangtracer::v1::ProbeSpec &spec, std::string &block,
+                                int &standard, std::string &error) {
+  block.clear();
+  standard = 0;
+  std::vector<::tracer::standard_headers::Entry> user_entries;
+  if (!parse_standard_header_entries(spec, user_entries, error))
+    return false;
   std::set<std::string> headers;
-  for (const auto &use : uses) {
+  for (const auto &use : callable_standard_records(spec)) {
     if (!::tracer::standard_headers::standard_library_scope(use.name))
       continue;
     std::string key;
-    const auto *header = ::tracer::standard_headers::find_header(use.name, user_entries, key);
-    if (!header) {
+    const auto *entry = ::tracer::standard_headers::find_entry(use.name, user_entries, key);
+    if (!entry) {
+      // Left to the header of the record that names it; see unmapped_argument_records().
+      if (use.nested)
+        continue;
       error = "standard-library record " + key + " (" + use.role +
               ") has no header mapping: map it with --std-header " + key +
               "=<header>, or supply its real header with --include or an #include in the "
               "callback";
       return false;
     }
-    headers.insert(::tracer::standard_headers::include_line(*header));
+    headers.insert(::tracer::standard_headers::include_line(entry->header));
+    standard = std::max(standard, entry->standard);
   }
   for (const auto &line : headers) {
     block += line.substr(0, line.size() - 1);  // drop the newline, then tag the line
@@ -1698,45 +1757,14 @@ bool automatic_standard_headers(const clangtracer::v1::ProbeSpec &spec, std::str
   return true;
 }
 
-// The libstdc++ dual-ABI class the target's debug data shows: 1 for the C++11 ABI
+// The libstdc++ dual ABI the target's debug data shows: 1 for the C++11 ABI
 // (std::__cxx11::basic_string), 0 for the old one (std::basic_string), -1 when it shows none or
-// both. Only the classes libstdc++ really keeps in two ABIs count.
+// both.
 int target_cxx11_abi(const clangtracer::v1::ProbeSpec &spec) {
-  const auto &info = spec.debug_info();
-  std::vector<StandardRecordUse> uses;
-  collect_standard_records(info, "receiver", uses);
-  for (const auto &argument : info.arguments())
-    if (argument.has_object_type())
-      collect_standard_records(argument.object_type(), "argument", uses);
-  if (info.has_result_object_type())
-    collect_standard_records(info.result_object_type(), "result", uses);
-  static const std::set<std::string> dual = {
-      "std::basic_string", "std::list", "std::basic_stringbuf", "std::basic_istringstream",
-      "std::basic_ostringstream", "std::basic_stringstream"};
-  bool seen_new = false, seen_old = false;
-  for (const auto &use : uses) {
-    if (!::tracer::standard_headers::standard_library_scope(use.name) ||
-        !dual.count(::tracer::standard_headers::primary_name(use.name)))
-      continue;
-    const auto scope = use.name.substr(0, use.name.find('<'));
-    (scope.find("__cxx11") != std::string::npos ? seen_new : seen_old) = true;
-  }
+  bool seen_new = spec.symbol().find("__cxx11") != std::string::npos, seen_old = false;
+  for (const auto &use : callable_standard_records(spec))
+    ::tracer::standard_headers::note_dual_abi_names(use.name, seen_new, seen_old);
   return seen_new == seen_old ? -1 : (seen_new ? 1 : 0);
-}
-
-// The _GLIBCXX_USE_CXX11_ABI the caller's options set: 0 or 1, -1 when they do not mention it,
-// -2 when they set it to something else.
-int explicit_cxx11_abi(const google::protobuf::RepeatedPtrField<std::string> &options) {
-  int result = -1;
-  for (const auto &option : options) {
-    const auto name = option.find("_GLIBCXX_USE_CXX11_ABI");
-    if (name == std::string::npos)
-      continue;
-    const auto equals = option.find('=', name);
-    const auto value = equals == std::string::npos ? std::string("1") : option.substr(equals + 1);
-    result = value == "0" ? 0 : value == "1" ? 1 : -2;
-  }
-  return result;
 }
 
 bool split_debug_template_arguments(llvm::StringRef spelling,
@@ -1938,7 +1966,8 @@ bool debug_record_identity_matches(clang::ASTContext &context,
 bool debug_template_type_matches(clang::ASTContext &context, const clang::PrintingPolicy &policy,
                                  clang::QualType type,
                                  const clangtracer::v1::DebugTemplateType &expected,
-                                 std::string &why) {
+                                 std::string &why, bool array_const = false,
+                                 bool array_volatile = false) {
   using Kind = clangtracer::v1::DebugTemplateType;
   type = context.getCanonicalType(type);
   const auto fail = [&](const std::string &reason) {
@@ -1947,8 +1976,29 @@ bool debug_template_type_matches(clang::ASTContext &context, const clang::Printi
   };
   if (expected.kind() == Kind::VOID)
     return type->isVoidType() ? true : fail("DWARF type is void");
-  if (type.isLocalConstQualified() != expected.is_const() ||
-      type.isLocalVolatileQualified() != expected.is_volatile())
+  // The qualifiers of an array belong to its elements: DWARF may put them on either, and the
+  // compiler's canonical type keeps them on the element. `array_*` carries them inward.
+  const bool expected_const = expected.is_const() || array_const;
+  const bool expected_volatile = expected.is_volatile() || array_volatile;
+  if (expected.kind() == Kind::ARRAY) {
+    const clang::ArrayType *array = nullptr;
+    if (expected.has_array_count()) {
+      const auto *constant = context.getAsConstantArrayType(type);
+      if (!constant || constant->getSize().getZExtValue() != expected.array_count())
+        return fail("DWARF type is an array of " + std::to_string(expected.array_count()));
+      array = constant;
+    } else {
+      // No bound in DWARF: an array of unknown bound (T[]).
+      array = context.getAsIncompleteArrayType(type);
+      if (!array)
+        return fail("DWARF type is an array of unknown bound");
+    }
+    return debug_template_type_matches(context, policy, array->getElementType(),
+                                       expected.element(), why, expected_const,
+                                       expected_volatile);
+  }
+  if (type.isLocalConstQualified() != expected_const ||
+      type.isLocalVolatileQualified() != expected_volatile)
     return fail("cv-qualification differs from DWARF");
   switch (expected.kind()) {
   case Kind::BUILTIN: {
@@ -2013,14 +2063,6 @@ bool debug_template_type_matches(clang::ASTContext &context, const clang::Printi
       return fail("DWARF type is an rvalue reference");
     return debug_template_type_matches(context, policy, type->getPointeeType(), expected.element(),
                                        why);
-  case Kind::ARRAY: {
-    const auto *array = context.getAsConstantArrayType(type);
-    if (!array || (expected.has_array_count() &&
-                   array->getSize().getZExtValue() != expected.array_count()))
-      return fail("DWARF type is an array of " + std::to_string(expected.array_count()));
-    return debug_template_type_matches(context, policy, array->getElementType(), expected.element(),
-                                       why);
-  }
   case Kind::FUNCTION: {
     const auto *function = type->getAs<clang::FunctionProtoType>();
     if (!function || function->getNumParams() != static_cast<unsigned>(expected.parameters_size()) ||
@@ -2379,7 +2421,14 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
         (finder.candidate_mismatch.empty()
              ? std::string()
              : "; candidate mismatch: " + finder.candidate_mismatch));
-  if (record && info.record_is_opaque()) {
+  // A standard-library specialization that a real header defines is the compiler's type: its
+  // members are the library's business and are not rebuilt or compared field by field, even
+  // when DWARF could describe them (std::chrono::duration holds one integer). Its identity was
+  // matched above; its size and alignment are compared with the target's here.
+  const bool header_standard_record =
+      record && standard_library_type && debug_record_from_header(record) &&
+      llvm::isa<clang::ClassTemplateSpecializationDecl>(record);
+  if (record && (info.record_is_opaque() || header_standard_record)) {
     if (!record->isCompleteDefinition())
       throw std::runtime_error("header record is incomplete for opaque DWARF type");
     const auto &layout = context.getASTRecordLayout(record);
@@ -2609,12 +2658,22 @@ std::string debug_scope_spelling(llvm::StringRef name) {
   }
 }
 
-std::string debug_template_type_spelling(const clangtracer::v1::DebugTemplateType &type) {
+// `declarator` is what the type is wrapped around, built from the outside in, so that a
+// pointer or reference to an array or function gets its parentheses: int (*)(int), int (&)[4],
+// never int(int)*. The qualifiers of an array are spelled on its element.
+std::string debug_template_type_spelling(const clangtracer::v1::DebugTemplateType &type,
+                                         std::string declarator = {}, bool array_const = false,
+                                         bool array_volatile = false) {
   using Kind = clangtracer::v1::DebugTemplateType;
-  std::string result;
+  const bool is_const = type.is_const() || array_const;
+  const bool is_volatile = type.is_volatile() || array_volatile;
+  const auto qualifiers = [&] {
+    return std::string(is_const ? " const" : "") + (is_volatile ? " volatile" : "");
+  };
+  std::string base;
   switch (type.kind()) {
   case Kind::VOID:
-    result = "void";
+    base = "void";
     break;
   case Kind::BUILTIN: {
     // DWARF builtin names are C++ spellings (long unsigned int, short int, ...) of one to
@@ -2624,47 +2683,43 @@ std::string debug_template_type_spelling(const clangtracer::v1::DebugTemplateTyp
         throw std::runtime_error("cannot spell DWARF builtin " + type.name() + " safely");
     if (type.name().empty())
       throw std::runtime_error("unnamed DWARF builtin template argument");
-    result = type.name();
+    base = type.name();
     break;
   }
   case Kind::ENUM:
-    result = "::" + debug_scope_spelling(type.name());
+    base = "::" + debug_scope_spelling(type.name());
     break;
   case Kind::RECORD:
-    result = type.has_record() ? debug_record_spelling(type.record())
-                               : "::" + debug_scope_spelling(type.name());
+    base = type.has_record() ? debug_record_spelling(type.record())
+                             : "::" + debug_scope_spelling(type.name());
     break;
   case Kind::POINTER:
-    result = debug_template_type_spelling(type.element()) + "*";
-    break;
   case Kind::LVALUE_REFERENCE:
-    result = debug_template_type_spelling(type.element()) + "&";
-    break;
-  case Kind::RVALUE_REFERENCE:
-    result = debug_template_type_spelling(type.element()) + "&&";
-    break;
+  case Kind::RVALUE_REFERENCE: {
+    declarator = (type.kind() == Kind::POINTER ? "*"
+                  : type.kind() == Kind::LVALUE_REFERENCE ? "&" : "&&") +
+                 qualifiers() + declarator;
+    if (type.element().kind() == Kind::ARRAY || type.element().kind() == Kind::FUNCTION)
+      declarator = "(" + declarator + ")";
+    return debug_template_type_spelling(type.element(), std::move(declarator));
+  }
   case Kind::ARRAY:
-    if (!type.has_array_count())
-      throw std::runtime_error("template argument array without a bound");
-    return debug_template_type_spelling(type.element()) + "[" +
-           std::to_string(type.array_count()) + "]";
+    declarator += type.has_array_count() ? "[" + std::to_string(type.array_count()) + "]" : "[]";
+    return debug_template_type_spelling(type.element(), std::move(declarator), is_const,
+                                        is_volatile);
   case Kind::FUNCTION: {
-    result = debug_template_type_spelling(type.element()) + "(";
+    declarator += "(";
     for (int i = 0; i < type.parameters_size(); ++i)
-      result += (i ? ", " : "") + debug_template_type_spelling(type.parameters(i));
+      declarator += (i ? ", " : "") + debug_template_type_spelling(type.parameters(i));
     if (type.function_variadic())
-      result += type.parameters_size() ? ", ..." : "...";
-    result += ")";
-    return result;
+      declarator += type.parameters_size() ? ", ..." : "...";
+    declarator += ")";
+    return debug_template_type_spelling(type.element(), std::move(declarator));
   }
   default:
     throw std::runtime_error("template argument type is not described");
   }
-  if (type.is_const())
-    result = (type.kind() == Kind::POINTER ? result + " const" : "const " + result);
-  if (type.is_volatile())
-    result = (type.kind() == Kind::POINTER ? result + " volatile" : "volatile " + result);
-  return result;
+  return base + qualifiers() + (declarator.empty() ? "" : " " + declarator);
 }
 
 std::string debug_template_argument_spelling(const clangtracer::v1::DebugTemplateArgument &argument) {
@@ -2704,17 +2759,24 @@ std::string debug_record_spelling(const clangtracer::v1::DebugInfo &info) {
     // parameter children. Its display name is then the only description, so it is used as a
     // request alone, after every character of it has been checked; identity is still decided
     // by comparing the compiler's type with the enclosing structure.
-    std::size_t depth = 0;
+    // Only what a type-id is made of may pass: names, template brackets, declarator
+    // punctuation and integer constants. No quote, brace, semicolon or assignment can occur,
+    // so the text cannot end the alias it is placed in.
+    std::vector<char> open_brackets;
     for (const char c : info.record_name()) {
-      depth += c == '<';
-      if (c == '>' && depth-- == 0)
+      const bool word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_';
+      if (c == '<' || c == '(' || c == '[') {
+        open_brackets.push_back(c == '<' ? '>' : c == '(' ? ')' : ']');
+      } else if (c == '>' || c == ')' || c == ']') {
+        if (open_brackets.empty() || open_brackets.back() != c)
+          throw std::runtime_error("cannot spell DWARF name " + info.record_name() + " safely");
+        open_brackets.pop_back();
+      } else if (!word && c != ':' && c != ',' && c != ' ' && c != '*' && c != '&' && c != '-') {
         throw std::runtime_error("cannot spell DWARF name " + info.record_name() + " safely");
-      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-            c == '_' || c == ':' || c == '<' || c == '>' || c == ',' || c == ' ' || c == '*' ||
-            c == '&'))
-        throw std::runtime_error("cannot spell DWARF name " + info.record_name() + " safely");
+      }
     }
-    if (depth != 0)
+    if (!open_brackets.empty())
       throw std::runtime_error("cannot spell DWARF name " + info.record_name() + " safely");
     return "::" + info.record_name();
   }
@@ -2766,6 +2828,148 @@ void collect_argument_records(const clangtracer::v1::DebugTemplateType &type,
     collect_argument_records(type.element(), records);
   for (const auto &parameter : type.parameters())
     collect_argument_records(parameter, records);
+}
+
+// The program's own types that a standard-library record names as template arguments, sorted
+// by what the headerless route can do with each. The real headers supply the standard record
+// but not these, so each is either declared from DWARF or reported by name.
+struct ArgumentProgramTypes {
+  struct Named {
+    std::string owner;   // The standard-library record whose argument it is.
+    std::string name;
+    std::string reason;  // Why it cannot be declared; empty otherwise.
+  };
+  std::vector<const clangtracer::v1::DebugTemplateType *> enums;  // Declared from DWARF.
+  std::vector<Named> undeclarable;  // Cannot be declared at all.
+  std::vector<Named> incomplete;    // Records DWARF describes only as opaque: declared, not defined.
+};
+
+bool declarable_argument_enum(const clangtracer::v1::DebugTemplateType &type) {
+  if (type.scopes_size() != 0 || type.name().find('(') != std::string::npos ||
+      type.name().find('<') != std::string::npos)
+    return false;
+  llvm::StringRef name = type.name();
+  while (!name.empty()) {
+    const auto part = name.split("::");
+    if (!debug_identifier(part.first))
+      return false;
+    name = part.second;
+  }
+  return type.byte_size() == 1 || type.byte_size() == 2 || type.byte_size() == 4 ||
+         type.byte_size() == 8;
+}
+
+void collect_argument_program_types(const clangtracer::v1::DebugInfo &info,
+                                    ArgumentProgramTypes &types);
+
+void collect_argument_program_types(const clangtracer::v1::DebugTemplateType &type,
+                                    const std::string &owner, ArgumentProgramTypes &types) {
+  using Kind = clangtracer::v1::DebugTemplateType;
+  if (type.kind() == Kind::ENUM && !standard_library_record_name(type.name())) {
+    if (declarable_argument_enum(type))
+      types.enums.push_back(&type);
+    else
+      types.undeclarable.push_back(
+          {owner, type.name(),
+           type.scopes_size() != 0 ? "an enumeration declared inside a class or function"
+                                   : "an enumeration without a declarable name"});
+  } else if (type.kind() == Kind::RECORD) {
+    if (standard_library_record_name(type.name())) {
+      if (type.has_record())
+        collect_argument_program_types(type.record(), types);
+    } else if (type.name().find('<') != std::string::npos) {
+      types.undeclarable.push_back({owner, type.name(), "a class template specialization"});
+    } else if (type.name().find('(') != std::string::npos) {
+      types.undeclarable.push_back({owner, type.name(), "a type in an anonymous namespace"});
+    } else if (!type.has_record()) {
+      types.undeclarable.push_back(
+          {owner, type.name(), "a record whose debug description is not supported"});
+    } else if (type.record().record_is_opaque()) {
+      types.incomplete.push_back({owner, type.name(), {}});
+    }
+  }
+  if (type.has_element() && type.kind() != Kind::ENUM)
+    collect_argument_program_types(type.element(), owner, types);
+  for (const auto &parameter : type.parameters())
+    collect_argument_program_types(parameter, owner, types);
+}
+
+void collect_argument_program_types(const clangtracer::v1::DebugInfo &info,
+                                    ArgumentProgramTypes &types) {
+  if (!standard_library_record_name(info.record_name()))
+    return;
+  const auto visit = [&](const auto &self, const clangtracer::v1::DebugTemplateArgument &argument)
+      -> void {
+    if (argument.has_type())
+      collect_argument_program_types(argument.type(), info.record_name(), types);
+    for (const auto &element : argument.pack_elements())
+      self(self, element);
+  };
+  for (const auto &argument : info.template_arguments())
+    visit(visit, argument);
+}
+
+ArgumentProgramTypes argument_program_types(const clangtracer::v1::ProbeSpec &spec) {
+  ArgumentProgramTypes types;
+  const auto &info = spec.debug_info();
+  collect_argument_program_types(info, types);
+  for (const auto &argument : info.arguments())
+    if (argument.has_object_type())
+      collect_argument_program_types(argument.object_type(), types);
+  if (info.has_result_object_type())
+    collect_argument_program_types(info.result_object_type(), types);
+  return types;
+}
+
+// Opaque declarations of the program's enumerations that standard-library records name as
+// template arguments (std::vector<Status>). The enumeration's name, whether it is scoped and
+// its underlying type are all the standard record's identity and layout depend on; its
+// enumerators are not declared.
+std::string argument_enum_declarations(const clangtracer::v1::ProbeSpec &spec) {
+  const auto types = argument_program_types(spec);
+  std::string result;
+  std::unordered_set<std::string> seen;
+  for (const auto *type : types.enums) {
+    if (!seen.insert(type->name()).second)
+      continue;
+    std::vector<std::string> parts;
+    for (llvm::StringRef name = type->name(); !name.empty();) {
+      const auto part = name.split("::");
+      parts.push_back(part.first.str());
+      name = part.second;
+    }
+    std::string underlying;
+    if (type->has_element() && type->element().byte_size() == type->byte_size()) {
+      underlying = type->element().name();
+      for (const char c : underlying)
+        if (!((c >= 'a' && c <= 'z') || c == ' ' || (c >= '0' && c <= '9') || c == '_'))
+          underlying.clear();
+    }
+    if (underlying.empty())
+      underlying = type->byte_size() == 1   ? "unsigned char"
+                   : type->byte_size() == 2 ? "unsigned short"
+                   : type->byte_size() == 4 ? "unsigned int"
+                                            : "unsigned long";
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i)
+      result += "namespace " + parts[i] + " { ";
+    result += std::string("enum ") + (type->enum_scoped() ? "class " : "") + parts.back() +
+              " : " + underlying + "; ";
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i)
+      result += "} ";
+  }
+  return result;
+}
+
+// The first program type that the automatic route cannot declare for a standard-library record,
+// as a diagnostic that names it; empty when there is none.
+std::string undeclarable_argument_type(const clangtracer::v1::ProbeSpec &spec) {
+  const auto types = argument_program_types(spec);
+  if (types.undeclarable.empty())
+    return {};
+  const auto &first = types.undeclarable.front();
+  return "standard-library type " + first.owner + " has the template argument " + first.name +
+         ", " + first.reason + ", which cannot be declared from the target's debug data; supply "
+         "its real header with --include and --compdb, or with an #include in the callback";
 }
 
 struct RecoveredScopePart {
@@ -3043,7 +3247,7 @@ std::string recovered_record_declarations(
     collect_argument_records(info.result_object_type(), nested);
   for (const auto *record : nested)
     append(*record);
-  return recovered_record_group(records);
+  return argument_enum_declarations(spec) + recovered_record_group(records);
 }
 
 // One alias per standard-library record the callable uses, each spelled from DWARF's
@@ -3185,6 +3389,9 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
 // caller can act on differ: a header the agent's toolchain does not have (a missing
 // definition), a header whose type is not the target's (an incompatible definition), and a
 // libstdc++ string ABI that disagrees with the target's.
+constexpr std::string_view kAutomaticCallbackFailure =
+    "cannot compile the callback with the standard headers chosen automatically";
+
 std::string automatic_headers_failure(const std::string &error,
                                       const clangtracer::v1::ProbeSpec &spec,
                                       const std::string &includes) {
@@ -3192,11 +3399,6 @@ std::string automatic_headers_failure(const std::string &error,
   const bool incompatible = ::tracer::compat::starts_with(error, "standard-library ABI mismatch") ||
                             ::tracer::compat::starts_with(error, "libstdc++ ABI mismatch") ||
                             error.find("size/alignment does not match") != std::string::npos;
-  if (!missing_header && !incompatible)
-    return error;
-  tracer::AgentRuntimeProfile profile;
-  const bool have_profile =
-      tracer_agent_runtime_profile_v1(&profile, sizeof(profile)) == 0;
   std::string selected;
   std::string_view lines(includes);
   while (!lines.empty()) {
@@ -3207,6 +3409,32 @@ std::string automatic_headers_failure(const std::string &error,
       selected += (selected.empty() ? "" : " ") + std::string(line.substr(9, tag - 9));
     lines.remove_prefix(newline == std::string_view::npos ? lines.size() : newline + 1);
   }
+  if (!missing_header && !incompatible) {
+    // The requested type did not compile. Two causes can be named from the debug data instead
+    // of leaving the caller with compiler output about generated code: a program type that is
+    // needed complete but is only described as opaque, and a standard-library argument record
+    // that has no mapping and that the chosen headers turned out not to define.
+    if (!::tracer::compat::starts_with(error, "cannot create debug type AST") &&
+        !::tracer::compat::starts_with(error, kAutomaticCallbackFailure))
+      return error;
+    const auto types = argument_program_types(spec);
+    if (!types.incomplete.empty() && error.find("incomplete type") != std::string::npos) {
+      const auto &first = types.incomplete.front();
+      return "standard-library type " + first.owner + " needs the complete definition of its "
+             "template argument " + first.name + ", which the target's debug data describes "
+             "only as an opaque type; supply its real header with --include and --compdb, or "
+             "with an #include in the callback (compiler output: " + error + ")";
+    }
+    if (const auto unmapped = unmapped_argument_records(spec); !unmapped.empty())
+      return "the headers chosen automatically (" + selected + ") do not define every "
+             "standard-library record the type names as a template argument; without a header "
+             "mapping: " + unmapped + "; map it, or supply the real header with --include or "
+             "an #include in the callback (compiler output: " + error + ")";
+    return error;
+  }
+  tracer::AgentRuntimeProfile profile;
+  const bool have_profile =
+      tracer_agent_runtime_profile_v1(&profile, sizeof(profile)) == 0;
   std::string result = missing_header
       ? "standard header selected for a recovered standard-library type is not available in the "
         "agent's toolchain: "
@@ -3373,23 +3601,9 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
         context.getTypeSize(context.VoidPtrTy) != 64)
       throw std::runtime_error("header target does not match Linux x86_64");
-    bool target_has_std_string = false;
-    bool target_uses_cxx11_string_abi =
-        spec.symbol().find("__cxx11") != std::string::npos;
-    const auto note_standard_type = [&](const auto &record) {
-      const auto &record_name = record.record_name();
-      target_has_std_string |= record_name.find("basic_string") !=
-                               std::string::npos;
-      target_uses_cxx11_string_abi |=
-          record_name.find("__cxx11") != std::string::npos;
-    };
-    note_standard_type(info);
-    for (const auto &argument : info.arguments())
-      if (argument.has_object_type())
-        note_standard_type(argument.object_type());
-    if (info.has_result_object_type())
-      note_standard_type(info.result_object_type());
-    if (target_has_std_string) {
+    // The string ABI the headers selected must be the one the target's dual-ABI classes show.
+    if (const int target_abi = target_cxx11_abi(spec); target_abi >= 0) {
+      const bool target_uses_cxx11_string_abi = target_abi == 1;
       auto &preprocessor = output->getPreprocessor();
       auto &identifier = preprocessor.getIdentifierTable().get(
           "_GLIBCXX_USE_CXX11_ABI");
@@ -4890,8 +5104,7 @@ bool debug_type_matches(clang::ASTContext &context, clang::QualType actual,
     if (!record)
       return false;
     const auto expected_identity = normalized_cpp_type(object->record_name());
-    if (!debug_record_identity_matches(context, record,
-                                       object->record_name()))
+    if (!debug_record_identity_matches(context, record, *object))
       return false;
     if (normalized_cpp_type(base) != expected_identity &&
         normalized_cpp_type(base) !=
@@ -4964,8 +5177,7 @@ bool validate_specialized_signature(
   }
   const auto has_multilevel_record_pointer = [](const std::string &type,
                                                  bool has_record) {
-    return has_record &&
-           std::count(type.begin(), type.end(), '*') > 1;
+    return has_record && record_pointer_levels(type) > 1;
   };
   const auto &result_info = info;
   if (has_multilevel_record_pointer(
@@ -6668,39 +6880,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
             "receiver context", true)))) {
     return false;
   }
-  // Standard headers chosen automatically must select the libstdc++ ABI the target was built
-  // with. The target's debug data says which one that is; the agent's headers default to the
-  // ABI of the agent's own toolchain. An explicit _GLIBCXX_USE_CXX11_ABI from the caller always
-  // wins, but one that disagrees with the target is reported here, before any header is read.
-  if (!typed_prepared && target_specification.has_debug_info() && !has_header_context &&
-      target_specification.include_headers().empty() &&
-      !has_user_includes(split_callback_includes(target_specification.callback_source()).first) &&
-      !std::any_of(target_specification.compile_options().begin(),
-                   target_specification.compile_options().end(), [](const std::string &option) {
-                     return ::tracer::compat::starts_with(option, "-include");
-                   })) {
-    const int target_abi = target_cxx11_abi(target_specification);
-    const int explicit_abi = [&] {
-      const auto from_options = explicit_cxx11_abi(target_specification.compile_options());
-      const auto from_extra = explicit_cxx11_abi(target_specification.extra_compile_arguments());
-      return from_extra != -1 ? from_extra : from_options;
-    }();
-    tracer::AgentRuntimeProfile profile;
-    const bool have_profile = tracer_agent_runtime_profile_v1(&profile, sizeof(profile)) == 0;
-    if (target_abi >= 0 && (explicit_abi == 0 || explicit_abi == 1) && explicit_abi != target_abi) {
-      error = std::string("libstdc++ ABI mismatch: the target uses the ") +
-              (target_abi ? "C++11 (std::__cxx11)" : "pre-C++11") +
-              " string/list ABI according to its DWARF, but the options select "
-              "_GLIBCXX_USE_CXX11_ABI=" + std::to_string(explicit_abi) +
-              "; pass -D_GLIBCXX_USE_CXX11_ABI=" + std::to_string(target_abi) +
-              " or remove the option that sets it";
-      return false;
-    }
-    if (target_abi >= 0 && explicit_abi == -1 && have_profile &&
-        profile.libstdcxx_default_cxx11_abi >= 0 && profile.libstdcxx_default_cxx11_abi != target_abi)
-      target_specification.add_compile_options(
-          std::string("-D_GLIBCXX_USE_CXX11_ABI=") + (target_abi ? "1" : "0"));
-  }
   if (typed_prepared) {
     if (!prepared_callback_context && !target_specification.include_headers().empty()) {
       error = "prepared injection requires a callback compilation context for optional includes";
@@ -6770,13 +6949,68 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   // gets the real standard headers those records need, chosen from the target's DWARF and
   // compiled with the agent's own toolchain: the manual header route, selected automatically.
   // Recovered records are never rebuilt as handwritten std:: classes.
-  if (!typed_prepared && target_specification.has_debug_info() && !has_header_context &&
+  const bool automatic_route =
+      !typed_prepared && target_specification.has_debug_info() && !has_header_context &&
       target_specification.include_headers().empty() && forced_include_source.empty() &&
-      !has_user_includes(callback_includes) && !has_automatic_headers(callback_includes)) {
+      !has_user_includes(callback_includes);
+  if (!automatic_route && target_specification.standard_headers_size() != 0) {
+    error = "--std-header maps records for the automatic selection of standard headers, which "
+            "applies only to a DWARF-resolved probe without headers of its own (no --include, "
+            "--compdb, forced include, callback #include or prepared context); remove it, or "
+            "the headers";
+    return false;
+  }
+  if (automatic_route && !has_automatic_headers(callback_includes)) {
     std::string automatic;
-    if (!automatic_standard_headers(target_specification, automatic, error))
+    int standard = 0;
+    if (!automatic_standard_headers(target_specification, automatic, standard, error))
       return false;
     if (!automatic.empty()) {
+      if (auto problem = undeclarable_argument_type(target_specification); !problem.empty()) {
+        error = std::move(problem);
+        return false;
+      }
+      // Options the selection adds are part of the probe from here on: the type AST and the
+      // callback are compiled with them, and a validation report lists them.
+      const auto add_option = [&](std::string option) {
+        target_specification.add_compile_options(option);
+        user_options.push_back(std::move(option));
+      };
+      // The headers must select the libstdc++ ABI the target was built with. The target's
+      // debug data says which one that is; the agent's headers default to the ABI of the
+      // agent's own toolchain. An explicit _GLIBCXX_USE_CXX11_ABI from the caller always wins,
+      // but one that disagrees with the target is reported here, before any header is read.
+      const int target_abi = target_cxx11_abi(target_specification);
+      const int explicit_abi = ::tracer::standard_headers::explicit_cxx11_abi(user_options);
+      if (target_abi >= 0 && (explicit_abi == 0 || explicit_abi == 1) &&
+          explicit_abi != target_abi) {
+        error = std::string("libstdc++ ABI mismatch: the target uses the ") +
+                (target_abi ? "C++11 (std::__cxx11)" : "pre-C++11") +
+                " string/list ABI according to its DWARF, but the options select "
+                "_GLIBCXX_USE_CXX11_ABI=" + std::to_string(explicit_abi) +
+                "; pass -D_GLIBCXX_USE_CXX11_ABI=" + std::to_string(target_abi) +
+                " or remove the option that sets it";
+        return false;
+      }
+      tracer::AgentRuntimeProfile profile;
+      const bool have_profile = tracer_agent_runtime_profile_v1(&profile, sizeof(profile)) == 0;
+      if (target_abi >= 0 && explicit_abi == -1 && have_profile &&
+          profile.libstdcxx_default_cxx11_abi >= 0 &&
+          profile.libstdcxx_default_cxx11_abi != target_abi)
+        add_option(std::string("-D_GLIBCXX_USE_CXX11_ABI=") + (target_abi ? "1" : "0"));
+      // The headers are compiled as C++20 unless the target is known to be newer: its producer
+      // names a later standard, or it uses a record that only a later standard has
+      // (std::expected). An explicit -std= from the caller always wins.
+      standard = std::max(standard,
+                          ::tracer::standard_headers::producer_cxx_standard(
+                              target_specification.debug_info().producer()));
+      const bool explicit_standard =
+          std::any_of(user_options.begin(), user_options.end(), [](const std::string &option) {
+            return ::tracer::compat::starts_with(option, "-std") ||
+                   ::tracer::compat::starts_with(option, "--std");
+          });
+      if (standard > 20 && !explicit_standard)
+        add_option("-std=c++" + std::to_string(standard));
       target_specification.set_callback_source(automatic + target_specification.callback_source());
       auto split = split_callback_includes(target_specification.callback_source());
       callback_includes = std::move(split.first);
@@ -6833,7 +7067,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   if (!typed_prepared && specification.has_debug_info() &&
       !interceptor_template_prelude(source).empty()) {
     const auto has_multiple_pointers = [](const std::string &type) {
-      return std::count(type.begin(), type.end(), '*') > 1;
+      return record_pointer_levels(type) > 1;
     };
     for (const auto &argument : specification.debug_info().arguments()) {
       if (argument.has_object_type() &&
@@ -7412,6 +7646,13 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                                     imported_receiver, specification.receiver(),
                                     error)) {
         error = "receiver layout changed during AST import: " + error;
+        // With automatically selected standard headers this import is only the fallback
+        // after the generated callback failed to compile; that failure is the cause.
+        if (!user_headers_available && has_automatic_headers(callback_includes) &&
+            !baseline_error.empty())
+          error = automatic_headers_failure(
+              std::string(kAutomaticCallbackFailure) + ": " + baseline_error, specification,
+              callback_includes);
         return false;
       }
       if (!create_receiver_alias(p.interpreter->getASTContext(),
@@ -7430,8 +7671,9 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         callback_header_source + header_receiver_alias +
         (user_headers_available
              ? std::string()
-             : missing_recovered_record_declarations(
-                   p.interpreter->getASTContext(), specification)) +
+             : argument_enum_declarations(specification) +
+                   missing_recovered_record_declarations(
+                       p.interpreter->getASTContext(), specification)) +
         tracer::kEmbeddedCallbackHeader +
         argument_aliases(specification) +
         interceptor_template_prelude(source) +
@@ -8577,8 +8819,12 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
     bool success = false;
     {
       std::lock_guard<std::mutex> lock(agent_mutex);
+      const auto listed_options = spec.compile_options_size();
       success = compile_probe(prepared, spec, error, false, syntax_only,
                               &report);
+      // Options the automatic standard-header selection added (ABI macro, language mode).
+      for (auto i = listed_options; i < spec.compile_options_size(); ++i)
+        report.add_effective_options(spec.compile_options(i));
     }
     if (success && spec.extra_compile_arguments_checked())
       report.set_extra_compile_arguments_applied(true);

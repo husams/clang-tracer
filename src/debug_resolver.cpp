@@ -752,13 +752,45 @@ void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribeP
     out.set_byte_size(number(die, dw::DW_AT_byte_size));
     out.set_dwarf_encoding(static_cast<std::uint32_t>(number(die, dw::DW_AT_encoding)));
     return;
-  case dw::DW_TAG_enumeration_type:
+  case dw::DW_TAG_enumeration_type: {
     out.set_kind(api::DebugTemplateType::ENUM);
     out.set_name(type_display_name(die));
     out.set_byte_size(number(die, dw::DW_AT_byte_size));
     if (out.name().empty())
       throw std::runtime_error("unnamed enumeration template argument");
+    out.set_enum_scoped(number(die, dw::DW_AT_enum_class) != 0);
+    // The underlying type, when the producer names one, so a consumer can declare the
+    // enumeration with the size and signedness the target gave it.
+    auto underlying = type_of(die);
+    while (underlying && (underlying.getTag() == dw::DW_TAG_typedef ||
+                          underlying.getTag() == dw::DW_TAG_const_type ||
+                          underlying.getTag() == dw::DW_TAG_volatile_type))
+      underlying = type_of(underlying);
+    if (underlying && underlying.getTag() == dw::DW_TAG_base_type) {
+      auto& element = *out.mutable_element();
+      element.set_kind(api::DebugTemplateType::BUILTIN);
+      element.set_name(name(underlying));
+      element.set_byte_size(number(underlying, dw::DW_AT_byte_size));
+      element.set_dwarf_encoding(static_cast<std::uint32_t>(number(underlying, dw::DW_AT_encoding)));
+    }
+    // Enclosing scope kinds, outermost first; left empty when every scope is a namespace.
+    for (auto scope = die.getParent(); scope; scope = scope.getParent()) {
+      const auto tag = scope.getTag();
+      if (tag == dw::DW_TAG_namespace)
+        out.add_scopes(api::RECORD_SCOPE_NAMESPACE);
+      else if (tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type ||
+               tag == dw::DW_TAG_subprogram)
+        out.add_scopes(api::RECORD_SCOPE_CLASS);
+      else if (tag == dw::DW_TAG_union_type)
+        out.add_scopes(api::RECORD_SCOPE_UNION);
+    }
+    auto* kinds = out.mutable_scopes();
+    std::reverse(kinds->begin(), kinds->end());
+    if (std::all_of(kinds->begin(), kinds->end(),
+                    [](int kind) { return kind == api::RECORD_SCOPE_NAMESPACE; }))
+      kinds->Clear();
     return;
+  }
   case dw::DW_TAG_class_type:
   case dw::DW_TAG_structure_type:
   case dw::DW_TAG_union_type: {
@@ -780,20 +812,28 @@ void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribeP
     return;
   }
   case dw::DW_TAG_array_type: {
-    out.set_kind(api::DebugTemplateType::ARRAY);
-    describe_template_type(type_of(die), *out.mutable_element(), path);
+    // One DW_TAG_subrange_type per dimension, outermost first: int[2][3] is an array of two
+    // arrays of three. A dimension without a bound (int[]) keeps has_array_count unset.
+    auto* level = &out;
+    bool first = true;
     for (const auto child : die.children()) {
       if (child.getTag() != dw::DW_TAG_subrange_type)
         continue;
+      if (!first)
+        level = level->mutable_element();
+      first = false;
+      level->set_kind(api::DebugTemplateType::ARRAY);
       if (const auto count = child.find(dw::DW_AT_count); count && count->getAsUnsignedConstant()) {
-        out.set_has_array_count(true);
-        out.set_array_count(*count->getAsUnsignedConstant());
+        level->set_has_array_count(true);
+        level->set_array_count(*count->getAsUnsignedConstant());
       } else if (const auto upper = child.find(dw::DW_AT_upper_bound);
                  upper && upper->getAsUnsignedConstant()) {
-        out.set_has_array_count(true);
-        out.set_array_count(*upper->getAsUnsignedConstant() + 1);
+        level->set_has_array_count(true);
+        level->set_array_count(*upper->getAsUnsignedConstant() + 1);
       }
     }
+    level->set_kind(api::DebugTemplateType::ARRAY);
+    describe_template_type(type_of(die), *level->mutable_element(), path);
     return;
   }
   case dw::DW_TAG_subroutine_type:
@@ -811,24 +851,47 @@ void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribeP
   }
 }
 
-// The integral DW_AT_const_value of a value parameter as decimal text. The signedness comes
-// from the parameter's type, because a DWARF data form does not carry it.
+// The integral DW_AT_const_value of a value parameter as decimal text. A DWARF data form
+// carries neither the signedness nor the width of the value: producers write a non-negative
+// constant in the smallest DW_FORM_dataN that holds it, so 200 of type int arrives as one byte.
+// Both therefore come from the parameter's type, never from the form.
 std::optional<std::string> template_constant_text(DWARFDie parameter,
                                                   const api::DebugTemplateType& type) {
   const auto value = parameter.find(dw::DW_AT_const_value);
   if (!value)
     return std::nullopt;
-  bool is_signed = value->getForm() == dw::DW_FORM_sdata;
-  if (type.kind() == api::DebugTemplateType::BUILTIN)
-    is_signed = type.dwarf_encoding() == dw::DW_ATE_signed ||
-                type.dwarf_encoding() == dw::DW_ATE_signed_char;
-  if (is_signed) {
-    if (const auto signed_value = value->getAsSignedConstant())
-      return std::to_string(*signed_value);
-  } else if (const auto unsigned_value = value->getAsUnsignedConstant()) {
-    return std::to_string(*unsigned_value);
+  const auto form = value->getForm();
+  const bool signed_form = form == dw::DW_FORM_sdata || form == dw::DW_FORM_implicit_const;
+  // An enumeration constant is read through the enumeration's underlying type.
+  const auto* builtin = &type;
+  if (type.kind() == api::DebugTemplateType::ENUM && type.has_element())
+    builtin = &type.element();
+  bool is_signed = signed_form;
+  std::uint64_t width = type.byte_size();
+  if (builtin->kind() == api::DebugTemplateType::BUILTIN) {
+    is_signed = builtin->dwarf_encoding() == dw::DW_ATE_signed ||
+                builtin->dwarf_encoding() == dw::DW_ATE_signed_char;
+    width = builtin->byte_size();
   }
-  return std::nullopt;
+  std::uint64_t bits = 0;
+  if (signed_form) {
+    const auto signed_value = value->getAsSignedConstant();
+    if (!signed_value)
+      return std::nullopt;
+    bits = static_cast<std::uint64_t>(*signed_value);
+  } else {
+    const auto unsigned_value = value->getAsUnsignedConstant();
+    if (!unsigned_value)
+      return std::nullopt;
+    bits = *unsigned_value;
+  }
+  if (width >= 1 && width < 8) {
+    const auto used = width * 8;
+    bits &= (std::uint64_t{1} << used) - 1;
+    if (is_signed && (bits >> (used - 1)) != 0)
+      bits |= ~std::uint64_t{0} << used;
+  }
+  return is_signed ? std::to_string(static_cast<std::int64_t>(bits)) : std::to_string(bits);
 }
 
 void describe_template_argument(DWARFDie parameter, api::DebugTemplateArgument& out,
@@ -1213,9 +1276,13 @@ bool is_special_member(DWARFDie die, DWARFDie decl) {
   return member.substr(0, member.find('<')) == record.substr(0, record.find('<'));
 }
 
+// `template_provenance` is passed on to describe_record for the argument records: only the
+// description a probe is built from carries template arguments and the producer. Contract
+// comparisons and discovery leave them out, so two definitions of one function from units
+// built with different flags still have one contract.
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                 const PreviewName &display = {}, bool allow_virtual_entry = false,
-                                bool allow_variadic = false) {
+                                bool allow_variadic = false, bool template_provenance = false) {
   // Constructors and destructors are concrete entry points (C1/C2, D0/D1/D2) even when the
   // destructor is virtual; a caller chooses one by its linkage symbol.
   const bool special_member = is_special_member(die, decl);
@@ -1291,7 +1358,8 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
     argument.set_is_reference(type.reference);
     argument.set_is_object_value(type.value == api::OBJECT);
     if (type.record) {
-      describe_record(type.record, *argument.mutable_object_type(), type.value == api::POINTER);
+      describe_record(type.record, *argument.mutable_object_type(), type.value == api::POINTER,
+                      template_provenance);
       describe_methods(type.record, *argument.mutable_object_type());
     }
     result.arguments.push_back(std::move(argument));
@@ -2831,7 +2899,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
               return;
             }
             ResolvedCallable found;
-            const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry, true);
+            const auto shape =
+                describe_callable(die, decl, display, options.allow_virtual_entry, true, true);
             const bool bare_name = by_linkage || selected == dwarf_name ||
                                    selected == name(decl) || selected == symbol_name;
             if (!bare_name && compact(shape.selector) != selected &&
