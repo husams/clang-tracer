@@ -405,12 +405,17 @@ Controller::~Controller() {
   }
 }
 
-void Controller::connect(const std::string &endpoint) {
+static std::unique_ptr<api::Tracer::Stub>
+new_stub(const std::string &endpoint) {
   grpc::ChannelArguments arguments;
   arguments.SetMaxReceiveMessageSize(-1);
   arguments.SetMaxSendMessageSize(-1);
-  auto next = api::Tracer::NewStub(grpc::CreateCustomChannel(
+  return api::Tracer::NewStub(grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments));
+}
+
+void Controller::connect(const std::string &endpoint) {
+  auto next = new_stub(endpoint);
   api::ListSessionsRequest request;
   unary<api::ListSessionsResponse>(
       [&](auto &context, auto &response) {
@@ -444,6 +449,26 @@ void Controller::start_server(const Command &command) {
   connect(server_.endpoint());
   out_ << "server ready endpoint=" << endpoint_
        << " ownership=this-console pid=" << server_.pid() << '\n';
+}
+
+void Controller::stop_owned_server() {
+  // The server finishes stopping only after this console's connection has
+  // closed, and an idle gRPC client reads the server's shutdown notice no
+  // sooner than its five-second backup poll. Close the connection first.
+  const bool connected = stub_ != nullptr;
+  stop_background();
+  stub_.reset();
+  try {
+    server_.stop(settings_.timeout_seconds);
+  } catch (...) {
+    // The server is retained for recovery; keep the console pointed at it.
+    if (connected && !endpoint_.empty())
+      stub_ = new_stub(endpoint_);
+    throw;
+  }
+  owned_sessions_.clear();
+  pending_attaches_.clear();
+  disconnect();
 }
 
 void Controller::disconnect() {
@@ -2310,10 +2335,7 @@ bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepa
     if (server_.pid() < 0) {
       throw std::runtime_error("this console does not own a server");
     }
-    server_.stop(settings_.timeout_seconds);
-    owned_sessions_.clear();
-    pending_attaches_.clear();
-    disconnect();
+    stop_owned_server();
     out_ << "owned server stopped after restoration\n";
     return true;
   case K::server_status:
@@ -3923,10 +3945,7 @@ void Controller::shutdown() {
   }
   if (server_.pid() >= 0) {
     try {
-      server_.stop(settings_.timeout_seconds);
-      owned_sessions_.clear();
-      pending_attaches_.clear();
-      disconnect();
+      stop_owned_server();
     } catch (const std::exception &e) {
       failures += e.what();
     }

@@ -206,14 +206,27 @@ void ServerProcess::start(const std::string &executable,
   }
   terminating_ = false;
   exit_status_ = 0;
-  auto stub = clangtracer::v1::Tracer::NewStub(
-      grpc::CreateChannel(endpoint_, grpc::InsecureChannelCredentials()));
+  // The first connection attempt usually precedes the server's socket. Retry
+  // at gRPC's shortest backoff (100 ms) instead of its default of one second.
+  grpc::ChannelArguments channel_arguments;
+  channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
+  channel_arguments.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 100);
+  channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 200);
+  auto channel = grpc::CreateCustomChannel(
+      endpoint_, grpc::InsecureChannelCredentials(), channel_arguments);
+  auto stub = clangtracer::v1::Tracer::NewStub(channel);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
   while (std::chrono::steady_clock::now() < deadline) {
     if (!running()) {
       throw std::runtime_error("server exited during startup: " +
                                diagnostics());
+    }
+    // Waiting on the channel drives its reconnect. A call that fails fast
+    // does not, which left the reconnect to gRPC's five-second backup poll.
+    if (!channel->WaitForConnected(std::chrono::system_clock::now() +
+                                   std::chrono::milliseconds(50))) {
+      continue;
     }
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() +

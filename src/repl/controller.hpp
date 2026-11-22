@@ -85,6 +85,7 @@ class Controller {
   void start_server(const Command &command);
   void connect(const std::string &endpoint);
   void disconnect();
+  void stop_owned_server();
   void prune_owned_targets();
   void require_no_owned_targets();
   void launch(const Command &command);

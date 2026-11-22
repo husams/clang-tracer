@@ -879,6 +879,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-entry-target> $<TARGET_FILE:repl-entry-stripped-target> "${CMAKE_NM}")
       set_tests_properties(native_repl_entry_integration PROPERTIES TIMEOUT 100)
+      add_test(NAME native_repl_owned_server_wait
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_owned_server_wait.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-entry-target>)
+      set_tests_properties(native_repl_owned_server_wait PROPERTIES TIMEOUT 100)
       add_executable(repl-object-watch-target tests/fixtures/repl_object_watch.cpp)
       set_target_properties(repl-object-watch-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-object-watch-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fPIE)
