@@ -124,9 +124,6 @@ before; here the code went from 8 to 9.
 - The writer must store with a plain move. If you change `mark` to
   `chars[0] ^= 0x20`, the compiler emits an exclusive-or on memory, and
   prepare stops with `no supported field-width store`.
-- A writer that takes a `char` argument, such as `mark(char)`, prepares but
-  cannot be started in a live process. Start reports
-  `unsupported debug parameter ABI`.
 - The watch reports stores made by the function named in `--code`. A write
   made inside `std::string::append` or another library call is not covered.
   Use a method snapshot from lesson 18 for those.

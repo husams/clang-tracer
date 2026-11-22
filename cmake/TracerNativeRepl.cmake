@@ -930,6 +930,26 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> "${_unnamed_receiver_gcc}")
       set_tests_properties(native_repl_unnamed_receiver PROPERTIES TIMEOUT 300
         SKIP_RETURN_CODE 77)
+      # Narrow and unsigned 32-bit integers in DWARF-resolved signatures (issue #145), built by the
+      # project compiler and, in the second test, rebuilt by the test with a GCC (skipped, exit 77,
+      # without one).
+      add_executable(repl-dwarf-narrow-target tests/fixtures/repl_dwarf_narrow.cpp)
+      set_target_properties(repl-dwarf-narrow-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-dwarf-narrow-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer
+        -fcf-protection=none -fno-pie)
+      target_link_options(repl-dwarf-narrow-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_dwarf_narrow
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_dwarf_narrow.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-dwarf-narrow-target>)
+      set_tests_properties(native_repl_dwarf_narrow PROPERTIES TIMEOUT 300)
+      add_test(NAME native_repl_dwarf_narrow_gcc
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_dwarf_narrow.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-dwarf-narrow-target>
+          "${_unnamed_receiver_gcc}")
+      set_tests_properties(native_repl_dwarf_narrow_gcc PROPERTIES TIMEOUT 300
+        SKIP_RETURN_CODE 77)
       add_executable(repl-virtual-target tests/fixtures/repl_virtual.cpp
         tests/fixtures/repl_virtual_main.cpp)
       set_target_properties(repl-virtual-target PROPERTIES CXX_STANDARD 17)

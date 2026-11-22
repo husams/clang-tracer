@@ -36,6 +36,25 @@ TRACER_SCALAR_OVERRIDE_TARGET long long integer_sample(long long value, bool fla
   return flag ? value : 0;
 }
 
+// Narrow integers keep their declared type in the wrapper and travel as int32 or uint64.
+TRACER_SCALAR_OVERRIDE_TARGET short short_sample(short value) {
+  asm volatile("nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
+  return static_cast<short>(value - 1);
+}
+
+TRACER_SCALAR_OVERRIDE_TARGET unsigned char byte_sample(unsigned char value) {
+  asm volatile("nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
+  return static_cast<unsigned char>(value + 1);
+}
+
+// `%call` passes int values; these call the narrow functions with their own types.
+[[gnu::noinline, gnu::used]] int short_call(int value) {
+  return short_sample(static_cast<short>(value));
+}
+[[gnu::noinline, gnu::used]] int byte_call(int value) {
+  return byte_sample(static_cast<unsigned char>(value));
+}
+
 [[gnu::noinline, gnu::used, gnu::no_caller_saved_registers]] int unmarked(int a) { return a; }
 [[gnu::noinline, gnu::used]] int pointer_sample(int *value) { return *value; }
 [[gnu::noinline, gnu::used]] void void_sample(int) {}
@@ -71,7 +90,9 @@ int main() {
   if (!tracer::launch::wait_for_resume(named_call("scenario", scenario),
                                        named_call("read_errno", read_errno),
                                        named_call("float_sample", float_sample),
-                                       named_call("integer_sample", integer_sample)))
+                                       named_call("integer_sample", integer_sample),
+                                       named_call("short_call", short_call),
+                                       named_call("byte_call", byte_call)))
     return 125;
   print_scenario("resumed");
   while (::access("after-detach", F_OK) != 0)

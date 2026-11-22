@@ -1609,6 +1609,33 @@ compared without them, as are the discovery commands. On the wire they are optio
 a server and an agent must still come from the same build, as for any change to `DebugInfo`:
 the agent resolves the callable again and compares its whole description with the server's.
 
+### Narrow integers in DWARF signatures
+
+A callable resolved from DWARF can take and return `char`, `signed char`, `unsigned char`,
+`short`, `unsigned short`, `unsigned int`, `wchar_t`, `char16_t` and `char32_t`, besides `bool`,
+`int`, `long`, `long long`, their unsigned forms, `float` and `double`. A typedef or a by-value
+`const` of one of them is the type it names. The probe keeps the declared type: the generated
+wrapper takes and returns `unsigned char` or `short`, not a wider integer, so the call keeps the
+target's ABI, and `%probe resolve` shows it in `cpp_type` and `result_cpp_type`.
+
+The value is carried as the header-prepared route carries it: a signed type up to 32 bits as
+`int32`, a signed 64-bit type as `int64`, and an unsigned type of any width as `uint64`.
+`call.arg<T>(index)`, `call.result<T>()`, `call.argument<N>()` and `call.result()` take the
+declared type, so `call.arg<unsigned char>(0)` and `Interceptor<unsigned char(unsigned char)>`
+validate, while `Interceptor<int(int)>` for the same function does not. A type that cannot hold
+the carried value, `call.arg<short>(0)` on an `int` slot holding 70000, throws instead of
+truncating. Events show signed values as `signedValue` and unsigned ones as `unsignedValue`.
+
+An override writes through the carrier: `call.override_argument<int>(0, -300)` for a `short`
+parameter, `call.override_result<unsigned long>(250)` for an `unsigned char` result, and the
+same for `replace_with` and `call_original`. The function receives the low bytes in its own
+type; `call_original<int>()` returns a `short` result with its sign.
+
+`long double`, `__int128`, `char8_t`, bit-precise integers and a size that is not the LP64 size
+of the spelled type are not supported. The message names the type and its role, for example
+`unsupported debug builtin for parameter 0 'x' of gaps::f_i128: __int128` or
+`unsupported debug builtin for the result of gaps::f_ldouble: long double`.
+
 ### Probe working directory
 
 Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.
@@ -1730,8 +1757,12 @@ Each flag enables only its corresponding hook operation. Overrides require a
 local Unix control socket and a DWARF binding. Use `--prepared-mode off` if a
 prepared package would otherwise be selected. Supported values are `bool`,
 signed 32- and 64-bit integers, unsigned 64-bit integers, `float`, and
-`double`. Match the slot's type and width exactly. A `void` function can use
-argument overrides.
+`double`. Match the slot's type and width exactly. A slot of a narrower integer
+type (`short`, `unsigned char`, `unsigned int`, ...) is written and read through
+its carrier, `int` for a signed type and `unsigned long` for an unsigned one,
+and the function receives it as its own type (see
+[Narrow integers in DWARF signatures](#narrow-integers-in-dwarf-signatures)).
+A `void` function can use argument overrides.
 
 The original function runs with the committed arguments. An escaping hook
 exception discards its staged writes. An exception from the original function

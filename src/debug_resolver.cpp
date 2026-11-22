@@ -160,6 +160,19 @@ std::string compact(const std::string& text) {
   return out;
 }
 
+// A debug type that cannot be traced, kept as the kind of type (`head`) and the reason (`cause`)
+// so a callable can put its role between them: `<head> for parameter 0 'x' of f: <cause>`.
+struct UnsupportedDebugType : std::runtime_error {
+  UnsupportedDebugType(std::string kind, std::string reason)
+      : std::runtime_error(kind + ": " + reason), head(std::move(kind)),
+        cause(std::move(reason)) {}
+  std::string head, cause;
+
+  std::string with_role(const std::string &role) const {
+    return head + " for " + role + ": " + cause;
+  }
+};
+
 struct Type {
   std::string spelling;
   std::uint64_t size = 0;
@@ -216,6 +229,8 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
                                                   "signed char",
                                                   "unsigned char",
                                                   "wchar_t",
+                                                  "char16_t",
+                                                  "char32_t",
                                                   "short",
                                                   "short int",
                                                   "unsigned short",
@@ -236,7 +251,7 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
                                                   "float",
                                                   "double"};
   if (!supported.count(t.spelling)) {
-    throw std::runtime_error("unsupported debug builtin: " + t.spelling);
+    throw UnsupportedDebugType("unsupported debug builtin", t.spelling);
   }
   // GCC spells these DWARF builtins differently from Clang and the demangler.
   // Use one spelling in selectors and declarations without changing the ABI.
@@ -248,17 +263,31 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
       {"unsigned long long int", "unsigned long long"}};
   if (const auto found = builtin_names.find(t.spelling); found != builtin_names.end())
     t.spelling = found->second;
+  // The agent derives the wrapper type from the spelling, so a size other than the LP64 size of
+  // the spelled type is left without a trace value type instead of being traced at a wrong width.
+  static const std::map<std::string, std::uint64_t> lp64_sizes = {
+      {"bool", 1}, {"char", 1}, {"signed char", 1}, {"unsigned char", 1},
+      {"short", 2}, {"unsigned short", 2}, {"char16_t", 2},
+      {"int", 4}, {"unsigned int", 4}, {"char32_t", 4}, {"wchar_t", 4},
+      {"long", 8}, {"unsigned long", 8}, {"long long", 8}, {"unsigned long long", 8},
+      {"float", 4}, {"double", 8}};
+  if (const auto expected = lp64_sizes.find(t.spelling);
+      expected == lp64_sizes.end() || expected->second != t.size)
+    return t;
+  // Narrow integers use the carriers of the header-prepared route: signed up to 32 bits travel as
+  // int32, signed 64-bit as int64 and every unsigned width as uint64. The exact C++ type stays in
+  // the spelling.
   const auto enc = number(d, dw::DW_AT_encoding);
   if (enc == dw::DW_ATE_boolean && t.size == 1) {
     t.value = api::BOOL;
   }
-  if (enc == dw::DW_ATE_signed && t.size == 4) {
+  if ((enc == dw::DW_ATE_signed || enc == dw::DW_ATE_signed_char) && t.size <= 4) {
     t.value = api::INT32;
   }
-  if (enc == dw::DW_ATE_signed && t.size == 8) {
+  if ((enc == dw::DW_ATE_signed || enc == dw::DW_ATE_signed_char) && t.size == 8) {
     t.value = api::INT64;
   }
-  if (enc == dw::DW_ATE_unsigned && t.size == 8) {
+  if (enc == dw::DW_ATE_unsigned || enc == dw::DW_ATE_unsigned_char || enc == dw::DW_ATE_UTF) {
     t.value = api::UINT64;
   }
   if (enc == dw::DW_ATE_float && t.size == 4) {
@@ -1227,6 +1256,16 @@ struct CallableShape {
   bool variadic = false;
 };
 
+// Reads the type of the result or of one parameter. A type that cannot be traced is reported with
+// its role and callable, so the diagnostic says which part of which callable it is.
+Type read_role_type(DWARFDie type, const std::string &role) {
+  try {
+    return read_type(type);
+  } catch (const UnsupportedDebugType &error) {
+    throw std::runtime_error(error.with_role(role));
+  }
+}
+
 // The receiver is identified by DW_AT_object_pointer, which a producer may attach to the concrete
 // entry, its declaration or an origin of either, and which may name the parameter itself or its
 // abstract origin. A producer may also omit the receiver's name, so the name is only a fallback.
@@ -1294,7 +1333,8 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   }
 
   CallableShape result;
-  const auto return_type = read_type(type_of(decl));
+  const auto result_role = "the result of " + qualified(decl);
+  const auto return_type = read_role_type(type_of(decl), result_role);
   if (return_type.value == api::VALUE_TYPE_UNSPECIFIED) {
     throw std::runtime_error("unsupported debug return ABI");
   }
@@ -1348,7 +1388,12 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                        name(parameter) == "vtt"))) {
       throw std::runtime_error("unsupported artificial debug parameter");
     }
-    const auto type = read_type(type_of(parameter));
+    const auto parameter_role =
+        "parameter " + std::to_string(result.arguments.size()) + " '" +
+        (name(parameter).empty() ? "arg" + std::to_string(result.arguments.size())
+                                 : name(parameter)) +
+        "' of " + qualified(decl);
+    const auto type = read_role_type(type_of(parameter), parameter_role);
     if (type.value == api::VALUE_TYPE_UNSPECIFIED || type.value == api::VOID) {
       throw std::runtime_error("unsupported debug parameter ABI");
     }

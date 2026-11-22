@@ -68,7 +68,8 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
             assert [line.split()[0] for line in rows] == [
                 "UNSUPPORTED", "DWARF_SUPPORTED", "DWARF_SUPPORTED", "UNMATCHED"
             ], rows
-            assert 'unsupported debug builtin: long double' in rows[0] and 'X::f(int)' in rows[2], rows
+            assert ('unsupported debug builtin for the result of UnsupportedFixture::unsupported: '
+                    'long double') in rows[0] and 'X::f(int)' in rows[2], rows
             # A virtual method with a body is a concrete entry, not a package-only candidate.
             assert 'VirtualOnly::f(int)' in rows[1], rows
             output.expect(r"^manifest=")
