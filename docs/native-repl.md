@@ -1560,6 +1560,32 @@ record but not the program types it is instantiated with, so those come from DWA
 For the rejected cases the remedy is the explicit route: the program's real header through
 `--include` with `--compdb`, or an `#include` in the callback.
 
+**Enumerations and member pointers in the signature itself.** A DWARF-resolved callable may take
+or return an enumeration, by value or behind a pointer or reference (`State set(State)`,
+`int by_ref(const State&)`). The callback source needs the enumeration's name, so it is declared
+from DWARF like the template-argument enumerations above: its qualified name, `enum class` or
+`enum`, and underlying type, without enumerators, at namespace scope or inside the class it is
+nested in. An enumeration nested in the receiver's class is declared inside that class, which is
+still one recovered class. A by-value enumeration is captured through the carrier of its
+underlying type: `int` (int32), `long`/`long long` (int64) or `unsigned long`/`unsigned long long`
+(uint64). An `Interceptor<Signature>` must name the same enumeration; `int` in its place is
+rejected.
+
+The table lists what is supported and what is not. A rejected type gets a message that names it,
+its role and its callable (`unsupported debug enumeration enums::Color for the result of
+enums::paint: underlying type unsigned int (4 bytes) has no exact DWARF trace value type`), and the callable
+previews as `UNSUPPORTED`:
+
+| Type | Result |
+|---|---|
+| An enumeration over `int`, `long`, `long long`, `unsigned long` or `unsigned long long` | supported by value, pointer and reference |
+| An enumeration by value over any other underlying type (`unsigned int`, `unsigned char`, `short`, `bool`) | rejected: no exact trace value type (the same gap as the integer types of the same width); behind a pointer or reference it is still declared |
+| An enumeration without a name, in an anonymous namespace, in an unnamed class, in a function, in a class template specialization, or whose underlying type DWARF does not record | rejected with the reason |
+| A pointer to a data member or to a member function | rejected: `pointer to data member int shop::Order::*` or `pointer to member function int (shop::Order::*)(int)` |
+
+A class that the callback's real headers already define cannot gain an enumeration: if the
+headers lack the enumeration the callable names, the error names both.
+
 **Language mode.** The automatic headers are compiled as C++20, or as a newer standard when the
 target is known to use one: its `DW_AT_producer` names it (GCC writes `GNU C++23 ...`; a recorded
 command line has `-std=`), or it uses a record that only exists from that standard on (the

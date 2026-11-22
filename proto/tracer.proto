@@ -166,6 +166,9 @@ message DebugInfo {
   // callable's own description). Diagnostics only: it names the compiler and library release
   // the target was built with.
   string producer = 31;
+  // The enumeration the result type names, by value or behind pointers, references,
+  // cv-qualifiers and typedefs; unset otherwise.
+  DebugTemplateType result_enum_type = 32;
 }
 // One template argument as the target's debug data describes it, with its kind kept apart
 // so that a type, a constant, a template and a pack are never compared as text.
@@ -227,6 +230,10 @@ message DebugArgument {
   bool is_reference = 3;
   bool is_object_value = 4;
   DebugInfo object_type = 5;
+  // The enumeration this argument's type names, by value or behind pointers, references,
+  // cv-qualifiers and typedefs; unset otherwise. It lets a callback declare the enumeration
+  // the cpp_type spelling mentions without any enumerator.
+  DebugTemplateType enum_type = 6;
 }
 message HeaderContext {
   string working_directory = 1;

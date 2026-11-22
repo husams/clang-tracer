@@ -160,17 +160,160 @@ std::string compact(const std::string& text) {
   return out;
 }
 
+// A debug type that cannot be traced, kept as the kind of type (`head`) and the reason (`cause`)
+// so a callable can put its role between them: `<head> for parameter 0 'x' of f: <cause>`.
+struct UnsupportedDebugType : std::runtime_error {
+  UnsupportedDebugType(std::string kind, std::string reason)
+      : std::runtime_error(kind + ": " + reason), head(std::move(kind)),
+        cause(std::move(reason)) {}
+  std::string head, cause;
+
+  std::string with_role(const std::string &role) const {
+    return head + " for " + role + ": " + cause;
+  }
+};
+
 struct Type {
   std::string spelling;
   std::uint64_t size = 0;
   api::ValueType value = api::VALUE_TYPE_UNSPECIFIED;
   DWARFDie record;
   bool reference = false;
+  // The enumeration the type names by value or behind pointers, references and qualifiers.
+  DWARFDie enumeration;
+  // Why `value` is unspecified, when the type is understood but has no exact trace value type.
+  std::optional<UnsupportedDebugType> unsupported;
 };
 
-Type read_type(DWARFDie d, unsigned depth = 0) {
+Type read_type(DWARFDie d, unsigned depth = 0);
+
+// The spelling of a type for a diagnostic; empty when the type cannot be spelled.
+std::string diagnostic_spelling(DWARFDie d) {
+  try {
+    return read_type(d).spelling;
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+std::string member_pointer_diagnostic(DWARFDie d) {
+  std::string kind = "pointer to data member";
+  std::string text;
+  const auto pointee = type_of(d);
+  auto stripped = pointee;
+  while (stripped && (stripped.getTag() == dw::DW_TAG_typedef ||
+                      stripped.getTag() == dw::DW_TAG_const_type ||
+                      stripped.getTag() == dw::DW_TAG_volatile_type))
+    stripped = type_of(stripped);
+  const auto containing = d.getAttributeValueAsReferencedDie(dw::DW_AT_containing_type);
+  const auto owner = containing ? record_display_name(containing) : std::string();
+  if (stripped && stripped.getTag() == dw::DW_TAG_subroutine_type) {
+    kind = "pointer to member function";
+    const auto result = type_of(stripped);
+    const auto result_text = result ? diagnostic_spelling(result) : std::string("void");
+    std::string parameters;
+    bool complete = !result_text.empty() && !owner.empty();
+    for (const auto child : stripped.children()) {
+      if (child.getTag() != dw::DW_TAG_formal_parameter || number(child, dw::DW_AT_artificial))
+        continue;
+      const auto parameter = diagnostic_spelling(type_of(child));
+      complete = complete && !parameter.empty();
+      parameters += (parameters.empty() ? "" : ", ") + parameter;
+    }
+    if (complete)
+      text = result_text + " (" + owner + "::*)(" + parameters + ")";
+  } else {
+    const auto pointee_text = diagnostic_spelling(pointee);
+    if (!pointee_text.empty() && !owner.empty())
+      text = pointee_text + " " + owner + "::*";
+  }
+  return kind + (text.empty() ? "" : " " + text) +
+         " (DW_TAG_ptr_to_member_type); member pointers are not supported";
+}
+
+// The qualified name of an enumeration the callback translation unit can declare. An enumeration
+// that cannot be named from there (no name, anonymous namespace, unnamed class, function scope,
+// class template specialization scope) is rejected with the reason.
+std::string enumeration_name(DWARFDie d) {
+  std::vector<std::string> parts{name(d)};
+  std::string reason;
+  if (parts.front().empty()) {
+    parts.front() = "(unnamed)";
+    reason = "it has no name";
+  }
+  for (auto scope = d.getParent(); scope; scope = scope.getParent()) {
+    const auto tag = scope.getTag();
+    const auto own = name(scope);
+    if (tag == dw::DW_TAG_namespace) {
+      if (own.empty() && reason.empty())
+        reason = "declared inside an anonymous namespace";
+      parts.push_back(own.empty() ? "(anonymous namespace)" : own);
+    } else if (tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type ||
+               tag == dw::DW_TAG_union_type) {
+      if (own.empty() && reason.empty())
+        reason = "declared inside an unnamed class";
+      else if (own.find('<') != std::string::npos && reason.empty())
+        reason = "declared inside the class template specialization " + own;
+      parts.push_back(own.empty() ? "(unnamed)" : own);
+    } else if (tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_lexical_block) {
+      if (reason.empty())
+        reason = "declared inside a function";
+      if (tag == dw::DW_TAG_subprogram)
+        parts.push_back(own.empty() ? "(function)" : own);
+    }
+  }
+  std::reverse(parts.begin(), parts.end());
+  std::string out;
+  for (const auto& part : parts)
+    out += (out.empty() ? "" : "::") + part;
+  if (!reason.empty())
+    throw UnsupportedDebugType("unsupported debug enumeration " + out, reason);
+  return out;
+}
+
+Type read_enumeration(DWARFDie d, unsigned depth) {
+  const auto enum_name = enumeration_name(d);
+  // The underlying type must be recorded: its width and signedness are never guessed.
+  auto underlying = type_of(d);
+  while (underlying && (underlying.getTag() == dw::DW_TAG_typedef ||
+                        underlying.getTag() == dw::DW_TAG_const_type ||
+                        underlying.getTag() == dw::DW_TAG_volatile_type))
+    underlying = type_of(underlying);
+  if (!underlying || underlying.getTag() != dw::DW_TAG_base_type)
+    throw UnsupportedDebugType("unsupported debug enumeration " + enum_name,
+                               "DWARF does not record its underlying type");
+  const auto underlying_size = number(underlying, dw::DW_AT_byte_size);
+  const auto size = number(d, dw::DW_AT_byte_size, underlying_size);
+  const auto bytes = [](std::uint64_t count) {
+    return std::to_string(count) + (count == 1 ? " byte" : " bytes");
+  };
+  if (size != underlying_size)
+    throw UnsupportedDebugType("unsupported debug enumeration " + enum_name,
+                               "its size " + std::to_string(size) +
+                                   " differs from its underlying type " + name(underlying) + " (" +
+                                   bytes(underlying_size) + ")");
+  api::ValueType carrier = api::VALUE_TYPE_UNSPECIFIED;
+  try {
+    carrier = read_type(underlying, depth + 1).value;
+  } catch (const std::exception&) {
+    // A builtin that read_type does not support has no carrier either.
+  }
+  Type t{enum_name, size, carrier, {}, false, d, {}};
+  // The ABI of the enumeration is the ABI of its underlying integer type, and the detour
+  // carries only these exactly: narrower and unsigned 32-bit integers are not exact.
+  if (carrier != api::INT32 && carrier != api::INT64 && carrier != api::UINT64) {
+    t.value = api::VALUE_TYPE_UNSPECIFIED;
+    t.unsupported = UnsupportedDebugType(
+        "unsupported debug enumeration " + enum_name,
+        "underlying type " + name(underlying) + " (" + bytes(underlying_size) +
+            ") has no exact DWARF trace value type");
+  }
+  return t;
+}
+
+Type read_type(DWARFDie d, unsigned depth) {
   if (!d) {
-    return {"void", 0, api::VOID, {}, false};
+    return {"void", 0, api::VOID, {}, false, {}, {}};
   }
   if (depth > 32) {
     throw std::runtime_error("debug type nesting exceeds 32");
@@ -193,24 +336,29 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
     if (number(d, dw::DW_AT_byte_size, 8) != 8) {
       throw std::runtime_error("non-LP64 debug pointer");
     }
-    return {t.spelling + "*", 8, api::POINTER, t.record, false};
+    return {t.spelling + "*", 8, api::POINTER, t.record, false, t.enumeration, {}};
   }
   case dw::DW_TAG_reference_type:
   case dw::DW_TAG_rvalue_reference_type: {
     auto t = read_type(type_of(d), depth + 1);
     return {t.spelling + (d.getTag() == dw::DW_TAG_reference_type ? "&" : "&&"), 8, api::POINTER,
-            t.record, true};
+            t.record, true, t.enumeration, {}};
   }
+  case dw::DW_TAG_enumeration_type:
+    return read_enumeration(d, depth);
+  case dw::DW_TAG_ptr_to_member_type:
+    throw UnsupportedDebugType("unsupported debug type", member_pointer_diagnostic(d));
   case dw::DW_TAG_class_type:
   case dw::DW_TAG_structure_type:
   case dw::DW_TAG_union_type:
-    return {record_display_name(d), number(d, dw::DW_AT_byte_size), api::OBJECT, d, false};
+    return {record_display_name(d), number(d, dw::DW_AT_byte_size), api::OBJECT,
+            d, false, {}, {}};
   case dw::DW_TAG_base_type:
     break;
   default:
     throw std::runtime_error("unsupported debug type: " + name(d));
   }
-  Type t{name(d), number(d, dw::DW_AT_byte_size), api::VALUE_TYPE_UNSPECIFIED, {}, false};
+  Type t{name(d), number(d, dw::DW_AT_byte_size), api::VALUE_TYPE_UNSPECIFIED, {}, false, {}, {}};
   static const std::set<std::string> supported = {"bool",
                                                   "char",
                                                   "signed char",
@@ -1054,6 +1202,11 @@ void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer,
       opaque = true;
       continue;
     }
+    // A field naming an enumeration keeps the record opaque: its declaration is not recovered.
+    if (t.enumeration) {
+      opaque = true;
+      continue;
+    }
     if (!t.size || *offset > info.record_size() || t.size > info.record_size() - *offset) {
       opaque = true;
       continue;
@@ -1122,7 +1275,11 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
     described.set_is_virtual(number(method, dw::DW_AT_virtuality) != 0);
     if (auto return_die = type_of(method)) {
       try {
-        described.set_cpp_result_type(read_type(return_die).spelling);
+        const auto returned = read_type(return_die);
+        // Recovered receiver classes do not declare enumerations, so such a method is skipped.
+        if (returned.enumeration)
+          continue;
+        described.set_cpp_result_type(returned.spelling);
       } catch (const std::exception &) {
         continue;
       }
@@ -1181,7 +1338,12 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
         break;
       }
       try {
-        described.add_cpp_parameter_types(read_type(type_of(parameter)).spelling);
+        const auto read = read_type(type_of(parameter));
+        if (read.enumeration) {
+          unsupported = true;
+          break;
+        }
+        described.add_cpp_parameter_types(read.spelling);
       } catch (const std::exception &) {
         unsupported = true;
         break;
@@ -1225,7 +1387,31 @@ struct CallableShape {
   std::vector<api::DebugArgument> arguments;
   std::vector<std::string> argument_names;
   bool variadic = false;
+  // The enumeration the result names by value or behind pointers and references, if any.
+  std::optional<api::DebugTemplateType> result_enum;
 };
+
+// The enumeration a type names, described the way a template argument enumeration is.
+std::optional<api::DebugTemplateType> describe_enumeration(const Type &type) {
+  if (!type.enumeration)
+    return std::nullopt;
+  api::DebugTemplateType out;
+  DescribePath path;
+  describe_template_type(type.enumeration, out, path);
+  if (out.name() != enumeration_name(type.enumeration))
+    throw std::runtime_error("inconsistent debug enumeration name " + out.name());
+  return out;
+}
+
+// Reads the type of the result or of one parameter. A type that cannot be traced is reported with
+// its role and callable, so the diagnostic says which part of which callable it is.
+Type read_role_type(DWARFDie type, const std::string &role) {
+  try {
+    return read_type(type);
+  } catch (const UnsupportedDebugType &error) {
+    throw std::runtime_error(error.with_role(role));
+  }
+}
 
 // The receiver is identified by DW_AT_object_pointer, which a producer may attach to the concrete
 // entry, its declaration or an origin of either, and which may name the parameter itself or its
@@ -1294,12 +1480,16 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   }
 
   CallableShape result;
-  const auto return_type = read_type(type_of(decl));
+  const auto result_role = "the result of " + qualified(decl);
+  const auto return_type = read_role_type(type_of(decl), result_role);
   if (return_type.value == api::VALUE_TYPE_UNSPECIFIED) {
-    throw std::runtime_error("unsupported debug return ABI");
+    throw std::runtime_error(return_type.unsupported
+                                 ? return_type.unsupported->with_role(result_role)
+                                 : "unsupported debug return ABI");
   }
   result.signature.set_result(return_type.value);
   result.result_spelling = return_type.spelling;
+  result.result_enum = describe_enumeration(return_type);
 
   std::vector<DWARFDie> params;
   for (auto child : die.children()) {
@@ -1348,15 +1538,24 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                        name(parameter) == "vtt"))) {
       throw std::runtime_error("unsupported artificial debug parameter");
     }
-    const auto type = read_type(type_of(parameter));
+    const auto parameter_role =
+        "parameter " + std::to_string(result.arguments.size()) + " '" +
+        (name(parameter).empty() ? "arg" + std::to_string(result.arguments.size())
+                                 : name(parameter)) +
+        "' of " + qualified(decl);
+    const auto type = read_role_type(type_of(parameter), parameter_role);
     if (type.value == api::VALUE_TYPE_UNSPECIFIED || type.value == api::VOID) {
-      throw std::runtime_error("unsupported debug parameter ABI");
+      throw std::runtime_error(type.unsupported
+                                   ? type.unsupported->with_role(parameter_role)
+                                   : "unsupported debug parameter ABI");
     }
     api::DebugArgument argument;
     argument.set_index(result.arguments.size());
     argument.set_cpp_type(type.spelling);
     argument.set_is_reference(type.reference);
     argument.set_is_object_value(type.value == api::OBJECT);
+    if (auto enumeration = describe_enumeration(type))
+      *argument.mutable_enum_type() = std::move(*enumeration);
     if (type.record) {
       describe_record(type.record, *argument.mutable_object_type(), type.value == api::POINTER,
                       template_provenance);
@@ -1442,6 +1641,8 @@ EntryAbi callable_abi(DWARFDie die) {
   info.set_result_cpp_type(returned.spelling);
   info.set_result_is_reference(returned.reference);
   info.set_result_is_object_value(returned.value == api::OBJECT);
+  if (shape.result_enum)
+    *info.mutable_result_enum_type() = *shape.result_enum;
   if (returned.record && complete(returned.record)) {
     api::DebugInfo layout;
     describe_record(returned.record, layout, returned.value == api::POINTER, false);
@@ -2950,6 +3151,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
               info->set_result_cpp_type(result_type.spelling);
               info->set_result_is_object_value(result_type.value == api::OBJECT);
               info->set_result_is_reference(result_type.reference);
+              if (shape.result_enum)
+                *info->mutable_result_enum_type() = *shape.result_enum;
               if (result_type.record) {
                 describe_record(result_type.record, *info->mutable_result_object_type(),
                                 result_type.value == api::POINTER);
