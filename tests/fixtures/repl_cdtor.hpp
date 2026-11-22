@@ -5,6 +5,10 @@
 //  - Box<T>: class template, constructor and destructor of an explicit instantiation;
 //  - VBase/Mid/Leaf: virtual inheritance (base-object entry points take a hidden VTT
 //    argument), virtual destructors (deleting D0 through a base pointer).
+//  - TBase/TMid<T>/TLeaf: a class template with a virtual base, whose base-object entry points
+//    take the hidden VTT argument while its constructors are named `TMid`, not `TMid<int>`.
+//  - TCtor/TCtorLeaf: a constructor template of a class with a virtual base; Clang names its
+//    specialization `TCtor<int>` in the class `TCtor`.
 namespace cdtor {
 struct Plain {
   int v;
@@ -47,6 +51,27 @@ struct Leaf : Mid {
   explicit Leaf(int x);
   ~Leaf() override;
   int id() const override;
+};
+struct TBase {
+  int b = 7;
+};
+template <class T> struct TMid : virtual TBase {
+  T t;
+  explicit TMid(T x);
+  ~TMid();
+  T get() const;
+};
+extern template struct TMid<int>;
+struct TLeaf : TMid<int> {
+  int l;
+  explicit TLeaf(int x);
+};
+struct TCtor : virtual TBase {
+  int v;
+  template <class U> explicit TCtor(U x) : v(static_cast<int>(x)) {}
+};
+struct TCtorLeaf : TCtor {
+  explicit TCtorLeaf(int x);
 };
 // A polymorphic class with an implicit destructor whose key function is defined in repl_cdtor.cpp.
 // repl_cdtor_user.cpp emits its own copy of the destructor from a translation unit that sees the

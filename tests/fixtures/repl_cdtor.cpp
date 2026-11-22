@@ -23,6 +23,12 @@ int Mid::id() const { return m; }
 Leaf::Leaf(int x) : VBase(x + 2), Mid(x + 1), l(x) {}
 Leaf::~Leaf() {}
 int Leaf::id() const { return l; }
+template <class T> TMid<T>::TMid(T x) : t(x) {}
+template <class T> TMid<T>::~TMid() {}
+template <class T> T TMid<T>::get() const { return t; }
+template struct TMid<int>;
+TLeaf::TLeaf(int x) : TMid<int>(x + 1), l(x) {}
+TCtorLeaf::TCtorLeaf(int x) : TCtor(x + 1) {}
 
 int Poly::tag() const { return p; }
 
@@ -46,6 +52,12 @@ int run_once(int n) {
   {
     Leaf stack(n);
     sum += stack.id();
+  }
+  {
+    TMid<int> complete(n);  // the complete-object constructor (C1): no VTT argument
+    TLeaf derived(n);       // the base-object constructor (C2) of TMid<int>, with a VTT argument
+    TCtorLeaf made(n);      // the base-object constructor of TCtor, a template specialization
+    sum += complete.get() + derived.get() + derived.l + made.v;
   }
   {
     VBase *heap = new Leaf(n + 1);

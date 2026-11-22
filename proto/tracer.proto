@@ -118,6 +118,11 @@ enum RecordCallingConvention {
   RECORD_PASS_BY_VALUE = 1;
   RECORD_PASS_BY_REFERENCE = 2;
 }
+enum RecordScopeKind {
+  RECORD_SCOPE_NAMESPACE = 0;
+  RECORD_SCOPE_CLASS = 1; // class or struct
+  RECORD_SCOPE_UNION = 2;
+}
 message DebugInfo {
   string module = 1;
   uint64 device = 2;
@@ -150,6 +155,9 @@ message DebugInfo {
   bool callable_is_variadic = 27;
   // Debug-image unit and DIE of a record in an anonymous namespace; empty otherwise.
   string record_identity = 28;
+  // One entry per enclosing scope of record_name, outermost first. Empty means every scope
+  // is a namespace.
+  repeated RecordScopeKind record_scopes = 29;
 }
 message DebugMethod {
   string name = 1;

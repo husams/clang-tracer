@@ -63,17 +63,19 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
                 '--exact "UnsupportedFixture::unsupported(long double)" '
                 '--exact "VirtualOnly::f(int)" --exact "Missing::run(int)" '
                 f'--save "{manifest}"',
-                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=unlimited fits=yes$",
+                r"matched=3 dwarf_supported=2 .*agent_retained=0 available=unlimited fits=yes$",
             )
             assert [line.split()[0] for line in rows] == [
-                "UNSUPPORTED", "PREPARED_REQUIRED", "DWARF_SUPPORTED", "UNMATCHED"
+                "UNSUPPORTED", "DWARF_SUPPORTED", "DWARF_SUPPORTED", "UNMATCHED"
             ], rows
             assert 'unsupported debug builtin: long double' in rows[0] and 'X::f(int)' in rows[2], rows
+            # A virtual method with a body is a concrete entry, not a package-only candidate.
+            assert 'VirtualOnly::f(int)' in rows[1], rows
             output.expect(r"^manifest=")
             assert 'include_globs: "X::*"' in manifest.read_text()
             assert preview(
                 f'%trace preview --manifest "{manifest}"',
-                r"matched=3 dwarf_supported=1 .*agent_retained=0 available=unlimited fits=yes$",
+                r"matched=3 dwarf_supported=2 .*agent_retained=0 available=unlimited fits=yes$",
             ) == rows
             assert os.pread(memory.fileno(), 16, address) == before
         assert "TracerPid:\t0" in Path(f"/proc/{names.pid}/status").read_text()
@@ -97,9 +99,10 @@ def main(repl, server, names_source, concrete, browser, library, compiler):
         rows = preview(
             '%trace preview --include "prepared_concrete::twice*" '
             '--exact "prepared_concrete::Handler::route(int) const"',
-            r"matched=3 dwarf_supported=2 .*available=unlimited fits=yes$",
+            r"matched=3 dwarf_supported=3 .*available=unlimited fits=yes$",
         )
-        assert any("PREPARED_REQUIRED" in row and "Handler::route(int) const" in row for row in rows), rows
+        assert any("DWARF_SUPPORTED" in row and "Handler::route(int) const" in row for row in rows), rows
+        assert not any("PREPARED_REQUIRED" in row for row in rows), rows
         assert any("DWARF_SUPPORTED" in row and "twice<int>(int)" in row for row in rows), rows
         assert any("DWARF_SUPPORTED" in row and "twice<double>(double)" in row for row in rows), rows
 

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tracer::module_index {
 namespace {
@@ -270,11 +271,9 @@ void describe_symbol(DWARFDie die, ModuleSymbol &symbol) {
   symbol.line = decl.getDeclLine();
   symbol.diagnostic.clear();
   if (die.getTag() != dw::DW_TAG_subprogram) return;
-  // A destructor entry (D0/D1/D2) is a concrete function even when the destructor is virtual;
-  // its hidden parameters are checked below.
-  const bool destructor = name(decl).rfind("~", 0) == 0;
-  if (number(decl, dw::DW_AT_calling_convention).value_or(dw::DW_CC_normal) != dw::DW_CC_normal ||
-      (flag(decl, dw::DW_AT_virtuality) && !destructor))
+  // A virtual method with a body (and any D0/D1/D2 destructor entry) is a concrete function: this
+  // row describes the entry at its address, not the declaration's vtable slot.
+  if (number(decl, dw::DW_AT_calling_convention).value_or(dw::DW_CC_normal) != dw::DW_CC_normal)
     symbol.diagnostic = "unsupported_call_abi";
   auto parameters = die;
   const auto children = die.children();
@@ -363,6 +362,14 @@ ModuleIdentity scan(const ModuleSource &source, const ModuleIndexOptions &option
         });
     std::unordered_multimap<std::string, ModuleSymbol *> by_linkage;
     for (auto &[key, symbol] : symbols) by_linkage.emplace(symbol.linkage, &symbol);
+    // A virtual declaration that nothing defines (a pure virtual method without a body) is
+    // recorded so that selecting it says why it has no entry. It is not one when a function
+    // with the same selector exists: GCC names the in-class declaration of a destructor with
+    // the unified "D4" form, while the entries are D0, D1 and D2.
+    std::unordered_set<std::string> function_selectors, defined_linkages;
+    for (const auto &[key, symbol] : symbols)
+      if (symbol.kind == "function") function_selectors.insert(symbol.selector);
+    std::map<std::string, ModuleSymbol> bodyless;
     bool has_units = false;
     for (auto &unit : dwarf->normal_units()) {
       has_units = true;
@@ -380,6 +387,29 @@ ModuleIdentity scan(const ModuleSource &source, const ModuleIndexOptions &option
         if (const auto *tag = kind(die.getTag())) type_sink(describe_type(die, tag));
         if (die.getTag() == dw::DW_TAG_subprogram || die.getTag() == dw::DW_TAG_variable) {
           const auto *linkage = die.getLinkageName();
+          if (linkage && die.getTag() == dw::DW_TAG_subprogram) {
+            if (!flag(die, dw::DW_AT_declaration)) {
+              // Code described by DWARF counts as a body even when the ELF symbol table read
+              // above does not list it (a stripped module with a companion debug file).
+              if (die.find(dw::DW_AT_low_pc) || die.find(dw::DW_AT_ranges))
+                defined_linkages.insert(linkage);
+            } else if (number(die, dw::DW_AT_virtuality).value_or(dw::DW_VIRTUALITY_none) !=
+                           dw::DW_VIRTUALITY_none &&
+                       by_linkage.find(linkage) == by_linkage.end() &&
+                       bodyless.find(linkage) == bodyless.end()) {
+              auto &symbol = bodyless[linkage];
+              auto [symbol_name, symbol_selector] = symbol_names(linkage);
+              symbol.linkage = linkage;
+              symbol.kind = "declaration";
+              symbol.name = std::move(symbol_name);
+              symbol.selector = std::move(symbol_selector);
+              symbol.diagnostic = "no_concrete_entry";
+              symbol.member = true;
+              symbol.has_debug = true;
+              if (const auto qualified_name = qualified(die); !qualified_name.empty())
+                symbol.name = qualified_name;
+            }
+          }
           if (linkage && !flag(die, dw::DW_AT_declaration)) {
             const auto range = by_linkage.equal_range(linkage);
             std::uint64_t address = 0, high = 0, section = 0;
@@ -403,6 +433,9 @@ ModuleIdentity scan(const ModuleSource &source, const ModuleIndexOptions &option
       }
     }
     if (!has_units) identity.diagnostics.push_back("no_dwarf");
+    for (auto &[linkage, symbol] : bodyless)
+      if (!defined_linkages.count(linkage) && !function_selectors.count(symbol.selector))
+        symbols[{linkage, 0, "declaration", ""}] = std::move(symbol);
     std::size_t id = 0;
     for (auto &[key, symbol] : symbols) {
       symbol.id = "s" + std::to_string(++id);

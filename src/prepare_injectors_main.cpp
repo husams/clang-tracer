@@ -281,6 +281,43 @@ int main(int argc, char **argv) {
             return callable;
           });
     }();
+    if (!resolved.pure_virtual_overrides.empty()) {
+      // A pure virtual method can have a body. The module decides: without a defined function
+      // there is nothing to patch, and the overrides are what the user can select instead.
+      const auto &selector = options.at("--selector");
+      if (!module.empty()) {
+        bool defined = false;
+        image_digest(module, [&](const auto &object) {
+          const auto defines = [&](const llvm::object::SymbolRef &symbol) {
+            auto name = symbol.getName();
+            auto type = symbol.getType();
+            auto flags = symbol.getFlags();
+            if (!name || !type || !flags) {
+              if (!name) llvm::consumeError(name.takeError());
+              if (!type) llvm::consumeError(type.takeError());
+              if (!flags) llvm::consumeError(flags.takeError());
+              return false;
+            }
+            return *name == resolved.spec.symbol() &&
+                   *type == llvm::object::SymbolRef::ST_Function &&
+                   !(*flags & llvm::object::SymbolRef::SF_Undefined);
+          };
+          for (const auto &symbol : object.symbols()) defined = defined || defines(symbol);
+          for (const auto &symbol : object.getDynamicSymbolIterators())
+            defined = defined || defines(symbol);
+        }, receiver_storage);
+        if (!defined)
+          throw std::runtime_error(
+              "no concrete implementation entry: " + selector +
+              " is a pure virtual declaration and " + module.filename().string() +
+              " defines no body for it (" + resolved.spec.symbol() + "); " +
+              resolved.pure_virtual_overrides);
+      } else {
+        std::cerr << "prepare: " << selector << " is a pure virtual declaration; this package "
+                     "installs only where a module defines a body for it. "
+                  << resolved.pure_virtual_overrides << '\n';
+      }
+    }
     const auto prepared = tracer::client::write_prepared_package(
         resolved, resolved.package_selector.empty() ? options.at("--selector")
                                                      : resolved.package_selector,

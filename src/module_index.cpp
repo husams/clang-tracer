@@ -431,6 +431,12 @@ ModuleSymbol ModuleIndex::find_symbol(const std::string &name) const {
   const bool by_tag = rows.empty() && name.find("[abi:") == name.npos;
   if (by_tag) rows = tag_insensitive_symbols(db.get(), name);
   if (rows.empty()) throw std::invalid_argument("unknown symbol: " + name);
+  // A bodyless declaration (kind "declaration") only answers when nothing with code matches:
+  // a bare name shared by a defined overload and a pure one selects the defined overload.
+  if (std::any_of(rows.begin(), rows.end(), [](const ModuleSymbol &row) { return row.kind != "declaration"; }))
+    rows.erase(std::remove_if(rows.begin(), rows.end(),
+                              [](const ModuleSymbol &row) { return row.kind == "declaration"; }),
+               rows.end());
   if (rows.size() > 1) {
     const auto list = [&] {
       std::string ids = by_tag ? rows.front().id + " " + rows.front().selector : rows.front().id;

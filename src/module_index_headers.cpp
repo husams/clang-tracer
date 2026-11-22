@@ -248,6 +248,10 @@ public:
   std::vector<std::optional<std::uint64_t>> argument_sizes;
 
   std::string signature(const ModuleSymbol &symbol) {
+    if (symbol.kind == "declaration")
+      throw std::invalid_argument(
+          "no_concrete_entry: " + symbol.selector + " is a virtual declaration with no executable "
+          "body in this module; select a concrete override by its full selector");
     if (symbol.kind != "function" || !symbol.has_debug || !symbol.diagnostic.empty())
       throw std::invalid_argument("unsupported_call_abi: " + symbol.selector + " " + symbol.diagnostic);
     result_type = spelling(symbol.type_id);

@@ -273,11 +273,10 @@ def main() -> int:
                 "fixture-overload-ambiguous", output_dir)
             require("X::f(int)" in ambiguous_virtual and "X::f(long)" in ambiguous_virtual,
                     f"virtual overload candidate list is incomplete:\n{ambiguous_virtual}")
-            virtual_exact = ensure_pre_rpc_rejection(
+            # A virtual method with a body is a concrete entry: it resolves like any other method.
+            ensure_resolution_reaches_rpc(
                 client, negative_target.pid, "VirtualOnly::f(int)", callback, fixture_options,
-                "virtual-exact-unsupported", output_dir)
-            require("virtual methods" in virtual_exact.lower() or "virtual" in virtual_exact.lower(),
-                    f"exact virtual method was not rejected as unsupported:\n{virtual_exact}")
+                "virtual-exact", output_dir)
             volatile_mismatch = ensure_pre_rpc_rejection(
                 client, negative_target.pid, "VolatileOnly::v(int)", callback, fixture_options,
                 "volatile-mismatch", output_dir)

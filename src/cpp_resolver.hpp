@@ -25,6 +25,9 @@ struct ResolvedCallable {
   std::string package_selector;
   std::string translation_unit;
   bool cl_driver = false;
+  // Set for a pure virtual declaration resolved from headers: the concrete overrides those
+  // headers define. Whether the declaration has a body is a question for the module.
+  std::string pure_virtual_overrides;
 };
 
 // Supplied compiler-visible type definitions: headers and the compilation command that gives
