@@ -238,7 +238,8 @@ def main() -> int:
                     f"original initialization or target fields changed: {rows}")
             require(target.poll() is None, "target exited after callback validation")
 
-            # A source fixture with a base class and a separate pointer field are rejected.
+            # A class with a public base class is rebuilt from DWARF: its own and inherited
+            # members read through imported self. A separate pointer field follows.
             inherited_log = (output_dir / "inheritance-target.log").open("wb")
             inherited = subprocess.Popen([str(args.unsupported_target)], stdout=inherited_log,
                                          stderr=inherited_log)
@@ -257,17 +258,31 @@ def main() -> int:
                 attached = text(run(args.client, endpoint, "attach", str(inherited.pid)))
                 require(re.search(r"state=ATTACHED", attached, re.I),
                         f"could not attach to inheritance fixture: {attached}")
-                inheritance_error = text(run(
+                inheritance_hook = output_dir / "inheritance-fields.cpp"
+                inheritance_hook.write_text(
+                    "class Interceptor { public: void pre(const Call &call) { "
+                    "call.field(\"base_value\", call.self()->base_value); "
+                    "call.field(\"bias\", call.self()->bias); } };\n", encoding="utf-8")
+                inheritance_probe_text = text(run(
                     args.client, endpoint, "trace", str(inherited.pid),
-                    "InheritedCalculator::read(int) const", "--callback", str(args.callback),
-                    ok=False, timeout=45))
-                rejection_diagnostics.append(f"inheritance: {inheritance_error}")
-                require(re.search(r"debug receiver inheritance is unsupported|unsupported.*(?:receiver|inheritance|layout)|"
-                                  r"receiver layout changed during AST import: receiver size or alignment changed since source selection|"
-                                  r"typed self\(\) requires "
-                                  r"a debug-selected supported non-static method",
-                                  inheritance_error, re.I),
-                        f"inheritance rejection was not clear: {inheritance_error}")
+                    "InheritedCalculator::read(int) const", "--callback", str(inheritance_hook),
+                    timeout=45))
+                inheritance_probe_match = re.search(r"\bprobe\s*=\s*(\d+)", inheritance_probe_text)
+                require(inheritance_probe_match is not None,
+                        f"inheritance receiver probe did not install: {inheritance_probe_text}")
+                inheritance_probe_id = int(inheritance_probe_match.group(1))
+                inheritance_events, _ = wait_binary(args.client, endpoint, inherited.pid,
+                                                    inheritance_probe_id, output_dir,
+                                                    args.protoc, args.proto, 1, 0)
+                inheritance_pre = next((line for line in inheritance_events
+                                        if re.search(r"^phase: PRE$", line, re.M)), None)
+                require(inheritance_pre is not None and
+                        field_value(inheritance_pre, "base_value") == 13 and
+                        field_value(inheritance_pre, "bias") == 5,
+                        f"inherited and own members were not read through self: "
+                        f"{inheritance_events}")
+                run(args.client, endpoint, "remove", str(inherited.pid),
+                    str(inheritance_probe_id))
 
                 # Reading the pointer through imported self must coexist with
                 # standard declarations used by the target method body.

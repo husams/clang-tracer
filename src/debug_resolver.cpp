@@ -864,6 +864,18 @@ using DescribePath = std::set<std::uint64_t>;
 void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer = false,
                      bool template_provenance = true, DescribePath* path = nullptr);
 
+// Keeps a record as an opaque description: no members, the alignment its own DIE declares, and
+// the reason. The union tag stays, so every declaration of the record agrees.
+void mark_opaque(DWARFDie record, api::DebugInfo &info, const std::string &reason) {
+  info.clear_fields();
+  info.clear_bases();
+  info.set_record_alignment(number(record, dw::DW_AT_alignment));
+  info.set_record_alignment_declared(info.record_alignment() != 0);
+  info.set_record_is_union(record.getTag() == dw::DW_TAG_union_type);
+  info.set_record_is_opaque(true);
+  info.set_record_opaque_reason(info.record_name() + ": " + reason);
+}
+
 // A string-form attribute value, or nothing when it is absent or not a string.
 std::optional<std::string> string_value(const std::optional<llvm::DWARFFormValue>& value) {
   if (!value)
@@ -990,6 +1002,11 @@ void describe_template_type(DWARFDie die, api::DebugTemplateType& out, DescribeP
     try {
       path.erase(offset);  // describe_record puts the record on the path itself.
       describe_record(die, nested, true, true, &path);
+      // The program record named only as a template argument is declared from this description
+      // and never compared with a compiler-built layout, so only flat members are trusted.
+      if (!nested.record_is_opaque() && uses_recovered_layout(nested))
+        mark_opaque(die, nested,
+                    "its layout is not rebuilt when it is only a template argument");
       *out.mutable_record() = std::move(nested);
     } catch (const std::exception&) {
       out.clear_record();
@@ -1137,6 +1154,413 @@ void describe_template_arguments(DWARFDie record, api::DebugInfo& info, Describe
   }
 }
 
+// A record whose layout the debug data cannot describe. The layout readers throw it with the
+// reason; describe_record turns it into an opaque description that keeps that reason.
+struct OpaqueLayout : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// The type behind typedefs and cv-qualifiers. `qualified` is set when a cv-qualifier was passed.
+DWARFDie unqualified_type(DWARFDie type, bool *qualified = nullptr) {
+  std::set<std::uint64_t> seen;  // A typedef that names itself is malformed data.
+  while (type) {
+    const auto tag = type.getTag();
+    if (tag != dw::DW_TAG_typedef && tag != dw::DW_TAG_const_type &&
+        tag != dw::DW_TAG_volatile_type)
+      break;
+    if (!seen.insert(type.getOffset()).second)
+      return {};
+    if (qualified && tag != dw::DW_TAG_typedef)
+      *qualified = true;
+    type = type_of(type);
+  }
+  return type;
+}
+
+bool is_standard_library_name(const std::string &display) {
+  return ::tracer::compat::starts_with(display, "std::") ||
+         ::tracer::compat::starts_with(display, "__gnu_cxx::") ||
+         ::tracer::compat::starts_with(display, "__cxxabiv1::");
+}
+
+bool is_record_tag(DWARFDie type) {
+  if (!type)
+    return false;
+  const auto tag = type.getTag();
+  return tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type ||
+         tag == dw::DW_TAG_union_type;
+}
+
+// What a record's name says about whether a callback can declare it from text, as a noun phrase
+// for a diagnostic; empty when it can.
+std::string undeclarable_record(DWARFDie record, const std::string &display) {
+  if (display.empty())
+    return "a type nested in an unnamed class";
+  for (auto scope = record.getParent(); scope; scope = scope.getParent())
+    if (scope.getTag() == dw::DW_TAG_subprogram || scope.getTag() == dw::DW_TAG_lexical_block)
+      return "a type declared inside a function";
+  if (in_anonymous_namespace(record))
+    return "a type in an anonymous namespace";
+  const auto outermost = display.substr(0, display.find("::"));
+  if (outermost == "std" || outermost == "__gnu_cxx" || outermost == "__cxxabiv1")
+    return "a standard-library type";
+  if (display.find('<') != std::string::npos)
+    return "a class template specialization";
+  std::size_t begin = 0;
+  while (true) {
+    const auto end = display.find("::", begin);
+    const auto part = display.substr(begin, end == std::string::npos ? end : end - begin);
+    const bool plain = !part.empty() && !std::isdigit(static_cast<unsigned char>(part[0])) &&
+                       std::all_of(part.begin(), part.end(), [](unsigned char c) {
+                         return std::isalnum(c) || c == '_';
+                       });
+    if (!plain)
+      return "a type whose name is not a plain identifier path";
+    if (end == std::string::npos)
+      return {};
+    begin = end + 2;
+  }
+}
+
+void describe_record_scopes(DWARFDie record, api::DebugInfo &info) {
+  // Keep each enclosing scope's kind: a class scope cannot be rebuilt as a namespace.
+  for (auto scope = record.getParent(); scope; scope = scope.getParent()) {
+    const auto tag = scope.getTag();
+    if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_subprogram)
+      info.add_record_scopes(api::RECORD_SCOPE_NAMESPACE);
+    else if (tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type)
+      info.add_record_scopes(api::RECORD_SCOPE_CLASS);
+    else if (tag == dw::DW_TAG_union_type)
+      info.add_record_scopes(api::RECORD_SCOPE_UNION);
+  }
+  auto *kinds = info.mutable_record_scopes();
+  std::reverse(kinds->begin(), kinds->end());
+  if (std::all_of(kinds->begin(), kinds->end(),
+                  [](int kind) { return kind == api::RECORD_SCOPE_NAMESPACE; }))
+    kinds->Clear();
+}
+
+void describe_record_convention(DWARFDie record, api::DebugInfo &info) {
+  const auto record_calling_convention = number(record, dw::DW_AT_calling_convention, 0);
+  info.set_record_pass_by_reference(record_calling_convention == dw::DW_CC_pass_by_reference);
+  info.set_record_calling_convention(
+      record_calling_convention == dw::DW_CC_pass_by_value
+          ? api::RECORD_PASS_BY_VALUE
+          : (record_calling_convention == dw::DW_CC_pass_by_reference
+                 ? api::RECORD_PASS_BY_REFERENCE
+                 : api::RECORD_CALLING_CONVENTION_UNSPECIFIED));
+}
+
+std::string access_text(DWARFDie member, DWARFDie owner, bool unnamed_owner) {
+  const auto access = unnamed_owner
+                          ? dw::DW_ACCESS_public
+                          : number(member, dw::DW_AT_accessibility,
+                                   owner.getTag() == dw::DW_TAG_class_type
+                                       ? dw::DW_ACCESS_private
+                                       : dw::DW_ACCESS_public);
+  return access == dw::DW_ACCESS_private     ? "private"
+         : access == dw::DW_ACCESS_protected ? "protected"
+                                             : "public";
+}
+
+// Reads one record's layout (bases, then members in declaration order) into `info`, whose name,
+// scopes and size are already set. Throws OpaqueLayout, with the plain reason, for a shape the
+// debug data does not let the agent rebuild and verify. `unnamed` is a record that is the type
+// of an unnamed or anonymous member: its members are public.
+void describe_layout(DWARFDie record, api::DebugInfo &info, DescribePath &path, bool unnamed);
+
+// A base class or member class that is described as a record of its own.
+void describe_named_record(DWARFDie record, api::DebugInfo &info, DescribePath &path) {
+  info.set_record_name(record_display_name(record));
+  describe_record_scopes(record, info);
+  info.set_record_size(number(record, dw::DW_AT_byte_size));
+  describe_record_convention(record, info);
+  describe_layout(record, info, path, false);
+}
+
+struct LayoutReader {
+  DWARFDie record;
+  api::DebugInfo &info;
+  DescribePath &path;
+  bool unnamed;
+  bool is_union;
+  std::uint64_t natural_alignment = 1;
+
+  bool fits(std::uint64_t offset, std::uint64_t size) const {
+    return offset <= info.record_size() && size <= info.record_size() - offset;
+  }
+
+  void base(DWARFDie inheritance) {
+    const auto type = unqualified_type(type_of(inheritance));
+    const auto shown = type ? record_display_name(type) : std::string();
+    if (number(inheritance, dw::DW_AT_virtuality))
+      throw OpaqueLayout("virtual base class " + shown +
+                         ": its location is found at run time and is not rebuilt from debug "
+                         "data");
+    const auto location = inheritance.find(dw::DW_AT_data_member_location);
+    const auto offset = location ? location->getAsUnsignedConstant() : std::nullopt;
+    if (!offset)
+      throw OpaqueLayout("virtual base class " + shown +
+                         ": its location is found at run time and is not rebuilt from debug "
+                         "data");
+    if (!type || (type.getTag() != dw::DW_TAG_class_type &&
+                  type.getTag() != dw::DW_TAG_structure_type))
+      throw OpaqueLayout("base class " + (shown.empty() ? std::string("(unnamed)") : shown) +
+                         " is not a class that debug data describes");
+    if (const auto phrase = undeclarable_record(type, shown); !phrase.empty())
+      throw OpaqueLayout("base class " + shown + " is " + phrase +
+                         ", which is not rebuilt from debug data");
+    auto *described = info.add_bases();
+    try {
+      describe_named_record(type, *described->mutable_record(), path);
+    } catch (const OpaqueLayout &reason) {
+      throw OpaqueLayout("base class " + shown + ": " + reason.what());
+    }
+    const auto size = described->record().record_size();
+    if (!fits(*offset, size))
+      throw OpaqueLayout("base class " + shown + " does not fit in the record");
+    described->set_byte_offset(*offset);
+    described->set_access(access_text(inheritance, record, false));
+    natural_alignment = std::max(natural_alignment, described->record().record_alignment());
+  }
+
+  // A bit-field of a plain integer type; its position is a bit offset from the record start.
+  void bit_field(DWARFDie member, const std::string &field_name, std::uint64_t offset,
+                 const std::string &label) {
+    // DWARF does not list unnamed bit-fields: the padding is reproduced from the gaps.
+    if (field_name.empty())
+      return;
+    const auto declared = type_of(member);
+    const auto core = unqualified_type(declared);
+    if (!core || core.getTag() != dw::DW_TAG_base_type)
+      throw OpaqueLayout(label + " is a bit-field of a type that is not a plain integer");
+    const auto encoding = number(core, dw::DW_AT_encoding);
+    if (encoding != dw::DW_ATE_boolean && encoding != dw::DW_ATE_signed &&
+        encoding != dw::DW_ATE_unsigned && encoding != dw::DW_ATE_signed_char &&
+        encoding != dw::DW_ATE_unsigned_char && encoding != dw::DW_ATE_UTF)
+      throw OpaqueLayout(label + " is a bit-field of a type that is not a plain integer");
+    Type t;
+    try {
+      t = read_type(declared);
+    } catch (const std::exception &error) {
+      throw OpaqueLayout(label + " has a type that is not rebuilt from debug data (" +
+                         error.what() + ")");
+    }
+    const auto width = number(member, dw::DW_AT_bit_size);
+    std::uint64_t bit_offset = 0;
+    if (const auto direct = member.find(dw::DW_AT_data_bit_offset)) {
+      const auto value = direct->getAsUnsignedConstant();
+      if (!value)
+        throw OpaqueLayout(label + " has a bit offset that is not constant");
+      bit_offset = *value;
+    } else {
+      // The DWARF 2-4 form counts from the most significant bit of the storage unit.
+      const auto legacy = member.find(dw::DW_AT_bit_offset);
+      const auto from_top = legacy ? legacy->getAsUnsignedConstant() : std::nullopt;
+      if (!from_top)
+        throw OpaqueLayout(label + " has no bit offset in the debug data");
+      const auto storage = number(member, dw::DW_AT_byte_size, t.size);
+      const auto end = (offset + storage) * 8;
+      if (end < *from_top + width)
+        throw OpaqueLayout(label + " has an inconsistent bit offset in the debug data");
+      bit_offset = end - *from_top - width;
+    }
+    if (!width || !t.size || width > t.size * 8 ||
+        bit_offset + width > info.record_size() * 8)
+      throw OpaqueLayout(label + " does not fit in the record");
+    auto *f = info.add_fields();
+    f->set_name(field_name);
+    f->set_builtin_type(t.spelling);
+    try {
+      describe_type_chain(declared, f->mutable_type_chain());
+    } catch (const std::exception &error) {
+      throw OpaqueLayout(label + " has a type that is not rebuilt from debug data (" +
+                         error.what() + ")");
+    }
+    f->set_byte_offset(bit_offset / 8);
+    f->set_byte_size(t.size);
+    f->set_access(access_text(member, record, unnamed));
+    f->set_bit_size(static_cast<std::uint32_t>(width));
+    f->set_bit_offset(bit_offset);
+    natural_alignment = std::max(natural_alignment, std::min<std::uint64_t>(t.size, 8));
+  }
+
+  void member(DWARFDie member) {
+    const auto field_name = name(member);
+    if (number(member, dw::DW_AT_artificial) &&
+        ::tracer::compat::starts_with(field_name, "_vptr"))
+      throw OpaqueLayout("it has virtual functions (a vtable pointer); dynamic classes are not "
+                         "rebuilt from debug data");
+    const auto label = field_name.empty() ? std::string("an anonymous member")
+                                          : "member '" + field_name + "'";
+    // Static data members have no object offset. Ignore only declarations explicitly marked
+    // external/declaration; a missing location on an ordinary member means the instance layout
+    // is incomplete (a union member sits at offset zero).
+    const auto location = member.find(dw::DW_AT_data_member_location);
+    std::uint64_t offset = 0;
+    if (location) {
+      const auto value = location->getAsUnsignedConstant();
+      if (!value)
+        throw OpaqueLayout(label + " is not at a constant offset");
+      offset = *value;
+    } else if (!member.find(dw::DW_AT_data_bit_offset)) {
+      if (number(member, dw::DW_AT_external) || number(member, dw::DW_AT_declaration))
+        return;
+      if (!is_union)
+        throw OpaqueLayout(label + " has no offset in the debug data");
+    }
+    if (member.find(dw::DW_AT_bit_size)) {
+      bit_field(member, field_name, offset, label);
+      return;
+    }
+
+    const auto declared = type_of(member);
+    bool qualified = false;
+    auto core = unqualified_type(declared, &qualified);
+    auto element = declared;
+    std::vector<std::uint64_t> extents;
+    while (core && core.getTag() == dw::DW_TAG_array_type) {
+      if (qualified)
+        throw OpaqueLayout(label + " is a const or volatile qualified array");
+      bool any = false;
+      for (const auto dimension : core.children()) {
+        if (dimension.getTag() != dw::DW_TAG_subrange_type)
+          continue;
+        any = true;
+        std::optional<std::uint64_t> extent;
+        if (const auto count = dimension.find(dw::DW_AT_count)) {
+          extent = count->getAsUnsignedConstant();
+        } else if (const auto upper = dimension.find(dw::DW_AT_upper_bound)) {
+          const auto bound = upper->getAsUnsignedConstant();
+          if (bound && *bound != std::numeric_limits<std::uint64_t>::max())
+            extent = *bound + 1;
+        }
+        if (!extent || !*extent)
+          throw OpaqueLayout(label + " is an array without a known size");
+        extents.push_back(*extent);
+      }
+      if (!any)
+        throw OpaqueLayout(label + " is an array without a known size");
+      element = type_of(core);
+      qualified = false;
+      core = unqualified_type(element, &qualified);
+    }
+    std::uint64_t count = 1;
+    for (const auto extent : extents) {
+      if (count > std::numeric_limits<std::uint64_t>::max() / extent)
+        throw OpaqueLayout(label + " is an array too large to describe");
+      count *= extent;
+    }
+
+    auto *f = info.add_fields();
+    f->set_name(field_name);
+    f->set_access(access_text(member, record, unnamed));
+    f->set_alignment(number(member, dw::DW_AT_alignment));
+    for (const auto extent : extents)
+      f->add_array_extents(extent);
+    std::uint64_t element_size = 0, element_alignment = 1;
+
+    if (is_record_tag(core)) {
+      if (qualified)
+        throw OpaqueLayout(label + " has a const or volatile qualified class type");
+      element_size = number(core, dw::DW_AT_byte_size);
+      auto &described = *f->mutable_record();
+      const bool unnamed_type = name(core).empty();
+      if (unnamed_type) {
+        if (field_name.empty() && !extents.empty())
+          throw OpaqueLayout("an anonymous member is an array");
+        described.set_record_size(element_size);
+        try {
+          describe_layout(core, described, path, true);
+        } catch (const OpaqueLayout &reason) {
+          throw OpaqueLayout(label + " of an unnamed class type: " + reason.what());
+        }
+      } else {
+        if (field_name.empty())
+          throw OpaqueLayout("an anonymous member has the named type " +
+                             record_display_name(core));
+        const auto shown = record_display_name(core);
+        if (const auto phrase = undeclarable_record(core, shown); !phrase.empty())
+          throw OpaqueLayout(label + " has the type " + (shown.empty() ? "(unnamed)" : shown) +
+                             ", " + phrase + ", which is not rebuilt from debug data");
+        try {
+          describe_named_record(core, described, path);
+        } catch (const OpaqueLayout &reason) {
+          throw OpaqueLayout(label + " of type " + shown + ": " + reason.what());
+        }
+      }
+      element_alignment = described.record_alignment();
+    } else {
+      if (field_name.empty())
+        throw OpaqueLayout("a member without a name is not a class type");
+      Type t;
+      try {
+        t = read_type(element);
+      } catch (const std::exception &error) {
+        throw OpaqueLayout(label + " has a type that is not rebuilt from debug data (" +
+                           error.what() + ")");
+      }
+      if (t.enumeration)
+        throw OpaqueLayout(label + " is the enumeration " + t.spelling +
+                           ", which is not rebuilt from debug data");
+      if (t.reference)
+        throw OpaqueLayout(label + " is the reference " + t.spelling +
+                           "; reference members are not rebuilt from debug data");
+      if (t.record)
+        throw OpaqueLayout(label + " is a pointer to the class " + t.spelling +
+                           "; pointers to classes are not rebuilt from debug data");
+      if (!t.size)
+        throw OpaqueLayout(label + " has no size in the debug data");
+      f->set_builtin_type(t.spelling);
+      try {
+        describe_type_chain(element, f->mutable_type_chain());
+      } catch (const std::exception &error) {
+        throw OpaqueLayout(label + " has a type that is not rebuilt from debug data (" +
+                           error.what() + ")");
+      }
+      element_size = t.size;
+      element_alignment = std::min<std::uint64_t>(t.size, 8);
+    }
+    if (!element_size || count > std::numeric_limits<std::uint64_t>::max() / element_size ||
+        !fits(offset, element_size * count))
+      throw OpaqueLayout(label + " does not fit in the record");
+    f->set_byte_offset(offset);
+    f->set_byte_size(element_size * count);
+    natural_alignment =
+        std::max({natural_alignment, element_alignment, f->alignment()});
+  }
+};
+
+void describe_layout(DWARFDie record, api::DebugInfo &info, DescribePath &path, bool unnamed) {
+  // A class cannot hold itself or a base of itself by value, so a record met again on its own
+  // path is malformed debug data. The path ends with this call, also when it throws.
+  if (!path.insert(record.getOffset()).second)
+    throw OpaqueLayout("its members refer back to the class itself in the debug data");
+  struct Leave {
+    DescribePath &path;
+    std::uint64_t offset;
+    ~Leave() { path.erase(offset); }
+  } leave{path, record.getOffset()};
+  if (number(record, dw::DW_AT_declaration) || !info.record_size()) {
+    const auto shown = record_display_name(record);
+    throw OpaqueLayout("debug data of this module only declares " +
+                       (shown.empty() ? std::string("this class") : shown) +
+                       "; its members are described where the class is defined");
+  }
+  const bool is_union = record.getTag() == dw::DW_TAG_union_type;
+  info.set_record_is_union(is_union);
+  LayoutReader reader{record, info, path, unnamed, is_union};
+  for (auto child : record.children()) {
+    if (child.getTag() == dw::DW_TAG_inheritance)
+      reader.base(child);
+    else if (child.getTag() == dw::DW_TAG_member)
+      reader.member(child);
+  }
+  const auto declared_alignment = number(record, dw::DW_AT_alignment);
+  info.set_record_alignment(declared_alignment ? declared_alignment : reader.natural_alignment);
+  info.set_record_alignment_declared(declared_alignment != 0);
+}
+
 // A record in an anonymous namespace is accepted only behind a pointer or reference: the
 // callback then observes an address, and members are read only from the checked DWARF layout.
 // By value it would need the original type's ABI, which no callback representation provides.
@@ -1167,118 +1591,30 @@ void describe_record(DWARFDie record, api::DebugInfo& info, bool behind_pointer,
       throw std::runtime_error("anonymous-namespace record by value is unsupported");
     info.set_record_identity(record_identity(record));
   }
-  // Keep each enclosing scope's kind: a class scope cannot be rebuilt as a namespace.
-  for (auto scope = record.getParent(); scope; scope = scope.getParent()) {
-    const auto tag = scope.getTag();
-    if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_subprogram)
-      info.add_record_scopes(api::RECORD_SCOPE_NAMESPACE);
-    else if (tag == dw::DW_TAG_class_type || tag == dw::DW_TAG_structure_type)
-      info.add_record_scopes(api::RECORD_SCOPE_CLASS);
-    else if (tag == dw::DW_TAG_union_type)
-      info.add_record_scopes(api::RECORD_SCOPE_UNION);
-  }
-  {
-    auto *kinds = info.mutable_record_scopes();
-    std::reverse(kinds->begin(), kinds->end());
-    if (std::all_of(kinds->begin(), kinds->end(),
-                    [](int kind) { return kind == api::RECORD_SCOPE_NAMESPACE; }))
-      kinds->Clear();
-  }
+  describe_record_scopes(record, info);
   info.set_record_size(number(record, dw::DW_AT_byte_size));
-  const auto record_calling_convention =
-      number(record, dw::DW_AT_calling_convention, 0);
-  info.set_record_pass_by_reference(
-      record_calling_convention == dw::DW_CC_pass_by_reference);
-  info.set_record_calling_convention(
-      record_calling_convention == dw::DW_CC_pass_by_value
-          ? api::RECORD_PASS_BY_VALUE
-          : (record_calling_convention == dw::DW_CC_pass_by_reference
-                 ? api::RECORD_PASS_BY_REFERENCE
-                 : api::RECORD_CALLING_CONVENTION_UNSPECIFIED));
+  describe_record_convention(record, info);
   info.set_receiver_volatile(false);
   if (info.record_name().empty())
     throw std::runtime_error("incomplete debug record identity");
-  if (is_union) {
-    info.set_record_is_opaque(true);
-    info.set_record_alignment(number(record, dw::DW_AT_alignment));
-    return;
+  info.set_record_is_union(is_union);
+  try {
+    DescribePath layout_path;
+    describe_layout(record, info, layout_path, false);
+    // A record described through its standard-library header keeps only the flat layout it had
+    // before: the header, not debug data, supplies the rest.
+    if (is_standard_library_name(info.record_name()) && uses_recovered_layout(info))
+      throw OpaqueLayout("its layout is supplied by the standard library's own header, not "
+                         "rebuilt from debug data");
+    if (info.fields_size() == 0 && info.bases_size() == 0) {
+      // A class without data members keeps the alignment it was described with.
+      const auto alignment = info.record_alignment();
+      mark_opaque(record, info, "it has no data members in the debug data");
+      info.set_record_alignment(alignment);
+    }
+  } catch (const OpaqueLayout &opaque) {
+    mark_opaque(record, info, opaque.what());
   }
-  bool opaque = !info.record_size();
-  for (auto member : record.children()) {
-    if (member.getTag() == dw::DW_TAG_inheritance) {
-      opaque = true;
-      continue;
-    }
-    if (member.getTag() != dw::DW_TAG_member) {
-      continue;
-    }
-    // Static data members have no object offset. Ignore only declarations
-    // explicitly marked external/declaration; a missing location on an
-    // ordinary member means the instance layout is incomplete.
-    if (member.find(dw::DW_AT_bit_size)) {
-      opaque = true;
-      continue;
-    }
-    auto location = member.find(dw::DW_AT_data_member_location);
-    if (!location) {
-      if (number(member, dw::DW_AT_external) ||
-          number(member, dw::DW_AT_declaration))
-        continue;
-      opaque = true;
-      continue;
-    }
-    auto offset = location->getAsUnsignedConstant();
-    if (!offset || name(member).empty()) {
-      opaque = true;
-      continue;
-    }
-    Type t;
-    try {
-      t = read_type(type_of(member));
-    } catch (const std::exception &) {
-      opaque = true;
-      continue;
-    }
-    // A field naming an enumeration keeps the record opaque: its declaration is not recovered.
-    if (t.enumeration) {
-      opaque = true;
-      continue;
-    }
-    if (!t.size || *offset > info.record_size() || t.size > info.record_size() - *offset) {
-      opaque = true;
-      continue;
-    }
-    if (t.record) {
-      opaque = true;
-      continue;
-    }
-    auto* f = info.add_fields();
-    f->set_name(name(member));
-    f->set_builtin_type(t.spelling);
-    describe_type_chain(type_of(member), f->mutable_type_chain());
-    f->set_byte_offset(*offset);
-    f->set_byte_size(t.size);
-    const auto access = number(member, dw::DW_AT_accessibility,
-                               record.getTag() == dw::DW_TAG_class_type ? dw::DW_ACCESS_private
-                                                                        : dw::DW_ACCESS_public);
-    f->set_access(access == dw::DW_ACCESS_private     ? "private"
-                  : access == dw::DW_ACCESS_protected ? "protected"
-                                                      : "public");
-  }
-  if (opaque)
-    info.clear_fields();
-  std::uint64_t natural_alignment = 1;
-  for (const auto& field : info.fields()) {
-    natural_alignment = std::max(natural_alignment, std::min<std::uint64_t>(field.byte_size(), 8));
-  }
-  const auto declared_alignment = number(record, dw::DW_AT_alignment);
-  if (!opaque && declared_alignment && declared_alignment != natural_alignment) {
-    throw std::runtime_error("nonordinary debug record alignment is unsupported");
-  }
-  info.set_record_alignment(declared_alignment
-                                ? declared_alignment
-                                : (opaque ? 0 : natural_alignment));
-  info.set_record_is_opaque(opaque || info.fields_size() == 0);
 }
 
 void describe_methods(DWARFDie record, api::DebugInfo &info) {

@@ -970,6 +970,26 @@ function(tracer_add_native_repl)
           "${_unnamed_receiver_gcc}")
       set_tests_properties(native_repl_dwarf_narrow_gcc PROPERTIES TIMEOUT 300
         SKIP_RETURN_CODE 77)
+      # Receiver layouts that headerless DWARF callbacks rebuild (issue #146): bases, bit-fields,
+      # record, union, array and anonymous members and declared alignment. The second test rebuilds
+      # the fixture with a GCC (skipped, exit 77, without one).
+      add_executable(repl-dwarf-layout-target tests/fixtures/repl_dwarf_layout.cpp)
+      set_target_properties(repl-dwarf-layout-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-dwarf-layout-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer
+        -fcf-protection=none -fno-pie)
+      target_link_options(repl-dwarf-layout-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_dwarf_layout
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_dwarf_layout.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-dwarf-layout-target>)
+      set_tests_properties(native_repl_dwarf_layout PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_dwarf_layout_gcc
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_dwarf_layout.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-dwarf-layout-target>
+          "${_unnamed_receiver_gcc}")
+      set_tests_properties(native_repl_dwarf_layout_gcc PROPERTIES TIMEOUT 600
+        SKIP_RETURN_CODE 77)
       add_executable(repl-virtual-target tests/fixtures/repl_virtual.cpp
         tests/fixtures/repl_virtual_main.cpp)
       set_target_properties(repl-virtual-target PROPERTIES CXX_STANDARD 17)
