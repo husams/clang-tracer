@@ -82,6 +82,40 @@ struct Interceptor {
   }
 };
 """,
+            # A narrow slot is written through its carrier: int for signed, unsigned long for
+            # unsigned. The wrapper keeps the declared type, so the sign must survive.
+            "short_argument": """struct Interceptor {
+  void pre(const Call &call) { call.override_argument<int>(0, -300); }
+};
+""",
+            "short_result": """struct Interceptor {
+  void post(const Call &call) { call.override_result<int>(-12); }
+};
+""",
+            "short_replace": """struct Interceptor {
+  void pre(const Call &call) { call.replace_with<int>(-77); }
+};
+""",
+            "short_original": """struct Interceptor {
+  void pre(const Call &call) { call.field("original", call.call_original<int>()); }
+};
+""",
+            "byte_argument": """struct Interceptor {
+  void pre(const Call &call) { call.override_argument<unsigned long>(0, 200); }
+};
+""",
+            "byte_result": """struct Interceptor {
+  void post(const Call &call) { call.override_result<unsigned long>(250); }
+};
+""",
+            "byte_replace": """struct Interceptor {
+  void pre(const Call &call) { call.replace_with<unsigned long>(251); }
+};
+""",
+            "byte_original": """struct Interceptor {
+  void pre(const Call &call) { call.field("original", call.call_original<unsigned long>()); }
+};
+""",
         }
         for name, source in files.items():
             (root / f"{name}.cpp").write_text(source)
@@ -158,6 +192,34 @@ struct Interceptor {
             probe = install("integer", f"{args} {result}", "integer_sample(long long, bool)")
             call("integer_sample --arg -9000000000 --arg false", "int64", "-9223372036854775808")
             remove(probe)
+
+            # Narrow integers: overridden, replaced and called through their carriers.
+            short_selector, byte_selector = "short_sample(short)", "byte_sample(unsigned char)"
+            for hook, flag, target, command, kind, value in (
+                ("short_argument", args, short_selector, "short_call --arg 7", "int32", "-301"),
+                ("short_result", result, short_selector, "short_call --arg 5", "int32", "-12"),
+                ("short_replace", "--allow-replacement", short_selector, "short_call --arg 5",
+                 "int32", "-77"),
+                ("byte_argument", args, byte_selector, "byte_call --arg 1", "int32", "201"),
+                ("byte_result", result, byte_selector, "byte_call --arg 3", "int32", "250"),
+                ("byte_replace", "--allow-replacement", byte_selector, "byte_call --arg 3",
+                 "int32", "251"),
+            ):
+                probe = install(hook, flag, target)
+                call(command, kind, value)
+                remove(probe)
+            # The original's result is read at the carrier's width: a negative short stays
+            # negative and a byte above 127 stays positive. The callable is unchanged.
+            for hook, target, command, value, original in (
+                ("short_original", short_selector, "short_call --arg -3", "-4", "-4"),
+                ("byte_original", byte_selector, "byte_call --arg 200", "201", "201"),
+            ):
+                probe = install(hook, "--allow-call-original", target)
+                call(command, "int32", value)
+                send(f"%events --probe {probe} --count 1 --timeout 5")
+                output.expect(rf"phase=PRE .*original={original}\b")
+                output.expect(r"^received=1 .*complete=true")
+                remove(probe)
 
             probe = install("both", f"{args} {result}")
             send("%probes")

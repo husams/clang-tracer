@@ -1,17 +1,19 @@
 """Enumerations and member pointers in DWARF-resolved signatures (issue #136).
 
 The fixture (tests/fixtures/repl_dwarf_enum.cpp) has functions and methods that take and return
-enumerations (a namespace-scope unscoped enum, scoped enums over long long and unsigned long, and
-an enum nested in a class, by value and by reference), and others the tracer must reject with a
-diagnostic that names the cause: enums over unsigned int and unsigned char, a pointer to a data
-member and a pointer to a member function. One "g" byte makes the fixture do one exact pass, so
-every count below is exact.
+enumerations (a namespace-scope unscoped enum, scoped enums over long long, unsigned long, bool,
+unsigned char and short, an enum nested in a class by value and by reference, an unsigned int enum
+and a standard-library enum), and others the tracer must reject with a diagnostic that names the
+cause: a pointer to a data member and a pointer to a member function. One "g" byte makes the
+fixture do one exact pass, so every count below is exact.
 
 Checked here:
   * the supported signatures resolve, with the carrier of the enum's underlying type and the
     enumeration named in the metadata;
-  * the others fail to resolve and preview as UNSUPPORTED with the enumeration or member pointer,
-    its role and its callable named, and never with an empty type name;
+  * the member pointers fail to resolve and preview as UNSUPPORTED with the kind of pointer, its
+    role and its callable named, and never with an empty type name;
+  * enumerations over narrow and unsigned 32-bit types arrive exactly, even when the caller leaves
+    junk in the upper bits of the argument register;
   * a typed Interceptor<Signature> naming the enums validates, a mismatching one does not;
   * the callbacks see the exact values, and a bulk apply of the supported callables installs,
     traces and restores the entry bytes.
@@ -42,6 +44,7 @@ BY_REF = "enums::Order::by_ref(const enums::Order::State&)"
 FLIP = "enums::flip(enums::Sign)"
 WIDEN = "enums::widen(enums::Wide)"
 BIG = "enums::big(enums::Big)"
+TINY = "enums::tiny(enums::Tiny)"
 FLAG = "enums::flag(enums::Flag)"
 CODE = "enums::code(std::errc)"
 PAINT = "enums::paint(enums::Color)"
@@ -49,11 +52,12 @@ NARROW = "enums::narrow(enums::Narrow)"
 READ = "enums::Order::read(int enums::Order::*)"
 CALL = "enums::call(enums::Order*, int (enums::Order::*)(int))"
 
-SUPPORTED = (SET_STATE, STATE_OF, BY_REF, FLIP, WIDEN, BIG, FLAG, CODE)
-UNSUPPORTED = (PAINT, NARROW, READ, CALL)
+SUPPORTED = (SET_STATE, STATE_OF, BY_REF, FLIP, WIDEN, BIG, FLAG, CODE, PAINT, NARROW, TINY)
+UNSUPPORTED = (READ, CALL)
 
 STATE, SIGN, WIDE, BIG_TYPE = "enums::Order::State", "enums::Sign", "enums::Wide", "enums::Big"
 FLAG_TYPE, ERRC = "enums::Flag", "std::errc"
+COLOR, NARROW_TYPE, TINY_TYPE = "enums::Color", "enums::Narrow", "enums::Tiny"
 
 
 def resolve(session, selector):
@@ -88,6 +92,10 @@ def resolve_phase(session, root):
         BIG: ("INT32", ["UINT64"], None, [BIG_TYPE]),
         FLAG: ("INT32", ["BOOL"], None, [FLAG_TYPE]),
         CODE: ("INT32", ["INT32"], None, [ERRC]),
+        # Narrow and unsigned 32-bit: unsigned types travel as uint64, signed narrow ones as int32.
+        PAINT: ("UINT64", ["UINT64"], COLOR, [COLOR]),
+        NARROW: ("UINT64", ["UINT64"], NARROW_TYPE, [NARROW_TYPE]),
+        TINY: ("INT32", ["INT32"], TINY_TYPE, [TINY_TYPE]),
         PLAIN: ("INT32", ["INT32"], None, [None]),
     }
     for selector, (result, arguments, result_enum, argument_enums) in expected.items():
@@ -106,9 +114,10 @@ def resolve_phase(session, root):
             if enum_name:
                 enum = one(argument_info, "enum_type")
                 assert one(enum, "name") == enum_name and one(enum, "kind") == "ENUM", enum
-                size = {WIDE: "8", BIG_TYPE: "8", FLAG_TYPE: "1"}.get(enum_name, "4")
+                size = {WIDE: "8", BIG_TYPE: "8", FLAG_TYPE: "1", NARROW_TYPE: "1",
+                        TINY_TYPE: "2"}.get(enum_name, "4")
                 assert one(enum, "byte_size") == size, enum
-                scoped = enum_name != SIGN
+                scoped = enum_name not in (SIGN, COLOR)
                 assert ("enum_scoped" in enum) == scoped, (selector, enum)
                 underlying = one(enum, "element")
                 assert one(underlying, "kind") == "BUILTIN", enum
@@ -125,12 +134,6 @@ def resolve_phase(session, root):
         assert spec is None and error, selector
         assert not re.search(r"unsupported debug type: *$", error), error
         errors[selector] = error
-    for selector, enum, size, underlying in ((PAINT, "enums::Color", "4 bytes", "unsigned int"),
-                                             (NARROW, "enums::Narrow", "1 byte", "unsigned char")):
-        error = errors[selector]
-        role = "the result of " + selector.split("(")[0]
-        assert f"unsupported debug enumeration {enum} for {role}: underlying type {underlying} " \
-            f"({size}) has no exact DWARF trace value type" in error, error
     error = errors[READ]
     assert "unsupported debug type for parameter 0 'field' of enums::Order::read: " \
         "pointer to data member int enums::Order::* (DW_TAG_ptr_to_member_type); " \
@@ -162,8 +165,6 @@ def preview_phase(session):
         status, reason = rows[selector]
         assert status == "UNSUPPORTED" and reason, (selector, rows[selector])
         assert not reason.rstrip().endswith("unsupported debug type:"), reason
-    assert "unsupported debug enumeration enums::Color" in rows[PAINT][1], rows[PAINT]
-    assert "unsupported debug enumeration enums::Narrow" in rows[NARROW][1], rows[NARROW]
     assert "pointer to data member" in rows[READ][1] and "parameter 0" in rows[READ][1], rows[READ]
     assert "pointer to member function" in rows[CALL][1] and "parameter 1" in rows[CALL][1], \
         rows[CALL]
@@ -197,6 +198,9 @@ def validate_phase(session, root, typed_receiver=True):
         WIDEN: f"{WIDE}({WIDE})",
         BIG: f"int({BIG_TYPE})",
         BY_REF: f"int(const {STATE}&)",
+        PAINT: f"{COLOR}({COLOR})",
+        NARROW: f"{NARROW_TYPE}({NARROW_TYPE})",
+        TINY: f"{TINY_TYPE}({TINY_TYPE})",
     }
     for selector, signature in typed.items():
         callback = write(root, "typed.cpp", f"""template <> class Interceptor<{signature}> {{
@@ -300,7 +304,9 @@ public:
                                 (STATE_OF, "int(int)"), (STATE_OF, f"{STATE}*(int)"),
                                 (FLIP, f"int({SIGN})"), (FLIP, f"{SIGN}(int)"),
                                 (BY_REF, f"int({STATE})"), (BY_REF, f"int({STATE}&)"),
-                                (WIDEN, f"{WIDE}(long long)"), (BIG, "int(unsigned long)")):
+                                (WIDEN, f"{WIDE}(long long)"), (BIG, "int(unsigned long)"),
+                                (PAINT, "unsigned int(unsigned int)"),
+                                (NARROW, "unsigned char(unsigned char)")):
         callback = write(root, "mismatch.cpp", f"""template <> class Interceptor<{signature}> {{
 public:
   void pre(const Call& call) {{ (void)call; }}
@@ -399,6 +405,62 @@ public:
     session.detach()
 
 
+def narrow_phase(session, root):
+    """Enumerations over unsigned int, unsigned char and short arrive exactly, even when the
+    caller leaves junk in the upper bits of the argument register (the fixture calls each of
+    them that way once per pass): the wrapper declares them at their own width."""
+    def callback(name, enum, pre, post):
+        return write(root, name, f"""template <> class Interceptor<{enum}({enum})> {{
+public:
+  void pre(const Call& call) {{ {pre} }}
+  void post(const Call& call) {{ {post} }}
+}};
+""")
+
+    probes = {}
+    for key, selector, enum, cast in (("paint", PAINT, COLOR, "unsigned long long"),
+                                      ("narrow", NARROW, NARROW_TYPE, "unsigned long long"),
+                                      ("tiny", TINY, TINY_TYPE, "long long")):
+        probes[key], _ = session.inject(f'"{selector}"', "--callback", str(callback(
+            f"{key}.cpp", enum,
+            f'call.field("before", static_cast<{cast}>(call.arg<{enum}>(0)));',
+            f'call.field("after", static_cast<{cast}>(call.result<{enum}>()));')))
+    session.run_passes()
+    n = PASSES
+
+    def value(entry):
+        return int(entry.get("signedValue", entry.get("unsignedValue")))
+
+    def pairs(key, count, name):
+        events = session.events(probes[key], "POST", count, name)
+        return sorted((value(e["namedArguments"][0]["value"]), value(e["result"]))
+                      for e in events)
+
+    # Color is unsigned int: Red -> Green, and Green (with junk above bit 32) -> Red.
+    assert pairs("paint", 2 * n, "paint") == [(0, 1)] * n + [(1, 0)] * n
+    # Narrow is unsigned char: 200 is not sign-extended and has no garbage above its byte.
+    assert pairs("narrow", 2 * n, "narrow") == [(0, 200)] * n + [(200, 0)] * n
+    # Tiny is short: -2 stays -2 (also with junk in bits 16 to 63).
+    assert pairs("tiny", 2 * n, "tiny") == [(-2, 3)] * n * 2
+
+    def recorded(key, phase, name, field):
+        found = []
+        for event in session.events(probes[key], phase, 2 * n, name):
+            for entry in event.get("objectFields", []):
+                if entry["name"] == field:
+                    found.append(value(entry["value"]))
+        return sorted(found)
+
+    assert recorded("paint", "PRE", "paint-pre", "before") == [0] * n + [1] * n
+    assert recorded("narrow", "PRE", "narrow-pre", "before") == [0] * n + [200] * n
+    assert recorded("narrow", "POST", "narrow-post", "after") == [0] * n + [200] * n
+    assert recorded("tiny", "PRE", "tiny-pre", "before") == [-2] * n * 2
+    assert recorded("tiny", "POST", "tiny-post", "after") == [3] * n * 2
+    session.run_passes(1)
+    assert session.target.process.poll() is None
+    session.detach()
+
+
 def bulk_phase(session, root, bytes_at):
     """One preview and one batch install every supported callable; remove restores the bytes."""
     manifest = root / "enums.textproto"
@@ -407,7 +469,7 @@ def bulk_phase(session, root, bytes_at):
     rows, summary = preview(session, f'%trace preview {exact} --save "{manifest}"')
     assert set(rows) == set(SUPPORTED + (PLAIN,)), rows
     assert all(status == "DWARF_SUPPORTED" for status, _ in rows.values()), rows
-    assert "dwarf_supported=9" in summary, summary
+    assert "dwarf_supported=12" in summary, summary
     session.output.expect(r"^manifest=")
 
     session.command(f'%trace apply --manifest "{manifest}"')
@@ -466,12 +528,15 @@ def observe(repl, server, agent, fixture, label):
                          ("widen", "_ZN5enums5widenENS_4WideE"),
                          ("big", "_ZN5enums3bigENS_3BigE"),
                          ("flag", "_ZN5enums4flagENS_4FlagE"),
+                         ("paint", "_ZN5enums5paintENS_5ColorE"),
+                         ("narrow", "_ZN5enums6narrowENS_6NarrowE"),
+                         ("tiny", "_ZN5enums4tinyENS_4TinyE"),
                          ("plain", "_ZN5enums5Order5plainEi")):
         match = re.search(rf"^([0-9a-f]+) [TW] {symbol}$", nm.stdout, re.M)
         assert match, symbol
         entries[name] = int(match.group(1), 16)
     # A fixture process per phase: an agent keeps a fixed number of probe slots per process.
-    for phase in ("resolve", "inject", "bulk"):
+    for phase in ("resolve", "inject", "narrow", "bulk"):
         with tempfile.TemporaryDirectory(prefix="ct-enum-run-") as directory, ExitStack() as stack:
             root = Path(directory)
             target = Target(str(fixture), stack)
@@ -483,11 +548,13 @@ def observe(repl, server, agent, fixture, label):
                 session.detach()
             elif phase == "inject":
                 inject_phase(session, root)
+            elif phase == "narrow":
+                narrow_phase(session, root)
             else:
                 bulk_phase(session, root, entries)
             send(target.process, "q")
             target.process.wait(timeout=10)
-    print(f"enumerations observed ({label}): resolve, preview, validate, inject, bulk")
+    print(f"enumerations observed ({label}): resolve, preview, validate, inject, narrow, bulk")
 
 
 def main(repl, server, agent, fixture, gcc=None):

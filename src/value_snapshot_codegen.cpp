@@ -303,10 +303,16 @@ make_value_snapshot_code(clang::ASTContext &ast,
     context_engine::StateFamilyKey family;
     family.source_lineage_id[0] = 1;
     if (const auto *record = type->getAsCXXRecordDecl();
-        record && !llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
-      family.cpp_state_type = record->getQualifiedNameAsString();
-    else
+        record && !llvm::isa<clang::ClassTemplateSpecializationDecl>(record)) {
+      // The type's spelling, which the schema is keyed by. It names an unnamed owner by
+      // the typedef that names it for linkage; a qualified declaration name does not.
+      clang::PrintingPolicy policy(ast.getLangOpts());
+      policy.SuppressTagKeyword = true;
+      family.cpp_state_type =
+          tracer::prepared::record_type(ast, record).getCanonicalType().getAsString(policy);
+    } else {
       family.cpp_state_type = type.getAsString();
+    }
     family.cpp_scope_type = "tracer::EventValueSnapshot";
     context_engine::SchemaLimits limits;
     limits.descriptor_bytes = 4096;

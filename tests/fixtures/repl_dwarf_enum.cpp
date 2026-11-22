@@ -23,17 +23,16 @@
 
 namespace enums {
 
-// Supported: the underlying type is int, long long, unsigned long or bool, which have an exact
-// DWARF trace value type (int32, int64, uint64, bool).
+// Supported: every integer underlying type. An enumeration travels as the carrier of its
+// underlying type (int32, int64, uint64, bool) and the wrapper declares it at its own width.
 enum Sign { Minus = -1, Plus = 1 };
 enum class Flag : bool { No, Yes };
 enum class Wide : long long { Low = -5, High = 1LL << 40 };
 enum class Big : unsigned long { Small = 1, Huge = 1UL << 63 };
-
-// Unsupported, with a diagnostic that names the enumeration: both compilers give it unsigned int
-// and the detour has no exact trace value type for that, and unsigned char is narrower than any.
+// Narrow and unsigned 32-bit: both compilers give Color the underlying type unsigned int.
 enum Color { Red, Green };
 enum class Narrow : unsigned char { Idle, Busy = 200 };
+enum class Tiny : short { Neg = -2, Pos = 3 };
 
 struct Order {
   enum class State { New, Paid };
@@ -54,6 +53,7 @@ NOINLINE int flag(Flag f) { return f == Flag::Yes ? 1 : 0; }
 NOINLINE int code(std::errc e) { return static_cast<int>(e); }
 NOINLINE Color paint(Color c) { return c == Red ? Green : Red; }
 NOINLINE Narrow narrow(Narrow n) { return n == Narrow::Idle ? Narrow::Busy : Narrow::Idle; }
+NOINLINE Tiny tiny(Tiny t) { return t == Tiny::Neg ? Tiny::Pos : Tiny::Neg; }
 // Unsupported: a pointer to a member function.
 NOINLINE int call(Order* order, int (Order::*function)(int)) { return (order->*function)(3); }
 
@@ -89,6 +89,16 @@ void run_once(int pass) {
   check(code(std::errc::invalid_argument) == 22, "code", pass);
   check(paint(Red) == Green, "paint", pass);
   check(narrow(Narrow::Idle) == Narrow::Busy, "narrow", pass);
+  check(tiny(Tiny::Neg) == Tiny::Pos, "tiny", pass);
+  // The same functions called as a caller may call them: only the low bytes of the argument
+  // register are the argument, and the rest is whatever the caller left there. A wrapper that
+  // declared the enumeration at the width of its carrier would read that junk.
+  check(reinterpret_cast<Color (*)(unsigned long)>(&paint)(0xDEADBEEF00000001UL) == Red,
+        "paint with junk", pass);
+  check(reinterpret_cast<Narrow (*)(unsigned long)>(&narrow)(0xDEADBEEFCAFEF0C8UL) == Narrow::Idle,
+        "narrow with junk", pass);
+  check(reinterpret_cast<Tiny (*)(unsigned long)>(&tiny)(0xFEDCBA987654FFFEUL) == Tiny::Pos,
+        "tiny with junk", pass);
   check(order.read(&Order::total) == 17, "read", pass);
   check(call(&order, &Order::plain) == 4, "call", pass);
 }

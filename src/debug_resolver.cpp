@@ -317,8 +317,10 @@ Type read_enumeration(DWARFDie d, unsigned depth) {
     // A builtin that read_type does not support has no carrier either.
   }
   Type t{enum_name, size, carrier, {}, false, d, {}};
-  // The ABI of the enumeration is the ABI of its underlying integer type, and the detour
-  // carries only these exactly: narrower and unsigned 32-bit integers are not exact. bool is.
+  // The ABI of the enumeration is the ABI of its underlying integer type. Every integer width has
+  // a carrier, and the wrapper declares the underlying type itself (not the carrier's), so a
+  // narrow or unsigned 32-bit enumeration is exact too. An underlying type without a carrier
+  // (a size that is not the LP64 size of its spelling, an unknown builtin) is rejected.
   if (carrier != api::INT32 && carrier != api::INT64 && carrier != api::UINT64 &&
       carrier != api::BOOL) {
     t.value = api::VALUE_TYPE_UNSPECIFIED;
@@ -383,6 +385,8 @@ Type read_type(DWARFDie d, unsigned depth) {
                                                   "signed char",
                                                   "unsigned char",
                                                   "wchar_t",
+                                                  "char16_t",
+                                                  "char32_t",
                                                   "short",
                                                   "short int",
                                                   "unsigned short",
@@ -403,7 +407,7 @@ Type read_type(DWARFDie d, unsigned depth) {
                                                   "float",
                                                   "double"};
   if (!supported.count(t.spelling)) {
-    throw std::runtime_error("unsupported debug builtin: " + t.spelling);
+    throw UnsupportedDebugType("unsupported debug builtin", t.spelling);
   }
   // GCC spells these DWARF builtins differently from Clang and the demangler.
   // Use one spelling in selectors and declarations without changing the ABI.
@@ -415,17 +419,31 @@ Type read_type(DWARFDie d, unsigned depth) {
       {"unsigned long long int", "unsigned long long"}};
   if (const auto found = builtin_names.find(t.spelling); found != builtin_names.end())
     t.spelling = found->second;
+  // The agent derives the wrapper type from the spelling, so a size other than the LP64 size of
+  // the spelled type is left without a trace value type instead of being traced at a wrong width.
+  static const std::map<std::string, std::uint64_t> lp64_sizes = {
+      {"bool", 1}, {"char", 1}, {"signed char", 1}, {"unsigned char", 1},
+      {"short", 2}, {"unsigned short", 2}, {"char16_t", 2},
+      {"int", 4}, {"unsigned int", 4}, {"char32_t", 4}, {"wchar_t", 4},
+      {"long", 8}, {"unsigned long", 8}, {"long long", 8}, {"unsigned long long", 8},
+      {"float", 4}, {"double", 8}};
+  if (const auto expected = lp64_sizes.find(t.spelling);
+      expected == lp64_sizes.end() || expected->second != t.size)
+    return t;
+  // Narrow integers use the carriers of the header-prepared route: signed up to 32 bits travel as
+  // int32, signed 64-bit as int64 and every unsigned width as uint64. The exact C++ type stays in
+  // the spelling.
   const auto enc = number(d, dw::DW_AT_encoding);
   if (enc == dw::DW_ATE_boolean && t.size == 1) {
     t.value = api::BOOL;
   }
-  if (enc == dw::DW_ATE_signed && t.size == 4) {
+  if ((enc == dw::DW_ATE_signed || enc == dw::DW_ATE_signed_char) && t.size <= 4) {
     t.value = api::INT32;
   }
-  if (enc == dw::DW_ATE_signed && t.size == 8) {
+  if ((enc == dw::DW_ATE_signed || enc == dw::DW_ATE_signed_char) && t.size == 8) {
     t.value = api::INT64;
   }
-  if (enc == dw::DW_ATE_unsigned && t.size == 8) {
+  if (enc == dw::DW_ATE_unsigned || enc == dw::DW_ATE_unsigned_char || enc == dw::DW_ATE_UTF) {
     t.value = api::UINT64;
   }
   if (enc == dw::DW_ATE_float && t.size == 4) {

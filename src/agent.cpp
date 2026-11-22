@@ -2289,6 +2289,10 @@ clang::QualType debug_builtin(clang::ASTContext &context,
     return context.UnsignedCharTy;
   if (type == "wchar_t")
     return context.WCharTy;
+  if (type == "char16_t")
+    return context.Char16Ty;
+  if (type == "char32_t")
+    return context.Char32Ty;
   if (type == "short" || type == "short int")
     return context.ShortTy;
   if (type == "unsigned short" || type == "unsigned short int")
@@ -2354,6 +2358,8 @@ bool matches_debug_type_chain(clang::QualType type, clang::ASTContext &context,
     case llvm::dwarf::DW_ATE_unsigned:
     case llvm::dwarf::DW_ATE_unsigned_char:
       return type->isUnsignedIntegerType() && !type->isBooleanType();
+    case llvm::dwarf::DW_ATE_UTF:
+      return type->isChar16Type() || type->isChar32Type();
     default:
       return false;
     }
@@ -4136,6 +4142,103 @@ const char *type_name(tracer::ValueType type) {
   }
 }
 
+// The C++ type a DWARF-described integer has in the generated wrapper, or an empty string when the
+// carrier's own type (`type_name`) already is the declared type. Narrow integers travel as int32 or
+// uint64, but the wrapper must declare them as the callee does: a `short` or `unsigned int`
+// parameter is passed and returned at its own width, and widening the prototype would change the
+// ABI. `char` and `wchar_t` take their signedness from the carrier, so a target built with
+// -funsigned-char still gets a matching wrapper.
+std::string narrow_integer_type(tracer::ValueType carrier, std::string cpp_type) {
+  for (bool stripped = true; stripped;) {
+    stripped = false;
+    for (const char *qualifier : {"const ", "volatile "}) {
+      const std::string prefix = qualifier;
+      if (::tracer::compat::starts_with(cpp_type, prefix)) {
+        cpp_type.erase(0, prefix.size());
+        stripped = true;
+      }
+    }
+    for (const char *qualifier : {" const", " volatile"}) {
+      const std::string suffix = qualifier;
+      if (::tracer::compat::ends_with(cpp_type, suffix)) {
+        cpp_type.erase(cpp_type.size() - suffix.size());
+        stripped = true;
+      }
+    }
+  }
+  struct Narrow {
+    const char *name;
+    std::size_t size;
+    bool is_signed;
+    bool plain; // The signedness is the target's choice.
+  };
+  static const Narrow narrow[] = {
+      {"char", 1, std::is_signed<char>::value, true},
+      {"signed char", 1, true, false},
+      {"unsigned char", 1, false, false},
+      {"short", 2, true, false},
+      {"unsigned short", 2, false, false},
+      {"unsigned int", 4, false, false},
+      {"char16_t", 2, false, false},
+      {"char32_t", 4, false, false},
+      {"wchar_t", sizeof(wchar_t), std::is_signed<wchar_t>::value, true}};
+  for (const auto &entry : narrow) {
+    if (cpp_type != entry.name)
+      continue;
+    if (carrier != tracer::ValueType::Int32 && carrier != tracer::ValueType::UInt64)
+      throw std::runtime_error("debug type '" + cpp_type +
+                               "' does not match its trace value type");
+    const bool carrier_signed = carrier == tracer::ValueType::Int32;
+    if (carrier_signed == entry.is_signed)
+      return entry.name;
+    if (!entry.plain)
+      throw std::runtime_error("debug type '" + cpp_type +
+                               "' does not match its trace value type");
+    static const char *const signed_names[] = {"signed char", "short", "int"};
+    static const char *const unsigned_names[] = {"unsigned char", "unsigned short", "unsigned int"};
+    const auto width = entry.size == 1 ? 0 : entry.size == 2 ? 1 : 2;
+    return carrier_signed ? signed_names[width] : unsigned_names[width];
+  }
+  return {};
+}
+
+// The C++ type an enumeration taken or returned by value has in the generated wrapper: the
+// integer type of its underlying type, at its own width and signedness, for the same reason as
+// narrow_integer_type (an enumeration over `unsigned char` is passed in a byte, not in a uint64).
+// The underlying type is taken from its size and DWARF encoding, not from its name: GCC spells
+// `unsigned short` as `short unsigned int`. The carrier must be the one that type travels as.
+std::string enum_integer_type(tracer::ValueType carrier,
+                              const clangtracer::v1::DebugTemplateType &enumeration) {
+  const auto size = enumeration.byte_size();
+  const auto encoding = enumeration.has_element() ? enumeration.element().dwarf_encoding() : 0;
+  const bool boolean = encoding == 0x02;                         // DW_ATE_boolean
+  const bool is_signed = encoding == 0x05 || encoding == 0x06;   // DW_ATE_signed, signed_char
+  const auto mismatch = [&]() {
+    return std::runtime_error("enumeration " + enumeration.name() +
+                              " does not match its trace value type");
+  };
+  if (enumeration.has_element() && enumeration.element().byte_size() != size)
+    throw mismatch();
+  if (boolean) {
+    if (carrier != tracer::ValueType::Bool || size != 1)
+      throw mismatch();
+    return "bool";
+  }
+  const bool carrier_ok =
+      is_signed ? (size == 8 ? carrier == tracer::ValueType::Int64
+                             : carrier == tracer::ValueType::Int32 && size <= 4)
+                : carrier == tracer::ValueType::UInt64;
+  if (!carrier_ok)
+    throw mismatch();
+  switch (size) {
+  case 1: return is_signed ? "signed char" : "unsigned char";
+  case 2: return is_signed ? "short" : "unsigned short";
+  case 4: return is_signed ? "int" : "unsigned int";
+  case 8: return type_name(carrier);
+  default: throw mismatch();
+  }
+}
+
 void fill_value(std::string &code, unsigned i, tracer::ValueType type,
                 bool indirect_object) {
   code += "ctx.arguments[" + std::to_string(i) +
@@ -4593,8 +4696,17 @@ std::string make_wrapper(const tracer::Request &r,
   const auto result_type = [&]() -> std::string {
     if (typed && r.result != tracer::ValueType::Pointer)
       return "tracer::ResolvedResult";
-    if (r.result != tracer::ValueType::Object)
+    if (r.result != tracer::ValueType::Object) {
+      if (spec && spec->has_debug_info()) {
+        if (spec->debug_info().has_result_enum_type() &&
+            r.result != tracer::ValueType::Pointer && r.result != tracer::ValueType::Void)
+          return enum_integer_type(r.result, spec->debug_info().result_enum_type());
+        if (auto narrow = narrow_integer_type(r.result, spec->debug_info().result_cpp_type());
+            !narrow.empty())
+          return narrow;
+      }
       return type_name(r.result);
+    }
     if (!spec || spec->debug_info().result_cpp_type().empty())
       throw std::runtime_error("missing object result ABI metadata");
     return spec->debug_info().result_cpp_type();
@@ -4604,8 +4716,18 @@ std::string make_wrapper(const tracer::Request &r,
       return "void*";
     if (typed && r.arguments[i] != tracer::ValueType::Pointer)
       return "tracer::ResolvedArgument<" + std::to_string(i) + ">";
-    if (r.arguments[i] != tracer::ValueType::Object)
+    if (r.arguments[i] != tracer::ValueType::Object) {
+      if (spec && spec->has_debug_info() &&
+          i < static_cast<unsigned>(spec->debug_info().arguments_size())) {
+        const auto &argument = spec->debug_info().arguments(i);
+        if (argument.has_enum_type() && r.arguments[i] != tracer::ValueType::Pointer)
+          return enum_integer_type(r.arguments[i], argument.enum_type());
+        if (auto narrow = narrow_integer_type(r.arguments[i], argument.cpp_type());
+            !narrow.empty())
+          return narrow;
+      }
       return type_name(r.arguments[i]);
+    }
     if (!spec || i >= static_cast<unsigned>(spec->debug_info().arguments_size()))
       throw std::runtime_error("missing object argument ABI metadata");
     const auto &argument = spec->debug_info().arguments(i);
@@ -4814,6 +4936,12 @@ std::string make_wrapper(const tracer::Request &r,
             "try { ";
     if (r.result == tracer::ValueType::Void)
       code += call + "; ";
+    else if (r.result == tracer::ValueType::Int32 || r.result == tracer::ValueType::Int64 ||
+             r.result == tracer::ValueType::UInt64)
+      // The callback reads the original's result at the carrier's width, so a narrow result is
+      // extended by its own signedness before it is stored.
+      code += std::string("original_bits=tracer::ScalarOverrides::pack(static_cast<") +
+              type_name(r.result) + ">(" + call + ")); ";
     else
       code += "original_bits=tracer::ScalarOverrides::pack(" + call + "); ";
     code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } "

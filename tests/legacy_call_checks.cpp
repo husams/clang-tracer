@@ -1,5 +1,6 @@
 #include "tracer/callback.hpp"
 #include <cassert>
+#include <stdexcept>
 
 int main() {
   // Standalone legacy users do not have generated ResultType specializations.
@@ -43,4 +44,47 @@ int main() {
   call.field(long_name.c_str(), 42);
   assert(std::string(named.values.back().name) == long_name);
   assert(std::string(call.argument_name(39)) == "arg39");
+
+  // Narrow integers are decoded from their carriers: signed up to 32 bits from int32 and unsigned
+  // of every width from uint64. A value the requested type cannot hold is reported.
+  arguments[0].type = tracer::ValueType::Int32;
+  arguments[0].signed_value = -128;
+  assert(call.arg<signed char>(0) == -128);
+  arguments[0].signed_value = -3;
+  assert(call.arg<short>(0) == -3);
+  arguments[0].signed_value = 70000;
+  assert(call.arg<int>(0) == 70000);
+  bool out_of_range = false;
+  try {
+    (void)call.arg<short>(0);
+  } catch (const std::out_of_range &) {
+    out_of_range = true;
+  }
+  assert(out_of_range);
+  arguments[1].type = tracer::ValueType::UInt64;
+  arguments[1].unsigned_value = 250;
+  assert(call.arg<unsigned char>(1) == 250);
+  arguments[1].unsigned_value = 65535;
+  assert(call.arg<unsigned short>(1) == 65535);
+  arguments[1].unsigned_value = 0xFFFE;
+  assert(call.arg<char16_t>(1) == u'\xFFFE');
+  arguments[1].unsigned_value = 0x10FFFF;
+  assert(call.arg<char32_t>(1) == U'\x10FFFF');
+  arguments[1].unsigned_value = 4000000000u;
+  assert(call.arg<unsigned int>(1) == 4000000000u);
+  assert(call.arg<unsigned long>(1) == 4000000000ul);
+  out_of_range = false;
+  try {
+    (void)call.arg<unsigned short>(1);
+  } catch (const std::out_of_range &) {
+    out_of_range = true;
+  }
+  assert(out_of_range);
+  bool mismatch = false;
+  try {
+    (void)call.arg<unsigned char>(0); // An int32 slot is not an unsigned one.
+  } catch (const std::invalid_argument &) {
+    mismatch = true;
+  }
+  assert(mismatch);
 }

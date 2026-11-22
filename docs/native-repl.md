@@ -1567,9 +1567,13 @@ from DWARF like the template-argument enumerations above: its qualified name, `e
 `enum`, and underlying type, without enumerators, at namespace scope or inside the class it is
 nested in. An enumeration nested in the receiver's class is declared inside that class, which is
 still one recovered class. A by-value enumeration is captured through the carrier of its
-underlying type: `int` (int32), `long`/`long long` (int64), `unsigned long`/`unsigned long long`
-(uint64) or `bool`. An `Interceptor<Signature>` must name the same enumeration; `int` in its
-place is rejected.
+underlying type, as the integer type is (see
+[Narrow integers in DWARF signatures](#narrow-integers-in-dwarf-signatures)): a signed type up to
+32 bits as int32, a signed 64-bit type as int64, an unsigned type of any width as uint64, and
+`bool` as bool. The generated wrapper declares the enumeration at the width of its underlying
+type (an enumeration over `unsigned char` is a byte, over `unsigned int` four bytes), not at the
+carrier's, so the call keeps the target's ABI. An `Interceptor<Signature>` must name the same
+enumeration; `int` in its place is rejected.
 
 A standard-library enumeration (`std::errc`, `std::launch`, `std::ios_base::fmtflags`,
 `std::memory_order`, ...) is not rebuilt: on the automatic route its real header is chosen from
@@ -1582,14 +1586,14 @@ the error names it and says which header to add, instead of reporting that the `
 argument is not a function signature.
 
 The table lists what is supported and what is not. A rejected type gets a message that names it,
-its role and its callable (`unsupported debug enumeration enums::Color for the result of
-enums::paint: underlying type unsigned int (4 bytes) has no exact DWARF trace value type`), and the callable
-previews as `UNSUPPORTED`:
+its role and its callable (`unsupported debug type for parameter 0 'field' of shop::Order::read:
+pointer to data member int shop::Order::* (DW_TAG_ptr_to_member_type); member pointers are not
+supported`), and the callable previews as `UNSUPPORTED`:
 
 | Type | Result |
 |---|---|
-| An enumeration over `int`, `long`, `long long`, `unsigned long`, `unsigned long long` or `bool` | supported by value, pointer and reference |
-| An enumeration by value over any other underlying type (`unsigned int`, `unsigned char`, `short`) | rejected: no exact trace value type (the same gap as the integer types of the same width); behind a pointer or reference it is still declared |
+| An enumeration over any integer type of the previous section (`int`, `long`, `long long`, `short`, `unsigned char`, `unsigned int`, `unsigned long`, `char16_t`, `bool`, ...) | supported by value, pointer and reference |
+| An enumeration whose underlying type has no carrier (a size that is not the LP64 size of its spelling, an unsupported builtin) | rejected by value: `underlying type X (N bytes) has no exact DWARF trace value type`; behind a pointer or reference it is still declared |
 | An enumeration without a name, in an anonymous namespace, in an unnamed class, in a function, in a class template specialization, or whose underlying type DWARF does not record | rejected with the reason |
 | A pointer to a data member or to a member function | rejected: `pointer to data member int shop::Order::*` or `pointer to member function int (shop::Order::*)(int)` |
 
@@ -1644,6 +1648,33 @@ from. They are not part of an entry's ABI contract: two definitions of one funct
 compared without them, as are the discovery commands. On the wire they are optional fields, but
 a server and an agent must still come from the same build, as for any change to `DebugInfo`:
 the agent resolves the callable again and compares its whole description with the server's.
+
+### Narrow integers in DWARF signatures
+
+A callable resolved from DWARF can take and return `char`, `signed char`, `unsigned char`,
+`short`, `unsigned short`, `unsigned int`, `wchar_t`, `char16_t` and `char32_t`, besides `bool`,
+`int`, `long`, `long long`, their unsigned forms, `float` and `double`. A typedef or a by-value
+`const` of one of them is the type it names. The probe keeps the declared type: the generated
+wrapper takes and returns `unsigned char` or `short`, not a wider integer, so the call keeps the
+target's ABI, and `%probe resolve` shows it in `cpp_type` and `result_cpp_type`.
+
+The value is carried as the header-prepared route carries it: a signed type up to 32 bits as
+`int32`, a signed 64-bit type as `int64`, and an unsigned type of any width as `uint64`.
+`call.arg<T>(index)`, `call.result<T>()`, `call.argument<N>()` and `call.result()` take the
+declared type, so `call.arg<unsigned char>(0)` and `Interceptor<unsigned char(unsigned char)>`
+validate, while `Interceptor<int(int)>` for the same function does not. A type that cannot hold
+the carried value, `call.arg<short>(0)` on an `int` slot holding 70000, throws instead of
+truncating. Events show signed values as `signedValue` and unsigned ones as `unsignedValue`.
+
+An override writes through the carrier: `call.override_argument<int>(0, -300)` for a `short`
+parameter, `call.override_result<unsigned long>(250)` for an `unsigned char` result, and the
+same for `replace_with` and `call_original`. The function receives the low bytes in its own
+type; `call_original<int>()` returns a `short` result with its sign.
+
+`long double`, `__int128`, `char8_t`, bit-precise integers and a size that is not the LP64 size
+of the spelled type are not supported. The message names the type and its role, for example
+`unsupported debug builtin for parameter 0 'x' of gaps::f_i128: __int128` or
+`unsupported debug builtin for the result of gaps::f_ldouble: long double`.
 
 ### Probe working directory
 
@@ -1766,8 +1797,12 @@ Each flag enables only its corresponding hook operation. Overrides require a
 local Unix control socket and a DWARF binding. Use `--prepared-mode off` if a
 prepared package would otherwise be selected. Supported values are `bool`,
 signed 32- and 64-bit integers, unsigned 64-bit integers, `float`, and
-`double`. Match the slot's type and width exactly. A `void` function can use
-argument overrides.
+`double`. Match the slot's type and width exactly. A slot of a narrower integer
+type (`short`, `unsigned char`, `unsigned int`, ...) is written and read through
+its carrier, `int` for a signed type and `unsigned long` for an unsigned one,
+and the function receives it as its own type (see
+[Narrow integers in DWARF signatures](#narrow-integers-in-dwarf-signatures)).
+A `void` function can use argument overrides.
 
 The original function runs with the committed arguments. An escaping hook
 exception discards its staged writes. An exception from the original function

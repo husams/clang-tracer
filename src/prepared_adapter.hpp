@@ -6,6 +6,7 @@
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/PrettyPrinter.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/ADT/StringExtras.h>
@@ -29,7 +30,7 @@ struct AdapterDeclarations {
   std::set<std::string> standard_headers;
 };
 
-class AdapterEmitter {
+class AdapterEmitter : private clang::PrintingCallbacks {
 public:
   static AdapterDeclarations emit(clang::ASTContext &ast, clang::Sema &sema,
                                   const clang::HeaderSearch &toolchain_search,
@@ -65,6 +66,14 @@ private:
         header_discovery_(ast, toolchain_search), late_requests_(late_requests) {
     policy_.SuppressTagKeyword = true;
     policy_.FullyQualifiedName = true;
+    policy_.Callbacks = this;
+  }
+
+  // The typedef that names an unnamed record is declared after the record's members, so
+  // a member cannot qualify a name with it. Inside the record its members are in scope.
+  bool isScopeVisible(const clang::DeclContext *scope) const override {
+    const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(scope);
+    return record && !record->getIdentifier() && emitting_.count(record->getCanonicalDecl());
   }
 
   void emit_declarations(const clang::FunctionDecl &function,
@@ -172,7 +181,7 @@ private:
     const auto argument_name = [](unsigned index) {
       return "__tracer_ctor_arg" + std::to_string(index);
     };
-    std::string source = access(ctor.getAccess()) + ": ";
+    std::string source;
     if (ctor.isExplicit())
       source += "explicit ";
     source += ctor.getParent()->getNameAsString() + "(";
@@ -342,12 +351,41 @@ private:
     return name == "tracer_snapshot::FollowPointers" || name == "tracer_snapshot::AnyPayloads";
   }
 
+  // The name a tag has for linkage: its own, or the typedef name an unnamed tag takes.
+  // Empty when the tag has neither.
+  static std::string linkage_name(const clang::TagDecl &tag) {
+    if (tag.getIdentifier())
+      return tag.getNameAsString();
+    const auto *alias = tag.getTypedefNameForAnonDecl();
+    return alias ? alias->getNameAsString() : std::string();
+  }
+
+  static bool names_tag_for_linkage(const clang::TypedefNameDecl &alias) {
+    const auto *tag = alias.getUnderlyingType()->getAsTagDecl();
+    const auto *name = tag && !tag->getIdentifier() ? tag->getTypedefNameForAnonDecl() : nullptr;
+    return name && name->getCanonicalDecl() == alias.getCanonicalDecl();
+  }
+
+  // An unnamed record has no forward declaration: the typedef that names it for linkage
+  // declares it, complete, in one declaration. Without that typedef nothing outside the
+  // record's own declaration can name it.
+  static const clang::CXXRecordDecl &unnamed_definition(const clang::CXXRecordDecl &record) {
+    const auto *definition = record.getDefinition();
+    if (!definition || !record.getTypedefNameForAnonDecl())
+      unsupported(record, ("an unnamed " + std::string(record.getKindName()) +
+                           " without a typedef name for linkage is unsupported").c_str());
+    return *definition;
+  }
+
   void emit_alias(const clang::TypedefNameDecl &alias) {
     if (alias.isInStdNamespace() || ast_.getSourceManager().isInSystemHeader(alias.getLocation()) ||
         emitted_.count(alias.getCanonicalDecl()) || defer_to_owner(alias))
       return;
     emitted_.insert(alias.getCanonicalDecl());
     visit(alias.getUnderlyingType());
+    // The typedef that names an unnamed tag for linkage is emitted with the tag's definition.
+    if (names_tag_for_linkage(alias))
+      return;
     const auto declaration = "using " + alias.getNameAsString() + " = " +
                              spelling(alias.getUnderlyingType()) + ";\n";
     place_declaration(alias, declaration);
@@ -361,21 +399,25 @@ private:
     if (enumeration.isInStdNamespace())
       unsupported(enumeration, "cannot resolve a public toolchain header");
     const auto *decl = enumeration.getDefinition();
-    if (!decl || (!allow_anonymous && !decl->getIdentifier()))
+    const auto name = decl ? linkage_name(*decl) : std::string();
+    if (!decl || (!allow_anonymous && name.empty()))
       unsupported(enumeration, "enumeration requires a named definition");
     if (emitted_.count(decl->getCanonicalDecl()) || defer_to_owner(*decl))
       return;
     emitted_.insert(decl->getCanonicalDecl());
-    std::string source = decl->isScoped() ? "enum class " : "enum ";
+    // An unnamed enumeration that a typedef names is declared through that typedef.
+    const bool by_typedef = !decl->getIdentifier() && !name.empty();
+    std::string source = by_typedef ? "typedef " : "";
+    source += decl->isScoped() ? "enum class " : "enum ";
     if (decl->getIdentifier())
-      source += decl->getNameAsString() + " ";
+      source += name + " ";
     source += ": " + spelling(decl->getIntegerType()) + " {\n";
     for (const auto *value : decl->enumerators()) {
       llvm::SmallString<32> number;
       value->getInitVal().toString(number, 10);
       source += value->getNameAsString() + " = " + number.str().str() + ",\n";
     }
-    place_declaration(*decl, source + "};\n");
+    place_declaration(*decl, source + (by_typedef ? "} " + name + ";\n" : "};\n"));
   }
 
   void emit_constant(const clang::VarDecl &constant) {
@@ -402,7 +444,7 @@ private:
 
   void place_declaration(const clang::NamedDecl &decl, std::string source) {
     if (const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext()))
-      nested_declarations_[owner->getCanonicalDecl()].push_back("public: " + std::move(source));
+      nested_declarations_[owner->getCanonicalDecl()].push_back(std::move(source));
     else
       declarations_ += in_namespace(decl, std::move(source));
   }
@@ -589,8 +631,13 @@ private:
   }
 
   void forward(const clang::CXXRecordDecl &record) {
-    if (!record.getIdentifier() || record.isDependentType())
+    if (record.isDependentType())
       unsupported(record, "requires a named concrete declaration");
+    if (!record.getIdentifier()) {
+      // A use that needs only a declaration gets the definition.
+      emit_record(unnamed_definition(record));
+      return;
+    }
     // A nested name can only be declared inside its owner. Its complete
     // declaration is queued there by emit_record instead.
     if (const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(record.getDeclContext())) {
@@ -601,7 +648,7 @@ private:
       const auto *owner_id = owner->getCanonicalDecl();
       if (emitted_.count(owner_id) && !emitting_.count(owner_id))
         remember_late_nested(record, /*complete=*/false);
-      nested_declarations_[owner_id].push_back("public: " +
+      nested_declarations_[owner_id].push_back(
           std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
       ensure_nested_owner(*owner, record);
       return;
@@ -620,6 +667,16 @@ private:
     } else {
       forwards_ += in_namespace(record,
           std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
+    }
+  }
+
+  static bool within_unnamed_record(const clang::CXXRecordDecl &record) {
+    for (const clang::DeclContext *scope = &record;; scope = scope->getParent()) {
+      const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(scope);
+      if (!owner)
+        return false;
+      if (!owner->getIdentifier())
+        return true;
     }
   }
 
@@ -644,18 +701,26 @@ private:
     const auto *identity = record.getCanonicalDecl();
     if (emitted_.count(identity) || defer_to_owner(record))
       return;
-    forward(record);
+    const bool unnamed = !record.getIdentifier();
+    if (unnamed)
+      unnamed_definition(record);
+    else
+      forward(record);
     if (!emitted_.insert(identity).second)
       return;
     emitting_.insert(identity);
     if (record.isUnion())
       unsupported(record, "union layout requires an explicit adapter");
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
-    std::string source = specialization_prefix(record) + std::string(record.getKindName()) + " alignas(" +
+    std::string source = specialization_prefix(record) + (unnamed ? "typedef " : "") +
+                         std::string(record.getKindName()) + " alignas(" +
                          std::to_string(alignment) + ") ";
     if (record.hasAttr<clang::PackedAttr>())
       source += "__attribute__((packed)) ";
-    source += record_name(record);
+    if (unnamed)
+      source.pop_back();
+    else
+      source += record_name(record);
     if (record.hasAttr<clang::FinalAttr>())
       source += " final";
     bool first = true;
@@ -667,7 +732,7 @@ private:
       first = false;
     }
     source += " {\n";
-    const auto body = source.size();
+    std::vector<std::pair<clang::AccessSpecifier, std::string>> members;
     const auto &sm = ast_.getSourceManager();
     const bool extra_header =
         extra_headers_.count(sm.getFilename(sm.getExpansionLoc(record.getLocation())).str()) != 0;
@@ -688,19 +753,19 @@ private:
     }
     for (const auto *field : record.fields()) {
       visit(field->getType());
-      source += access(field->getAccess()) + ": ";
+      std::string member;
       if (field->hasAttr<clang::NoUniqueAddressAttr>())
-        source += "[[no_unique_address]] ";
+        member += "[[no_unique_address]] ";
       if (field->hasAttr<clang::PackedAttr>())
-        source += "__attribute__((packed)) ";
+        member += "__attribute__((packed)) ";
       if (const auto alignment = field->getMaxAlignment())
-        source += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
+        member += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
       if (field->isMutable())
-        source += "mutable ";
-      source += spelling(field->getType(), field->getName());
+        member += "mutable ";
+      member += spelling(field->getType(), field->getName());
       if (field->isBitField())
-        source += " : " + std::to_string(field->getBitWidthValue());
-      source += ";\n";
+        member += " : " + std::to_string(field->getBitWidthValue());
+      members.emplace_back(field->getAccess(), member + ";\n");
     }
     bool emitted_selected = false;
     bool emitted_default_constructor = false;
@@ -711,7 +776,7 @@ private:
         const bool selected = selected_method_ &&
             method->getCanonicalDecl() == selected_method_->getCanonicalDecl();
         visit_signature(*method, selected);
-        source += access(method->getAccess()) + ": " + callable(*method, selected);
+        members.emplace_back(method->getAccess(), callable(*method, selected));
         emitted_selected |= selected;
         continue;
       }
@@ -720,7 +785,7 @@ private:
         auto declaration = callable(*method);
         if (method->isExplicitlyDefaulted() && !method->isDeletedAsWritten())
           declaration.insert(declaration.rfind(';'), " = default");
-        source += access(method->getAccess()) + ": " + declaration;
+        members.emplace_back(method->getAccess(), std::move(declaration));
         continue;
       }
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);
@@ -730,51 +795,64 @@ private:
           (!custom && !method->isExplicitlyDefaulted() && !method->isDeletedAsWritten()))
         continue;
       emitted_default_constructor |= ctor && ctor->getNumParams() == 0;
-      source += access(method->getAccess()) + ": ";
-      if (destructor)
-        source += "~";
-      source += record.getNameAsString() + "(";
+      std::string member = destructor ? "~" : "";
+      member += record.getNameAsString() + "(";
       // A copy or move constructor can have trailing default arguments.
       // Only its first parameter is needed to retain its special-member role.
       const auto parameters = custom && ctor ? 1U : method->getNumParams();
       for (unsigned i = 0; i < parameters; ++i) {
         if (i)
-          source += ", ";
-        source += spelling(method->getParamDecl(i)->getType());
+          member += ", ";
+        member += spelling(method->getParamDecl(i)->getType());
       }
-      source += ")";
+      member += ")";
       if (custom) {
         // Keep the call ABI without compiling application lifetime code.
-        source += exception_suffix(*method);
+        member += exception_suffix(*method);
       } else {
-        source += method->isDeletedAsWritten() ? " = delete" : " = default";
+        member += method->isDeletedAsWritten() ? " = delete" : " = default";
       }
       // This lifetime declaration already is the selected constructor or destructor.
       emitted_selected |= selected_method_ &&
           method->getCanonicalDecl() == selected_method_->getCanonicalDecl();
-      source += ";\n";
+      members.emplace_back(method->getAccess(), member + ";\n");
     }
     if (const auto recipe = record_factory::infer(record)) {
-      source += emit_factory_constructor(*recipe);
+      members.emplace_back(recipe->constructor->getAccess(), emit_factory_constructor(*recipe));
     } else if (record.hasUserDeclaredConstructor() && !emitted_default_constructor &&
                (!record.hasDefaultConstructor() || record.isDynamicClass() || record.getNumBases())) {
       // Dropping application constructor bodies must not give a layout-only
       // adapter an implicit constructor for local snapshot reconstruction.
-      source += "private: " + record.getNameAsString() + "() = delete;\n";
+      members.emplace_back(clang::AS_private, record.getNameAsString() + "() = delete;\n");
     }
     if (!emitted_selected && selected_method_ &&
         selected_method_->getParent()->getCanonicalDecl() == record.getCanonicalDecl() &&
         !nested_static_method(selected_method_)) {
       visit_signature(*selected_method_);
-      source += "public: " + callable(*selected_method_);
+      members.emplace_back(clang::AS_public, callable(*selected_method_));
     }
-    source.insert(body, take_nested_declarations(identity));
+    // A typedef may name an unnamed class for linkage only when the class is C-compatible,
+    // and an access specifier is a member declaration that makes it otherwise. Inside such
+    // a record a specifier is therefore written only where the access changes.
+    const bool plain = within_unnamed_record(record);
+    auto current = record.isClass() ? clang::AS_private : clang::AS_public;
+    const auto add = [&](clang::AccessSpecifier wanted, const std::string &member) {
+      if (!plain || wanted != current)
+        source += access(wanted) + ": ";
+      current = wanted;
+      source += member;
+    };
+    for (const auto &nested : take_nested_declarations(identity))
+      add(clang::AS_public, nested);
+    for (const auto &[wanted, member] : members)
+      add(wanted, member);
     emitting_.erase(identity);
-    place_declaration(record, source + "};\n");
+    place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
   }
 
-  std::string take_nested_declarations(const clang::CXXRecordDecl *owner) {
-    std::string source;
+  // The declarations queued for `owner`, each one a public member.
+  std::vector<std::string> take_nested_declarations(const clang::CXXRecordDecl *owner) {
+    std::vector<std::string> source;
     for (auto found = nested_declarations_.find(owner); found != nested_declarations_.end();
          found = nested_declarations_.find(owner)) {
       auto pending = std::move(found->second);
@@ -793,7 +871,7 @@ private:
           else
             emit_enum(*llvm::cast<clang::EnumDecl>(declaration), /*allow_anonymous=*/true);
         } else {
-          source += std::get<std::string>(entry);
+          source.push_back(std::get<std::string>(entry));
         }
       }
     }

@@ -435,23 +435,30 @@ private:
     } else if constexpr (std::is_same_v<U, double>) {
       require_type(value, ValueType::Float64);
       return static_cast<T>(value.real_value);
-    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> &&
-                         sizeof(U) == 4) {
+    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> && sizeof(U) <= 4) {
+      // Signed integers up to 32 bits travel as int32; a narrower type must be able to hold it.
       require_type(value, ValueType::Int32);
-      return static_cast<T>(value.signed_value);
-    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> &&
-                         sizeof(U) == 8) {
+      return narrow<T>(value.signed_value);
+    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> && sizeof(U) == 8) {
       require_type(value, ValueType::Int64);
       return static_cast<T>(value.signed_value);
-    } else if constexpr (std::is_integral_v<U> && std::is_unsigned_v<U> &&
-                         sizeof(U) == 8) {
+    } else if constexpr (std::is_integral_v<U> && std::is_unsigned_v<U> && sizeof(U) <= 8) {
+      // Unsigned integers of every width travel as uint64.
       require_type(value, ValueType::UInt64);
-      return static_cast<T>(value.unsigned_value);
+      return narrow<T>(value.unsigned_value);
     } else {
-      static_assert(kUnsupportedType<T>, "Call values support signed 32/64-bit "
-                                         "integers, unsigned 64-bit integers, "
-                                         "float, double, and pointers only");
+      static_assert(kUnsupportedType<T>, "Call values support integers up to 64 bits, float, "
+                                         "double, bool, enumerations, and pointers only");
     }
+  }
+
+  // Converts a carried value to the declared type; a value the type cannot hold is reported
+  // instead of being truncated.
+  template <class T, class V> static T narrow(V value) {
+    const T converted = static_cast<T>(value);
+    if (static_cast<V>(converted) != value)
+      throw std::out_of_range("callback value does not fit the requested type");
+    return converted;
   }
 
   const TraceContext &context_;

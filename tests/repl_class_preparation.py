@@ -1,7 +1,9 @@
 """Prepare, install and observe callables whose records are passed or returned by value.
 
 The callables are selected by ELF symbol (explicit signature) or by index entry, and their
-types come from a supplied type context: a header that only defines the types. The target is
+types come from a supplied type context: a header that only defines the types. Records and
+enumerations that only a typedef names are also prepared from the header that declares the
+callables. The target is
 checked against its own untraced behaviour, including the copies and destructions of a
 nontrivial class, so a probe that perturbs a by-value object makes it exit.
 """
@@ -19,7 +21,15 @@ struct Result { long a, b, c; };
 namespace extra {
 struct Plain { int value; };
 class Session { public: int id; };
+// Unnamed types that only a typedef names, at namespace scope and inside a class, and a
+// named record inside an unnamed one.
 typedef struct { int x, y; } Point;
+typedef enum { Red, Green = 5 } Color;
+typedef struct { struct Inner { int v; } inner; int k; } Holder;
+struct Frame { typedef struct { int a; } Slot; Slot slot; int tail; };
+// Unnamed types the adapter cannot declare.
+struct Wrap { struct { int a; } inner; int b; };
+typedef union { int i; float f; } Either;
 struct Mix16 { long id; double scale; };
 struct Duo { double scale; double bias; };
 struct Large { long a, b, c, d, e; };
@@ -39,6 +49,13 @@ API = """#pragma once
 int take_result(Result value);
 namespace extra {
 int area(Point value);
+Point make_point(int n);
+int shade(Color color);
+int take_holder(Holder value);
+int take_inner(Holder::Inner value);
+int take_slot(Frame::Slot value);
+int take_wrap(Wrap value);
+int take_either(Either value);
 Plain make_for(Session* session);
 int mixed(const std::string& text, const Outer::Inner* inner, const Box<Plain>& box, Plain value);
 Plain make_plain(int n);
@@ -115,6 +132,13 @@ __attribute__((noinline)) int take_result(Result value) { return static_cast<int
 namespace extra {
 namespace { int live = 0, copies = 0; }
 __attribute__((noinline)) int area(Point value) { return value.x * value.y; }
+__attribute__((noinline)) Point make_point(int n) { return {n, n + 1}; }
+__attribute__((noinline)) int shade(Color color) { return color + 1; }
+__attribute__((noinline)) int take_holder(Holder value) { return value.inner.v + value.k; }
+__attribute__((noinline)) int take_inner(Holder::Inner value) { return value.v; }
+__attribute__((noinline)) int take_slot(Frame::Slot value) { return value.a; }
+__attribute__((noinline)) int take_wrap(Wrap value) { return value.inner.a + value.b; }
+__attribute__((noinline)) int take_either(Either value) { return value.i; }
 __attribute__((noinline)) Plain make_for(Session* session) { return {session->id}; }
 __attribute__((noinline)) int mixed(const std::string& text, const Outer::Inner* inner,
                                     const Box<Plain>& box, Plain value) {
@@ -191,6 +215,13 @@ int main() {
         if (extra::tagged(3) != 5 || extra::multi(3) != 6) return 10;
         if (take_result(Result{1, 2, 3}) != 4) return 13;
         if (extra::area(extra::Point{2, 5}) != 10) return 14;
+        extra::Point point = extra::make_point(7);
+        if (point.x != 7 || point.y != 8) return 15;
+        if (extra::shade(extra::Green) != 6) return 16;
+        extra::Holder holder{{21}, 3};
+        if (extra::take_holder(holder) != 24 || extra::take_inner(holder.inner) != 21) return 17;
+        extra::Frame frame{{11}, 4};
+        if (extra::take_slot(frame.slot) != 11) return 18;
         usleep(10000);
     }
 }
@@ -217,6 +248,18 @@ ROUTES = {
     "count_label": ("extra::count_label(std::__cxx11::basic_string<char, std::char_traits<char>, "
                     "std::allocator<char> >)", "int(std::string)"),
     "take_result": ("take_result(Result)", "int(Result)"),
+    "area": ("extra::area(extra::Point)", "int(extra::Point)"),
+    "make_point": ("extra::make_point(int)", "extra::Point(int)"),
+    "shade": ("extra::shade(extra::Color)", "int(extra::Color)"),
+    "take_holder": ("extra::take_holder(extra::Holder)", "int(extra::Holder)"),
+}
+
+# Callables prepared from the header that declares them.
+HEADER = {
+    "area": "extra::area(extra::Point)",
+    "make_point": "extra::make_point(int)",
+    "holder_inner": "extra::take_inner(extra::Holder::Inner)",
+    "take_slot": "extra::take_slot(extra::Frame::Slot)",
 }
 
 # What each observed call must show, checked on both PRE-independent POST events.
@@ -252,6 +295,19 @@ BODIES = {
     "take_result": 'if (e.result_as<int>() != 4 || e.argument_snapshot(0).field("c").as<long long>() != 3) '
                    'throw std::runtime_error("take_result");',
     "tagged": 'if (e.result_as<int>() != 5) throw std::runtime_error("tagged");',
+    "area": 'const auto a = e.argument_snapshot(0); if (e.result_as<int>() != 10 || '
+            'a.field("x").as<int>() != 2 || a.field("y").as<int>() != 5) '
+            'throw std::runtime_error("area");',
+    "make_point": 'const auto r = e.result_snapshot(); if (r.field("x").as<int>() != 7 || '
+                  'r.field("y").as<int>() != 8) throw std::runtime_error("make_point");',
+    "shade": 'if (e.result_as<int>() != 6) throw std::runtime_error("shade");',
+    "take_holder": 'const auto a = e.argument_snapshot(0); if (e.result_as<int>() != 24 || '
+                   'a.field("inner").field("v").as<int>() != 21 || a.field("k").as<int>() != 3) '
+                   'throw std::runtime_error("take_holder");',
+    "holder_inner": 'if (e.result_as<int>() != 21 || e.argument_snapshot(0).field("v").as<int>() != 21) '
+                    'throw std::runtime_error("holder_inner");',
+    "take_slot": 'if (e.result_as<int>() != 11 || e.argument_snapshot(0).field("a").as<int>() != 11) '
+                 'throw std::runtime_error("take_slot");',
 }
 
 
@@ -331,6 +387,15 @@ def main():
              "--module ./libclassprep.so --output pkg/long\n",
              expected_error="at most 511 bytes")
         assert not (root / "pkg/long").exists()
+        # Unnamed types that no declaration outside their own can name are reported as such.
+        repl('%probe prepare "extra::take_wrap(extra::Wrap)" --signature "int(extra::Wrap)" '
+             f"--module ./libclassprep.so {context} --output pkg/unnamed_member\n",
+             expected_error="an unnamed struct without a typedef name for linkage is unsupported")
+        repl('%probe prepare "extra::take_either(extra::Either)" --signature "int(extra::Either)" '
+             f"--module ./libclassprep.so {context} --output pkg/unnamed_union\n",
+             expected_error="cannot prepare standalone type 'extra::Either': union layout")
+        assert not (root / "pkg/unnamed_member").exists()
+        assert not (root / "pkg/unnamed_union").exists()
         # A mismatched parameter list is still caught against the ELF symbol.
         repl('%probe prepare "extra::take_plain(extra::Plain)" --signature "int(extra::Plain, int)" '
              f"--module ./libclassprep.so {context} --output pkg/arity\n",
@@ -395,11 +460,6 @@ def main():
              "--include types.hpp --compdb compile_commands_strict.json "
              "--translation-unit module.cpp --output pkg/strict\n%quit\n")
         assert (root / "pkg/strict/prepared.pb").is_file()
-        # An unnamed struct is spelled by its typedef name, so the failure is about the type the
-        # adapter cannot name, not about missing headers.
-        repl(f'%probe prepare "extra::area(extra::Point)" --module-index {index} {context} '
-             "--output pkg/unnamed\n", expected_error="requires a named concrete declaration")
-        assert not (root / "pkg/unnamed").exists()
         # A type context whose header does not compile reports the header, not one of the types.
         (root / "broken.hpp").write_text('#pragma once\n#include "does_not_exist.hpp"\n')
         repl(f'%probe prepare "extra::make_plain(int)" --module-index {index} '
@@ -414,6 +474,16 @@ def main():
              "--include reserved.hpp --compdb compile_commands.json --translation-unit module.cpp "
              "--output pkg/reserved\n", expected_error="declares '::TracerProbeResult'")
         assert not (root / "pkg/no_header").exists() and not (root / "pkg/reserved").exists()
+
+        # The header that declares the callables prepares them too.
+        repl("".join(
+            f'%probe prepare "{selector}" --include api.hpp --compdb compile_commands.json '
+            f"--translation-unit module.cpp --module ./libclassprep.so --output pkg/header_{name}\n"
+            for name, selector in HEADER.items()) + "%quit\n")
+        assert all((root / f"pkg/header_{name}/prepared.pb").is_file() for name in HEADER)
+        # The typedef declares an unnamed record, complete, where a named one is declared ahead.
+        adapter = (root / "pkg/header_area/generated/adapter.hpp").read_text()
+        assert "typedef struct alignas(4) {\nint x;\nint y;\n} Point;" in adapter, adapter
 
         # C. ABI-tag lookup.
         def show(selector, expected_error=None):
@@ -463,7 +533,6 @@ def main():
             root / "pkg/explicit_make_label/prepared.pb").read_bytes()
 
         # D. Install, observe and check the target's own behaviour.
-        checked = [*ROUTES, "tagged"]
         # An event carries the selector its package records: the tagged spelling when the
         # callable was requested without its ABI tags, otherwise the selector as written.
         indexed_names = {name: json.loads(show(selector))["selector"]
@@ -475,19 +544,25 @@ def main():
                                 if name in ROUTES else text)
                          for name, text in indexed_names.items()},
         }
-        for kind in ("explicit", "indexed"):
+        # name: (selector to inject, package, selector the events carry)
+        probes = {kind: {name: (selector, f"pkg/{kind}_{name}", spelled[kind][name])
+                         for name, (selector, _) in ROUTES.items()}
+                  for kind in ("explicit", "indexed")}
+        for kind in probes:
+            probes[kind]["tagged"] = ("extra::tagged(int)", "pkg/tag_scalar", spelled[kind]["tagged"])
+        probes["header"] = {name: (selector, f"pkg/header_{name}", selector)
+                            for name, selector in HEADER.items()}
+        for kind, checked in probes.items():
             with subprocess.Popen([root / "target"], cwd=root, stdout=subprocess.PIPE,
                                   text=True) as target:
                 try:
                     assert target.stdout.readline().strip() == "ready"
                     script = "".join(
-                        f'%probe inject "{selector}" --prepared pkg/{kind}_{name} '
-                        "--prepared-mode require\n" for name, (selector, _) in ROUTES.items())
-                    script += ('%probe inject "extra::tagged(int)" --prepared pkg/tag_scalar '
-                               "--prepared-mode require\n")
-                    for name in checked:
+                        f'%probe inject "{selector}" --prepared {package} '
+                        "--prepared-mode require\n" for selector, package, _ in checked.values())
+                    for name, (_, _, event) in checked.items():
                         script += (
-                            f'%collect --name "{spelled[kind][name]}" --phase POST --count 2 --timeout 40 '
+                            f'%collect --name "{event}" --phase POST --count 2 --timeout 40 '
                             f"--as got_{name}\n"
                             f'{{ auto got = tracer.batch("got_{name}"); '
                             f'if (got.size() < 2) throw std::runtime_error("too few events: {name}"); '
