@@ -94,6 +94,9 @@ message ReceiverContext {
   uint64 alignment = 8;
   repeated ReceiverField fields = 9;
   bool is_volatile = 10;
+  // Structural identity of a record that has bases, unions, record, array or bit-field members
+  // (see DebugInfo bases/record_is_union). Set instead of `fields` for such a record.
+  string layout_identity = 11;
 }
 message DebugField {
   string name = 1;
@@ -102,6 +105,21 @@ message DebugField {
   uint64 byte_size = 4;
   string access = 5;
   repeated DebugTypeLevel type_chain = 6;
+  // One per dimension, outermost first; empty when the member is not an array. builtin_type,
+  // type_chain and record then describe the element, and byte_size is the whole array.
+  repeated uint64 array_extents = 7;
+  // The class, struct or union the member (or its array element) is, described like any record.
+  // record_name is empty for an unnamed type.
+  DebugInfo record = 8;
+  uint32 bit_size = 9;   // Bit-field width; 0 for an ordinary member.
+  uint64 bit_offset = 10; // Bit-field: offset of its least significant bit from the record start.
+  uint64 alignment = 11;  // DW_AT_alignment on the member (alignas); 0 when absent.
+}
+// A non-virtual base class subobject at a constant offset.
+message DebugBase {
+  DebugInfo record = 1;
+  uint64 byte_offset = 2;
+  string access = 3; // public, protected, or private.
 }
 // Outer type through terminal builtin/void, retaining pointee ABI facts that
 // a spelling and the outer pointer width cannot prove.
@@ -169,6 +187,12 @@ message DebugInfo {
   // The enumeration the result type names, by value or behind pointers, references,
   // cv-qualifiers and typedefs; unset otherwise.
   DebugTemplateType result_enum_type = 32;
+  repeated DebugBase bases = 33; // Non-virtual bases, in declaration order.
+  bool record_is_union = 34;
+  // Why the layout is not described (record_is_opaque); names the class and the shape.
+  string record_opaque_reason = 35;
+  // record_alignment is the DW_AT_alignment of the record's DIE, not a computed natural alignment.
+  bool record_alignment_declared = 36;
 }
 // One template argument as the target's debug data describes it, with its kind kept apart
 // so that a type, a constant, a template and a pack are never compared as text.

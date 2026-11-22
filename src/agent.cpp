@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -1484,10 +1485,98 @@ const char *field_access_name(clang::AccessSpecifier access, bool is_class) {
   return "";
 }
 
+std::string record_layout_identity(clang::ASTContext &context,
+                                   const clang::CXXRecordDecl *record);
+
+// The identity of one member type: arrays by extent and element, records by their own structural
+// identity, everything else by its ABI identity and canonical spelling.
+std::string layout_type_identity(clang::ASTContext &context, clang::QualType type) {
+  type = type.getCanonicalType();
+  std::string qualifiers;
+  if (type.isConstQualified())
+    qualifiers += "const ";
+  if (type.isVolatileQualified())
+    qualifiers += "volatile ";
+  if (const auto *array = context.getAsConstantArrayType(type))
+    return qualifiers + "array[" + std::to_string(array->getSize().getZExtValue()) + "]" +
+           layout_type_identity(context, array->getElementType());
+  if (!type->isDependentType())
+    if (const auto *record = type->getAsCXXRecordDecl()) {
+      // An unnamed record has no spelling that survives an AST import (it names its location).
+      const auto name = record->getDeclName().isEmpty() ? std::string()
+                                                         : record->getQualifiedNameAsString();
+      return qualifiers + "record[" + name + "]" + record_layout_identity(context, record);
+    }
+  clang::PrintingPolicy policy(context.getLangOpts());
+  return qualifiers + tracer::receiver_abi::type_identity(type, context) + "|" +
+         type.getAsString(policy);
+}
+
+// The structural identity of a record that has bases, unions, record, array or bit-field members:
+// everything that decides where each member lives and what it is, recursively. Two records with
+// the same identity are laid out the same way, so a record rebuilt or imported later can be
+// compared with the one that was verified against DWARF. Unnamed bit-fields are padding: they
+// are left out, and the offsets of their neighbours carry the effect.
+std::string record_layout_identity(clang::ASTContext &context,
+                                   const clang::CXXRecordDecl *record) {
+  record = record ? record->getDefinition() : nullptr;
+  if (!record)
+    return "incomplete";
+  const auto &layout = context.getASTRecordLayout(record);
+  std::string identity = std::string(record->isUnion() ? "union" : "class") +
+                         "{size=" + std::to_string(layout.getSize().getQuantity()) +
+                         ";align=" + std::to_string(layout.getAlignment().getQuantity()) +
+                         (record->isDynamicClass() ? ";dynamic" : "");
+  for (const auto &base : record->bases()) {
+    const auto *base_record = base.getType()->getAsCXXRecordDecl();
+    identity += ";base[" + std::string(field_access_name(base.getAccessSpecifier(), false));
+    if (base.isVirtual() || !base_record) {
+      identity += ";virtual]";
+      continue;
+    }
+    identity += ";offset=" + std::to_string(layout.getBaseClassOffset(base_record).getQuantity()) +
+                ";name=" + base_record->getQualifiedNameAsString() + ";" +
+                record_layout_identity(context, base_record) + "]";
+  }
+  for (const auto *field : record->fields()) {
+    if (field->isUnnamedBitField())
+      continue;
+    identity += ";field[" + field->getNameAsString() + ";" +
+                field_access_name(field->getAccess(), record->isClass()) +
+                (field->isMutable() ? ";mutable" : "") +
+                ";offset=" + std::to_string(layout.getFieldOffset(field->getFieldIndex())) +
+                ";width=" + std::to_string(field->isBitField() ? field->getBitWidthValue() : 0) +
+                ";" + layout_type_identity(context, field->getType()) + "]";
+  }
+  return identity + "}";
+}
+
 bool validate_receiver_layout(clang::ASTContext &context,
                               clang::CXXRecordDecl *record,
                               const clangtracer::v1::ReceiverContext &receiver,
                               std::string &error) {
+  if (!receiver.layout_identity().empty()) {
+    // A record with bases, unions or record, array and bit-field members is compared by its
+    // structural identity instead of a flat field list.
+    if (!record || !record->isCompleteDefinition() || record->isDependentType() ||
+        record->getDescribedClassTemplate() ||
+        llvm::isa<clang::ClassTemplateSpecializationDecl>(record) || record->isDynamicClass() ||
+        record->getNumVBases() != 0) {
+      error = "receiver class has an unsupported or changed layout";
+      return false;
+    }
+    const auto &layout = context.getASTRecordLayout(record);
+    if (static_cast<std::uint64_t>(layout.getSize().getQuantity()) != receiver.size() ||
+        static_cast<std::uint64_t>(layout.getAlignment().getQuantity()) != receiver.alignment()) {
+      error = "receiver size or alignment changed since source selection";
+      return false;
+    }
+    if (record_layout_identity(context, record) != receiver.layout_identity()) {
+      error = "receiver fields changed since source selection";
+      return false;
+    }
+    return true;
+  }
   if (!record || !record->isCompleteDefinition() || record->isUnion() ||
       record->isDependentType() || record->getDescribedClassTemplate() ||
       llvm::isa<clang::ClassTemplateSpecializationDecl>(record) ||
@@ -2367,6 +2456,115 @@ bool matches_debug_type_chain(clang::QualType type, clang::ASTContext &context,
   return false; // A pointer chain without its terminal type is incomplete.
 }
 
+// Checks a record that Clang laid out against the DWARF description of the record, recursively
+// through bases and by-value members. Every difference throws and names the record, the member
+// and both values, because a rebuilt layout is only trusted when DWARF agrees with it entirely.
+void verify_debug_layout(clang::ASTContext &context, const clang::CXXRecordDecl *declared,
+                         const clangtracer::v1::DebugInfo &expected, const std::string &path) {
+  const auto mismatch = [&](const std::string &what) {
+    throw std::runtime_error("Clang layout of " + path + " does not match DWARF: " + what);
+  };
+  const auto *record = declared ? declared->getDefinition() : nullptr;
+  if (!record || record->isDependentType())
+    mismatch("it is not a complete class in the rebuilt declarations");
+  if (record->isUnion() != expected.record_is_union())
+    mismatch(std::string("it is ") + (record->isUnion() ? "a union" : "not a union") +
+             " in Clang and " + (expected.record_is_union() ? "a union" : "not a union") +
+             " in DWARF");
+  if (record->isDynamicClass() || record->getNumVBases() != 0)
+    mismatch("it is a dynamic class or has virtual bases in Clang");
+  const auto &layout = context.getASTRecordLayout(record);
+  const auto size = static_cast<std::uint64_t>(layout.getSize().getQuantity());
+  if (size != expected.record_size())
+    mismatch("its size is " + std::to_string(size) + " bytes in Clang and " +
+             std::to_string(expected.record_size()) + " in DWARF");
+  const auto alignment = static_cast<std::uint64_t>(layout.getAlignment().getQuantity());
+  if (expected.record_alignment() && alignment != expected.record_alignment())
+    mismatch("its alignment is " + std::to_string(alignment) + " in Clang and " +
+             std::to_string(expected.record_alignment()) + " in DWARF");
+  if (record->getNumBases() != static_cast<unsigned>(expected.bases_size()))
+    mismatch("it has " + std::to_string(record->getNumBases()) + " base classes in Clang and " +
+             std::to_string(expected.bases_size()) + " in DWARF");
+  int base_index = 0;
+  for (const auto &base : record->bases()) {
+    const auto &wanted = expected.bases(base_index++);
+    const auto *base_record = base.getType()->getAsCXXRecordDecl();
+    if (!base_record || base_record->getQualifiedNameAsString() != wanted.record().record_name())
+      mismatch("base class " + wanted.record().record_name() + " is " +
+               (base_record ? base_record->getQualifiedNameAsString() : std::string("not a class")) +
+               " in Clang");
+    const auto offset = layout.getBaseClassOffset(base_record).getQuantity();
+    if (static_cast<std::uint64_t>(offset) != wanted.byte_offset())
+      mismatch("base class " + wanted.record().record_name() + " is at offset " +
+               std::to_string(offset) + " in Clang and " + std::to_string(wanted.byte_offset()) +
+               " in DWARF");
+    if (field_access_name(base.getAccessSpecifier(), false) != wanted.access())
+      mismatch("base class " + wanted.record().record_name() + " is " +
+               field_access_name(base.getAccessSpecifier(), false) + " in Clang and " +
+               wanted.access() + " in DWARF");
+    verify_debug_layout(context, base_record, wanted.record(),
+                        path + " base " + wanted.record().record_name());
+  }
+  std::vector<const clang::FieldDecl *> fields;
+  for (const auto *field : record->fields())
+    if (!field->isUnnamedBitField())
+      fields.push_back(field);
+  if (fields.size() != static_cast<std::size_t>(expected.fields_size()))
+    mismatch("it has " + std::to_string(fields.size()) + " data members in Clang and " +
+             std::to_string(expected.fields_size()) + " in DWARF");
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto *field = fields[i];
+    const auto &wanted = expected.fields(static_cast<int>(i));
+    const auto where = "member " + (wanted.name().empty() ? std::string("(anonymous)") : wanted.name());
+    if (field->getNameAsString() != wanted.name())
+      mismatch(where + " is named '" + field->getNameAsString() + "' in Clang");
+    if (field_access_name(field->getAccess(), record->isClass()) != wanted.access())
+      mismatch(where + " is " + field_access_name(field->getAccess(), record->isClass()) +
+               " in Clang and " + wanted.access() + " in DWARF");
+    const auto offset = layout.getFieldOffset(field->getFieldIndex());
+    const auto wanted_offset = wanted.bit_size() ? wanted.bit_offset() : wanted.byte_offset() * 8;
+    if (offset != wanted_offset)
+      mismatch(where + " is at bit offset " + std::to_string(offset) + " in Clang and " +
+               std::to_string(wanted_offset) + " in DWARF");
+    if (field->isBitField() != (wanted.bit_size() != 0) ||
+        (field->isBitField() && field->getBitWidthValue() != wanted.bit_size()))
+      mismatch(where + " has a different bit-field width in Clang (" +
+               std::to_string(field->isBitField() ? field->getBitWidthValue() : 0) +
+               ") and DWARF (" + std::to_string(wanted.bit_size()) + ")");
+    auto type = field->getType();
+    for (const auto extent : wanted.array_extents()) {
+      const auto *array = context.getAsConstantArrayType(type);
+      if (!array || array->getSize().getZExtValue() != extent)
+        mismatch(where + " is not an array of " + std::to_string(extent) + " elements in Clang");
+      type = array->getElementType();
+    }
+    if (context.getAsArrayType(type))
+      mismatch(where + " has more array dimensions in Clang than in DWARF");
+    if (wanted.has_record()) {
+      const auto *element = type->getAsCXXRecordDecl();
+      const auto &described = wanted.record();
+      if (!element ||
+          (described.record_name().empty()
+               ? !element->getDeclName().isEmpty()
+               : element->getQualifiedNameAsString() != described.record_name()))
+        mismatch(where + " has a different class type in Clang than " +
+                 (described.record_name().empty() ? std::string("DWARF's unnamed class")
+                                                  : described.record_name()));
+      verify_debug_layout(context, element, described, path + "::" + wanted.name());
+    } else {
+      if (!matches_debug_type_chain(type, context, wanted))
+        mismatch(where + " has a type whose ABI differs from DWARF");
+      if (!context.hasSameType(type, debug_builtin(context, wanted.builtin_type())))
+        mismatch(where + " has the type " + type.getAsString() + " in Clang and " +
+                 wanted.builtin_type() + " in DWARF");
+    }
+    const auto bits = context.getTypeSize(field->getType());
+    if (bits != wanted.byte_size() * 8)
+      mismatch(where + " is " + std::to_string(bits) + " bits in Clang and " +
+               std::to_string(wanted.byte_size() * 8) + " in DWARF");
+  }
+}
+
 DebugRecord construct_debug_record(clang::ASTUnit &unit,
                                    const clangtracer::v1::DebugInfo &info) {
   auto &context = unit.getASTContext();
@@ -2449,21 +2647,32 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
   const bool header_standard_record =
       record && standard_library_type && debug_record_from_header(record) &&
       llvm::isa<clang::ClassTemplateSpecializationDecl>(record);
-  if (record && (info.record_is_opaque() || header_standard_record)) {
+  // A record that a real header defines was opaque before DWARF described bases, unions and
+  // record, array and bit-field members, and it is accepted the same way now: by size and
+  // declared alignment. Its members are the header's business.
+  const bool header_recovered_layout =
+      record && !info.record_is_opaque() && tracer::client::uses_recovered_layout(info) &&
+      debug_record_from_header(record);
+  if (record && (info.record_is_opaque() || header_standard_record || header_recovered_layout)) {
     if (!record->isCompleteDefinition())
       throw std::runtime_error("header record is incomplete for opaque DWARF type");
+    // An opaque record's alignment is the one its DIE declares or none. A described one also
+    // has a computed alignment, which is compared only when it is the declared one.
+    const std::uint64_t compared_alignment =
+        header_recovered_layout && !info.record_alignment_declared() ? 0
+                                                                     : info.record_alignment();
     const auto &layout = context.getASTRecordLayout(record);
     if ((info.record_size() &&
          static_cast<std::uint64_t>(layout.getSize().getQuantity()) !=
              info.record_size()) ||
-        (info.record_alignment() &&
-         layout.getAlignment().getQuantity() != info.record_alignment()))
+        (compared_alignment &&
+         static_cast<std::uint64_t>(layout.getAlignment().getQuantity()) != compared_alignment))
       throw std::runtime_error(
           "header record size/alignment does not match opaque DWARF type");
     clangtracer::v1::ReceiverContext metadata;
     metadata.set_record_name(info.record_name());
     metadata.set_size(info.record_size());
-    metadata.set_alignment(info.record_alignment());
+    metadata.set_alignment(compared_alignment);
     metadata.set_is_volatile(info.receiver_volatile());
     return {record, std::move(metadata), true};
   }
@@ -2488,6 +2697,11 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
     metadata.set_is_volatile(info.receiver_volatile());
     return {record, std::move(metadata), true};
   }
+  const bool recovered_layout = tracer::client::uses_recovered_layout(info);
+  if (!record && recovered_layout)
+    // The members of such a record come from the declarations built out of DWARF.
+    throw std::runtime_error("receiver " + info.record_name() +
+                             " was not declared from debug data");
   if (!record) {
     llvm::StringRef remaining;
     const clang::CXXRecordDecl *real_enclosing = nullptr;
@@ -2522,6 +2736,20 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
                 clangtracer::v1::RECORD_PASS_BY_REFERENCE
             ? clang::RecordArgPassingKind::CannotPassInRegs
             : clang::RecordArgPassingKind::CanPassInRegs);
+  }
+  if (recovered_layout) {
+    verify_debug_layout(context, record, info, info.record_name());
+    const auto &rich_layout = context.getASTRecordLayout(record);
+    clangtracer::v1::ReceiverContext rich;
+    rich.set_record_name(info.record_name());
+    rich.set_size(info.record_size());
+    rich.set_alignment(rich_layout.getAlignment().getQuantity());
+    rich.set_is_volatile(info.receiver_volatile());
+    rich.set_layout_identity(record_layout_identity(context, record));
+    std::string rich_error;
+    if (!validate_receiver_layout(context, record, rich, rich_error))
+      throw std::runtime_error(rich_error);
+    return {record, std::move(rich), false};
   }
   if (record->isUnion() || record->isDynamicClass() || record->getNumBases() ||
       std::distance(record->field_begin(), record->field_end()) !=
@@ -3068,19 +3296,103 @@ std::vector<RecoveredScopePart> recovered_record_scopes(
   return scopes;
 }
 
+// The qualified spelling of a recovered record named by another record's base or member,
+// with every part validated like the record's own name.
+std::string recovered_record_reference(const clangtracer::v1::DebugInfo &info) {
+  llvm::StringRef name;
+  recovered_record_scopes(info, name);
+  return "::" + info.record_name();
+}
+
+std::string recovered_fields(const clangtracer::v1::DebugInfo &info, bool unnamed,
+                             std::string &access);
+
+// An unnamed struct or union that is the type of a member, with its members inline. They are
+// public, which is what DWARF records for them.
+std::string recovered_unnamed_record(const clangtracer::v1::DebugInfo &record) {
+  std::string access = "public";
+  return std::string(record.record_is_union() ? "union" : "struct") + " { " +
+         recovered_fields(record, true, access) + "}";
+}
+
+// The data members of a recovered record in DWARF order. `access` is the access the text is
+// currently in; `unnamed` is a record whose members need no access labels.
+std::string recovered_fields(const clangtracer::v1::DebugInfo &info, bool unnamed,
+                             std::string &access) {
+  std::string result;
+  // Where the previous member ended, in bits: an unnamed bit-field is not in DWARF, so a bit-field
+  // that starts later than that is preceded by the padding the source had there.
+  std::uint64_t end_bit = 0;
+  for (const auto &base : info.bases())
+    end_bit = std::max<std::uint64_t>(
+        end_bit, (base.byte_offset() + base.record().record_size()) * 8);
+  for (const auto &field : info.fields()) {
+    if (!field.name().empty() && !debug_identifier(field.name()))
+      throw std::runtime_error("unsupported recovered field name");
+    if (field.name().empty() && !field.has_record())
+      throw std::runtime_error("unsupported recovered field name");
+    if (!unnamed && field.access() != access) {
+      if (field.access() != "public" && field.access() != "protected" &&
+          field.access() != "private")
+        throw std::runtime_error("unsupported recovered field access");
+      access = field.access();
+      result += access + ": ";
+    }
+    std::string extents;
+    for (const auto extent : field.array_extents())
+      extents += "[" + std::to_string(extent) + "]";
+    const bool anonymous = field.name().empty();
+    if (field.alignment() && !anonymous)
+      result += "alignas(" + std::to_string(field.alignment()) + ") ";
+    if (field.bit_size()) {
+      if (!info.record_is_union()) {
+        while (field.bit_offset() > end_bit) {
+          // Never across a byte boundary: a char-sized bit-field is never split by its type.
+          const auto to_boundary = 8 - end_bit % 8;
+          const auto piece = std::min<std::uint64_t>(field.bit_offset() - end_bit, to_boundary);
+          result += "unsigned char : " + std::to_string(piece) + "; ";
+          end_bit += piece;
+        }
+      }
+      result += field.builtin_type() + " " + field.name() + " : " +
+                std::to_string(field.bit_size()) + "; ";
+      end_bit = field.bit_offset() + field.bit_size();
+      continue;
+    }
+    if (field.has_record()) {
+      const auto &record = field.record();
+      if (!record.record_name().empty()) {
+        result += recovered_record_reference(record) + " " + field.name() + extents + "; ";
+      } else if (anonymous) {
+        // An anonymous union is standard C++; an anonymous struct is an extension.
+        result += (record.record_is_union() ? "" : "__extension__ ") +
+                  recovered_unnamed_record(record) + "; ";
+      } else {
+        result += recovered_unnamed_record(record) + " " + field.name() + extents + "; ";
+      }
+    } else {
+      result += field.builtin_type() + " " + field.name() + extents + "; ";
+    }
+    end_bit = (field.byte_offset() + field.byte_size()) * 8;
+  }
+  return result;
+}
+
 // The record's own declaration, without its enclosing scopes. `nested` is the text of records
 // declared inside it.
 std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
                                   llvm::StringRef name, const std::string &nested = {}) {
   std::string result;
+  // A union keeps its tag everywhere it is declared, so every declaration of it agrees.
+  const std::string keyword = info.record_is_union() ? "union" : "class";
   if (info.record_is_opaque()) {
     if (nested.empty()) {
-      result += "class " + name.str() + "; ";
+      result += keyword + " " + name.str() + "; ";
     } else {
       // The record is only named by pointer, but it must be complete to hold the nested
       // declarations. Give the stand-in the size and alignment DWARF recorded so that the
       // layout check against the opaque type holds; nothing is claimed about its members.
-      result += "class " + name.str() + " { public: " + nested;
+      result += keyword + " " + name.str() + " { public: " + nested;
       if (info.record_size() != 0) {
         const auto alignment = info.record_alignment() > 1 ? info.record_alignment() : 1;
         result += "alignas(" + std::to_string(alignment) + ") unsigned char tracer_opaque_storage[" +
@@ -3089,23 +3401,23 @@ std::string recovered_record_body(const clangtracer::v1::DebugInfo &info,
       result += "}; ";
     }
   } else {
-    result += "class";
+    result += keyword;
     if (info.record_alignment() > 1)
       result += " alignas(" + std::to_string(info.record_alignment()) + ")";
     result += " " + name.str();
+    for (int i = 0; i < info.bases_size(); ++i) {
+      const auto &base = info.bases(i);
+      if (base.access() != "public" && base.access() != "protected" &&
+          base.access() != "private")
+        throw std::runtime_error("unsupported recovered base access");
+      result += (i ? ", " : " : ") + base.access() + " " +
+                recovered_record_reference(base.record());
+    }
     result += " { ";
     if (!nested.empty())
       result += "public: " + nested;
     std::string access = nested.empty() ? std::string() : "public";
-    for (const auto &field : info.fields()) {
-      if (!debug_identifier(field.name()))
-        throw std::runtime_error("unsupported recovered field name");
-      if (field.access() != access) {
-        access = field.access();
-        result += access + ": ";
-      }
-      result += field.builtin_type() + " " + field.name() + "; ";
-    }
+    result += recovered_fields(info, false, access);
     if (info.record_calling_convention() ==
         clangtracer::v1::RECORD_PASS_BY_REFERENCE) {
       result += "public: " + name.str() + "(const " + name.str() + "&); ";
@@ -3166,7 +3478,7 @@ std::string emit_recovered_scope(const RecoveredScopeNode &node) {
     inner += declaration;
   // Forward declarations next: a method may name a sibling declared later, or a cycle.
   for (const auto &child : node.children) {
-    const char *keyword = child.record ? "class"
+    const char *keyword = child.record ? (child.record->record_is_union() ? "union" : "class")
                           : child.kind == clangtracer::v1::RECORD_SCOPE_UNION ? "union" : "struct";
     inner += std::string(keyword) + " " + child.name + "; ";
   }
@@ -3358,6 +3670,54 @@ std::string recovered_record_group(
   return result;
 }
 
+// Calls `visit` for each named record that `record` holds by value or derives from, looking
+// through unnamed member types, which have no declaration of their own.
+void for_each_recovered_dependency(
+    const clangtracer::v1::DebugInfo &record,
+    const std::function<void(const clangtracer::v1::DebugInfo &)> &visit) {
+  if (record.record_is_opaque())
+    return;
+  const auto visit_record = [&](const clangtracer::v1::DebugInfo &dependency, auto &&self) -> void {
+    if (!dependency.record_name().empty()) {
+      visit(dependency);
+      return;
+    }
+    for (const auto &base : dependency.bases())
+      self(base.record(), self);
+    for (const auto &field : dependency.fields())
+      if (field.has_record())
+        self(field.record(), self);
+  };
+  for (const auto &base : record.bases())
+    visit_record(base.record(), visit_record);
+  for (const auto &field : record.fields())
+    if (field.has_record())
+      visit_record(field.record(), visit_record);
+}
+
+// Adds `record` to `records` after every record it needs complete, each once and by name:
+// a base or by-value member must be declared before the class that uses it. A record for which
+// `declared_elsewhere` holds (a header already defines it) and one the standard library
+// supplies are left out, and so are their dependencies.
+void append_recovered_record(
+    const clangtracer::v1::DebugInfo &record,
+    std::vector<const clangtracer::v1::DebugInfo *> &records,
+    std::unordered_set<std::string> &seen,
+    const std::function<bool(const clangtracer::v1::DebugInfo &)> &declared_elsewhere) {
+  if (record.record_name().empty() || standard_library_record_name(record.record_name()) ||
+      seen.count(record.record_name()))
+    return;
+  if (declared_elsewhere && declared_elsewhere(record)) {
+    seen.insert(record.record_name());
+    return;
+  }
+  for_each_recovered_dependency(record, [&](const clangtracer::v1::DebugInfo &dependency) {
+    append_recovered_record(dependency, records, seen, declared_elsewhere);
+  });
+  if (seen.insert(record.record_name()).second)
+    records.push_back(&record);
+}
+
 std::string recovered_record_declarations(
     const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
@@ -3366,9 +3726,7 @@ std::string recovered_record_declarations(
   // A standard-library record is never rebuilt as a handwritten class: its real header
   // supplies it, selected automatically or named by the caller.
   auto append = [&](const clangtracer::v1::DebugInfo &record) {
-    if (!record.record_name().empty() && !standard_library_record_name(record.record_name()) &&
-        seen.insert(record.record_name()).second)
-      records.push_back(&record);
+    append_recovered_record(record, records, seen, {});
   };
   if (!info.record_name().empty())
     append(info);
@@ -3499,13 +3857,11 @@ std::string missing_recovered_record_declarations(
     const clangtracer::v1::ProbeSpec &spec, bool check_enclosing = false) {
   std::vector<const clangtracer::v1::DebugInfo *> records;
   std::unordered_set<std::string> seen;
+  const auto declared = [&](const clangtracer::v1::DebugInfo &record) {
+    return ast_has_debug_record(context, record);
+  };
   const auto append = [&](const clangtracer::v1::DebugInfo &record) {
-    if (record.record_name().empty() ||
-        standard_library_record_name(record.record_name()) ||
-        !seen.insert(record.record_name()).second ||
-        ast_has_debug_record(context, record))
-      return;
-    records.push_back(&record);
+    append_recovered_record(record, records, seen, declared);
   };
   const auto &info = spec.debug_info();
   if (!info.record_name().empty())
@@ -3654,12 +4010,12 @@ std::string automatic_headers_failure(const std::string &error,
   return result;
 }
 
-bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
-                          std::unique_ptr<clang::ASTUnit> &output,
-                          clang::CXXRecordDecl *&record, std::string &error,
-                          DebugRecords &records,
-                          const std::string &callback_includes,
-                          const VerifiedDebugEntry *verified_entry) {
+bool build_debug_receiver_once(clangtracer::v1::ProbeSpec &spec,
+                               std::unique_ptr<clang::ASTUnit> &output,
+                               clang::CXXRecordDecl *&record, std::string &error,
+                               DebugRecords &records,
+                               const std::string &callback_includes,
+                               const VerifiedDebugEntry *verified_entry) {
   try {
     const auto &info = spec.debug_info();
     // tracer_agent_start performed the full serialized metadata comparison
@@ -3866,6 +4222,78 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       error = automatic_headers_failure(error, spec, callback_includes);
     return false;
   }
+}
+
+// Gives up the described layout of every record the agent rebuilt from debug data (those that
+// the header route accepts by size and alignment only are not touched unless their layout is
+// described beyond flat members), keeping the class as an opaque one with the reason. Returns
+// false when a demoted record is passed or returned by value: that needs the verified layout.
+bool demote_recovered_records(clangtracer::v1::DebugInfo &info, bool recovered_from_debug_data,
+                              const std::string &cause) {
+  bool by_value = false;
+  const auto demote = [&](clangtracer::v1::DebugInfo &record, bool value) {
+    if (record.record_is_opaque() || record.record_name().empty() ||
+        standard_library_record_name(record.record_name()) ||
+        (!recovered_from_debug_data && !tracer::client::uses_recovered_layout(record)))
+      return;
+    record.clear_fields();
+    record.clear_bases();
+    record.set_record_is_opaque(true);
+    // The alignment was derived together with the layout that did not hold.
+    record.set_record_alignment(0);
+    record.set_record_opaque_reason(record.record_name() +
+                                    ": its layout could not be rebuilt from debug data: " + cause);
+    by_value |= value;
+  };
+  demote(info, false);
+  for (auto &argument : *info.mutable_arguments())
+    if (argument.has_object_type())
+      demote(*argument.mutable_object_type(),
+             argument.is_object_value() && !argument.is_reference());
+  if (info.has_result_object_type())
+    demote(*info.mutable_result_object_type(),
+           info.result_is_object_value() && !info.result_is_reference());
+  return !by_value;
+}
+
+// Builds the receiver's declarations and verifies them. A layout that DWARF describes but Clang
+// does not reproduce (packed members, reused tail padding, ...) must not turn a receiver that can
+// be observed into one that cannot: those records are demoted to opaque ones and the build is
+// repeated once, so the probe still installs and only a callback that reads members is refused.
+bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
+                          std::unique_ptr<clang::ASTUnit> &output,
+                          clang::CXXRecordDecl *&record, std::string &error,
+                          DebugRecords &records,
+                          const std::string &callback_includes,
+                          const VerifiedDebugEntry *verified_entry) {
+  if (build_debug_receiver_once(spec, output, record, error, records, callback_includes,
+                                verified_entry))
+    return true;
+  const bool recovered_from_debug_data =
+      !(spec.has_header_context() || spec.include_headers_size() != 0 ||
+        has_user_includes(callback_includes));
+  // Work on a copy: a demotion that does not allow a retry leaves the specification as it was.
+  auto demoted = spec.debug_info();
+  const std::string original = error;
+  if (!demote_recovered_records(demoted, recovered_from_debug_data, original) ||
+      demoted.SerializeAsString() == spec.debug_info().SerializeAsString())
+    return false;
+  const auto previous = spec.debug_info();
+  *spec.mutable_debug_info() = std::move(demoted);
+  records.clear();
+  output.reset();
+  record = nullptr;
+  std::string retry_error;
+  if (build_debug_receiver_once(spec, output, record, retry_error, records, callback_includes,
+                                verified_entry))
+    return true;
+  // The original failure is the cause worth reporting.
+  *spec.mutable_debug_info() = previous;
+  records.clear();
+  output.reset();
+  record = nullptr;
+  error = original;
+  return false;
 }
 
 bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
@@ -8114,6 +8542,37 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return false;
     }
 
+    // A receiver that DWARF does not describe member by member is only a name with a size: there
+    // is nothing to import, and a callback that reads its members cannot compile. Say that,
+    // instead of reporting the failed import of an empty stand-in.
+    if (receiver_record && !callback_header_receiver) {
+      const auto opaque_receiver = std::find_if(
+          p.debug_records.begin(), p.debug_records.end(), [&](const DebugRecord &entry) {
+            return entry.decl == receiver_record && entry.opaque &&
+                   !debug_record_from_header(entry.decl);
+          });
+      if (opaque_receiver != p.debug_records.end()) {
+        const auto &debug = specification.debug_info();
+        std::string reason = debug.record_opaque_reason();
+        const auto prefix = debug.record_name() + ": ";
+        if (::tracer::compat::starts_with(reason, prefix))
+          reason.erase(0, prefix.size());
+        if (reason.empty())
+          reason = "its layout is not described by the debug data";
+        if (report) {
+          append_diagnostics(*report, user_capture, "syntax");
+          append_diagnostics(*report, complete_capture, "wrapper");
+        }
+        error = "receiver " + debug.record_name() +
+                " has no members on the headerless DWARF route: " + reason +
+                "; the probe can still observe the call and the receiver address, but this "
+                "callback needs the class's members; supply its header with --include (and "
+                "--compdb) or an #include in the callback";
+        if (!baseline_error.empty())
+          error += "\n" + baseline_error;
+        return false;
+      }
+    }
     auto *ci = p.interpreter->getCompilerInstance();
     if (!ci) {
       error = "Clang Interpreter has no CompilerInstance for receiver import";

@@ -1554,7 +1554,7 @@ record but not the program types it is instantiated with, so those come from DWA
 |---|---|
 | A record DWARF describes in full (`std::vector<Person>`, `Person` holding builtin members) | recovered from DWARF, as for any other program record |
 | An enumeration at namespace scope (`std::vector<Status>`, `std::optional<Level>`) | declared from DWARF with its name, `enum class` or `enum`, and underlying type; its enumerators are not declared |
-| A record DWARF describes only as opaque (it has a `std::string`, a base class, ...) | declared, not defined: enough where the standard type only points at it (`std::vector<Order>`, `std::shared_ptr<Order>`, `std::unique_ptr<Order>` by reference or as a result); a type that holds it by value (`std::optional<Order>`, `std::pair<int, Order>`, a by-value `std::vector<Order>` argument) is rejected with a message that names `Order` |
+| A record DWARF describes only as opaque (it has a `std::string`, virtual functions, ...) | declared, not defined: enough where the standard type only points at it (`std::vector<Order>`, `std::shared_ptr<Order>`, `std::unique_ptr<Order>` by reference or as a result); a type that holds it by value (`std::optional<Order>`, `std::pair<int, Order>`, a by-value `std::vector<Order>` argument) is rejected with a message that names `Order` |
 | A class template specialization (`std::vector<Box<int>>`), a type in an anonymous namespace, an enumeration declared inside a class | rejected with a message that names the type |
 
 For the rejected cases the remedy is the explicit route: the program's real header through
@@ -1675,6 +1675,41 @@ type; `call_original<int>()` returns a `short` result with its sign.
 of the spelled type are not supported. The message names the type and its role, for example
 `unsupported debug builtin for parameter 0 'x' of gaps::f_i128: __int128` or
 `unsupported debug builtin for the result of gaps::f_ldouble: long double`.
+
+### Receiver layouts without headers
+
+A callback on a DWARF-resolved method reads the receiver's members through `call.self()` with no
+header. The agent rebuilds the class from the target's debug data and accepts it only when Clang
+lays the rebuilt class out exactly as DWARF says: the offset, width and type of every member, the
+offset of every base, the size and the alignment. These shapes are rebuilt:
+
+* non-virtual base classes at a fixed offset, including a base of a base and several bases;
+* unions, as the receiver and as a member;
+* members that are classes, structs or unions (named, nested in the receiver, or of an unnamed
+  type), arrays of any dimension, and anonymous struct and union members;
+* bit-fields, signed and unsigned, including the padding an unnamed bit-field leaves;
+* a declared alignment of the class (`alignas(16) struct`) and of a member.
+
+A receiver that DWARF does not let the agent rebuild stays observable but opaque, and says why in
+`record_opaque_reason`: a virtual base class, a class with virtual functions (it has a vtable
+pointer), an enumeration member, a pointer or reference to a class, a member whose type is a class
+template specialization, a standard-library type or a type in an anonymous namespace, a class
+that this module's debug data only declares (GCC emits a class with a vtable only where it emits
+the vtable), and a layout that Clang does not reproduce (a packed class, a base whose tail padding
+is reused). The probe installs, and a callback that does not read members (it can still use the
+arguments, the result and the receiver address) compiles. A callback that reads a member of such
+a receiver is refused with the receiver and the reason, for example
+
+```text
+receiver gaps::VD has no members on the headerless DWARF route: virtual base class gaps::VB: its
+location is found at run time and is not rebuilt from debug data; the probe can still observe the
+call and the receiver address, but this callback needs the class's members; supply its header with
+--include (and --compdb) or an #include in the callback
+```
+
+Supplying the class's header with `--include` (and `--compdb`) reads any member of it. The class
+then comes from the header, and its size (and its declared alignment, when it has one) is checked
+against DWARF.
 
 ### Probe working directory
 

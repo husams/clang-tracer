@@ -46,12 +46,22 @@ union RecordResult {
   double ratio;
 };
 
+// An enumeration member keeps a record opaque: its layout is not described by the debug data.
+enum class RecordKind { First, Second };
+
+struct TaggedResult {
+  RecordKind kind;
+  int value;
+};
+
 class RecordCalculator {
 public:
   __attribute__((visibility("default"), noinline)) RecordResult result() const;
+  __attribute__((visibility("default"), noinline)) TaggedResult tagged() const;
 };
 
 RecordResult RecordCalculator::result() const { return {42}; }
+TaggedResult RecordCalculator::tagged() const { return {RecordKind::Second, 7}; }
 
 int main() {
   std::signal(SIGINT, stop_target);
@@ -67,9 +77,11 @@ int main() {
     volatile int result = calculator.read(1);
     volatile int pointer_result = pointer_calculator.read(2);
     const auto record_result = record_calculator.result();
+    const auto tagged_result = record_calculator.tagged();
     (void)result;
     (void)pointer_result;
     (void)record_result;
+    (void)tagged_result;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }

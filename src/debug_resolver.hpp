@@ -14,6 +14,18 @@ namespace object { class ObjectFile; }
 }
 
 namespace tracer::client {
+// True when a record's description goes beyond flat scalar and pointer members: it has base
+// classes, is a union, or has a member that is a record, an array, a bit-field or declared
+// with its own alignment. The agent verifies and identifies such a record structurally.
+inline bool uses_recovered_layout(const clangtracer::v1::DebugInfo &info) {
+  if (info.bases_size() != 0 || info.record_is_union())
+    return true;
+  for (const auto &field : info.fields())
+    if (field.array_extents_size() != 0 || field.has_record() || field.bit_size() != 0 ||
+        field.alignment() != 0)
+      return true;
+  return false;
+}
 // Bind a code range from an already opened executable to the live image.
 // Requires a matching mapped build ID and returns the ASLR load bias.
 std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,

@@ -471,9 +471,12 @@ and imported into preflight/JIT. Member paths are scoped to the target argument,
 so two Order instances can both publish quantity without duplicate labels.
 By-value class arguments require explicit DWARF pass-by-value ABI evidence;
 Clang performs aggregate argument lowering with the verified record layout.
-Nontrivial/unsupported by-value ABIs and nonordinary alignments are rejected.
-Flat scalar/pointer-member layout restrictions still apply. Optional headers are
-not required. Existing argument<T>(index) and arg<T>(index) scalar access remains.
+Nontrivial/unsupported by-value ABIs are rejected. Non-virtual bases, unions,
+record, array, bit-field and anonymous members and declared alignments are
+rebuilt and verified against DWARF; virtual bases, classes with virtual
+functions, enumeration members, pointers to classes and layouts Clang does not
+reproduce stay opaque, with the reason named (`docs/native-repl.md`, "Receiver
+layouts without headers"). Optional headers are not required. Existing argument<T>(index) and arg<T>(index) scalar access remains.
 The Protobuf OBJECT value records an address of the wrapper's by-value snapshot;
 member snapshots remain independent typed named values. Bootstrap ABI is 13.
 

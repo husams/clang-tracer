@@ -45,7 +45,8 @@ def main():
         syntax = root / "syntax-error.cpp"
         syntax.write_text('class Interceptor {\npublic:\n'
                           '  void pre(const Call &call) { call.field("x", 1 }\n};\n')
-        record_method = "RecordCalculator::result() const"
+        # A by-value result with an enumeration member: its layout is not described by DWARF.
+        record_method = "RecordCalculator::tagged() const"
         module_options = ("--module", str(args.target))
         for selector in ("InheritedCalculator::read(int) const", record_method):
             for level in ("syntax", "compile"):
@@ -67,6 +68,13 @@ def main():
             *module_options, timeout=45))
         require("validation success=true" in valid,
                 f"valid method callback failed after syntax rejection: {valid}")
+        # A union result is described by DWARF since #146, so it validates with the same observer.
+        union_valid = text(run(
+            args.client, endpoint, "validate", str(target.pid),
+            "RecordCalculator::result() const", "--callback", str(plain),
+            *module_options, timeout=45))
+        require("validation success=true" in union_valid,
+                f"a described by-value union result was rejected: {union_valid}")
         abi_error = text(run(
             args.client, endpoint, "validate", str(target.pid), record_method,
             "--callback", str(plain), *module_options, ok=False, timeout=45))
