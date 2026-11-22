@@ -50,6 +50,8 @@ int take_box(Box<Plain> value);
 Outer::Inner make_inner(int n);
 int take_inner(Outer::Inner value);
 int read_plain(const Plain* value);
+struct Opaque;
+Plain make_with_ctx(Opaque* ctx);
 __attribute__((abi_tag("v1"))) int tagged(int n);
 __attribute__((abi_tag("a", "b"))) int multi(int n);
 int tracked_live();
@@ -125,6 +127,8 @@ __attribute__((noinline)) int take_box(Box<Plain> value) { return value.item.val
 __attribute__((noinline)) Outer::Inner make_inner(int n) { return {n, n * 2}; }
 __attribute__((noinline)) int take_inner(Outer::Inner value) { return value.x + value.y; }
 __attribute__((noinline)) int read_plain(const Plain* value) { return value->value; }
+struct Opaque { int n; };
+__attribute__((noinline)) Plain make_with_ctx(Opaque* ctx) { return {ctx->n}; }
 __attribute__((noinline)) int tagged(int n) { return n + 2; }
 __attribute__((noinline)) int multi(int n) { return n + 3; }
 }
@@ -341,6 +345,16 @@ def main():
         # The pointer control still prepares from the index alone.
         repl(f'%probe prepare "extra::read_plain(extra::Plain const*)" --module-index {index} '
              "--output pkg/indexed_pointer\n%quit\n")
+        # A record reached only through a pointer needs a declaration, which the headers that
+        # define the by-value types are not required to provide.
+        repl(f'%probe prepare "extra::make_with_ctx(extra::Opaque*)" --module-index {index} '
+             "--include types.hpp --compdb compile_commands.json --translation-unit module.cpp "
+             "--output pkg/opaque_pointer\n%quit\n")
+        assert (root / "pkg/opaque_pointer/prepared.pb").is_file()
+        # A type context missing a header reports the header, not one of the types.
+        repl(f'%probe prepare "extra::make_plain(int)" --module-index {index} '
+             "--include missing.hpp --compdb compile_commands.json --translation-unit module.cpp "
+             "--output pkg/no_header\n", expected_error="missing.hpp")
 
         # C. ABI-tag lookup.
         def show(selector, expected_error=None):

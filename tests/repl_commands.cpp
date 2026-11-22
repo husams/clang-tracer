@@ -98,7 +98,9 @@ int main() {
   require(parse_command("%probe prepare f --signature 'app::Item(int)' --module app "
                         "--include types.hpp --compdb build --output prepared")
               .has("--include"));
-  bad("%probe prepare f --include original.hpp --id s1 --output prepared");
+  // An index chosen by --id (default search) takes the headers as a type context too.
+  require(parse_command("%probe prepare f --include types.hpp --id s1 --compdb build "
+                        "--output prepared").has("--id"));
   bad("%probe prepare f --module-index types.sqlite --include types.hpp --generated out "
       "--output prepared");
   bad("%probe prepare f --signature 'int(int)' --module app --module-index types.sqlite "

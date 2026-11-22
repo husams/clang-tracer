@@ -3,6 +3,7 @@
 #include "prepared_types.hpp"
 #include "snapshot_limits.hpp"
 #include "snapshot_members.hpp"
+#include "type_text.hpp"
 #include "prepared_adapter.hpp"
 #include "prepared_contract.hpp"
 #include "prepared_header_search.hpp"
@@ -2055,19 +2056,6 @@ ResolvedCallable resolve_with_capture_steps(
 namespace {
 constexpr const char *probe_scope = "tracer_symbol_probe";
 
-// Text that is spliced into generated source cannot end the declaration it belongs to.
-bool spliceable_type_text(std::string_view text) {
-  return !text.empty() &&
-         std::none_of(text.begin(), text.end(), [](unsigned char c) {
-           return (c < 0x20 && c != '\t') || c == 0x7f || c == ';' || c == '{' || c == '}' ||
-                  c == '#' || c == '\\';
-         }) &&
-         text.find("//") == text.npos && text.find("/*") == text.npos &&
-         // Digraphs and trigraphs spell the same characters.
-         text.find("<%") == text.npos && text.find("%>") == text.npos &&
-         text.find("%:") == text.npos && text.find("??") == text.npos;
-}
-
 // What the type-checking pass learned about a contract in the supplied context.
 struct SymbolProbe {
   std::string scope;
@@ -2279,6 +2267,10 @@ std::string explain_context_failure(const PreparedHeaderCommand &command,
     return contract.display + ": " + role + " '" + spelling + "' cannot be compiled in the "
            "supplied type context (" + error + "); supply headers that declare and define it";
   };
+  // A header that does not compile fails every role, so it is reported as itself.
+  if (const auto error = type_error(command, arguments, includes, "void"); !error.empty())
+    return "Clang reported an error while parsing the supplied type context for " +
+           contract.display + ": " + error;
   if (!contract.result_type)
     return missing("the signature", contract.signature, first_error);
   if (const auto error = type_error(command, arguments, includes, *contract.result_type);
@@ -2383,14 +2375,14 @@ ResolvedCallable resolve_symbol_in_type_context(const SymbolContract &contract,
                                                 const TypeContext &context) {
   if (context.headers.empty())
     throw std::invalid_argument("a type context requires at least one --include header");
-  if (!spliceable_type_text(contract.signature.empty() && contract.result_type
+  if (!tracer::spliceable_type_text(contract.signature.empty() && contract.result_type
                                 ? *contract.result_type : contract.signature) ||
-      (!contract.encoded_parameters.empty() && !spliceable_type_text(contract.encoded_parameters)) ||
-      (!contract.encoded_result.empty() && !spliceable_type_text(contract.encoded_result)))
+      (!contract.encoded_parameters.empty() && !tracer::spliceable_type_text(contract.encoded_parameters)) ||
+      (!contract.encoded_result.empty() && !tracer::spliceable_type_text(contract.encoded_result)))
     throw std::invalid_argument(contract.display + ": the signature text is empty or contains "
         "characters that cannot be part of a C++ type (; { } # \\ comments)");
   for (const auto &type : contract.argument_types)
-    if (!spliceable_type_text(type))
+    if (!tracer::spliceable_type_text(type))
       throw std::invalid_argument(contract.display + ": a parameter type spelling is not a C++ type");
   std::string includes;
   for (const auto &header : context.headers) {
@@ -2398,6 +2390,7 @@ ResolvedCallable resolve_symbol_in_type_context(const SymbolContract &contract,
       throw std::invalid_argument("invalid header path");
     includes += "#include \"" + header + "\"\n";
   }
+  includes += contract.declarations;
   auto command = resolve_prepared_header_command(context.headers.front(),
                                                   context.compilation_database,
                                                   context.translation_unit);

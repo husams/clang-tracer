@@ -403,8 +403,6 @@ Command parse_command(std::string input) {
     // declarations, so it cannot also take definitions from headers.
     if (source_mode && command.has("--generated"))
       throw std::invalid_argument("--generated supplies recovered declarations and cannot be combined with --include");
-    if (source_mode && !elf_mode && indexed_mode && !command.has("--module-index"))
-      throw std::invalid_argument("indexed preparation with --include requires --module-index");
     if (!source_mode &&
         (command.has("--compdb") || command.has("--translation-unit") ||
          !command.extra_compile_argument_inputs.empty()))

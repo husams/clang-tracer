@@ -1,6 +1,7 @@
 #include "prepare_elf_signature.hpp"
 
 #include "abi_tags.hpp"
+#include "type_text.hpp"
 
 #include "prepared_contract.hpp"
 #include "prepared_types.hpp"
@@ -23,6 +24,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -160,20 +162,6 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
   return std::move(*match);
 }
 
-// The text is spliced into generated source, so it must not be able to end the declaration it
-// belongs to. Everything else is judged by parsing it, not by a spelling whitelist.
-bool type_text(std::string_view text) {
-  return !text.empty() &&
-         std::none_of(text.begin(), text.end(), [](unsigned char c) {
-           return (c < 0x20 && c != '\t') || c == 0x7f || c == ';' || c == '{' || c == '}' ||
-                  c == '#' || c == '\\';
-         }) &&
-         text.find("//") == text.npos && text.find("/*") == text.npos &&
-         // Digraphs and trigraphs spell the same characters.
-         text.find("<%") == text.npos && text.find("%>") == text.npos &&
-         text.find("%:") == text.npos && text.find("??") == text.npos;
-}
-
 // Keeps the first compiler error so a failure can say what Clang could not resolve.
 class FirstError final : public clang::TextDiagnosticPrinter {
 public:
@@ -226,7 +214,7 @@ ResolvedCallable resolve_elf_signature(
     const llvm::object::ELF64LEObjectFile &image, const std::string &selector,
     const std::string &signature, bool member, const IndexedElfSignature *indexed,
     const TypeContext *context) {
-  if (!indexed && !type_text(signature))
+  if (!indexed && !tracer::spliceable_type_text(signature))
     throw std::invalid_argument(
         "--signature requires a C++ function type such as 'const int&()' (it must not contain "
         "; { } # \\ or comments)");
@@ -242,6 +230,7 @@ ResolvedCallable resolve_elf_signature(
     if (indexed) {
       contract.result_type = indexed->result_type;
       contract.argument_types = indexed->argument_types;
+      contract.declarations = indexed->preamble;
       contract.result_size = indexed->result_size;
       contract.argument_sizes = indexed->argument_sizes;
     }
@@ -249,8 +238,8 @@ ResolvedCallable resolve_elf_signature(
     resolved.package_selector = tagged_selector(selector, target);
     return resolved;
   }
-  if (!indexed && (!type_text(target.parameters) ||
-      (!target.result.empty() && !type_text(target.result))))
+  if (!indexed && (!tracer::spliceable_type_text(target.parameters) ||
+      (!target.result.empty() && !tracer::spliceable_type_text(target.result))))
     throw std::invalid_argument(
         selector + ": the symbol's parameter or result types cannot be compiled without a type "
         "context (--include HEADER --compdb FILE)");
@@ -266,9 +255,14 @@ ResolvedCallable resolve_elf_signature(
       package, {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
                                      "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
-  const auto parse = [&](const std::string &source, const char *what = "signature") {
+  // The units keep a pointer to their diagnostic consumer, so each one is kept alive with them.
+  struct Diagnostics {
     clang::DiagnosticOptions options;
-    FirstError diagnostics(options);
+    FirstError consumer{options};
+  };
+  std::deque<Diagnostics> consumers;
+  const auto parse = [&](const std::string &source, const char *what = "signature") {
+    auto &diagnostics = consumers.emplace_back().consumer;
     auto unit = clang::tooling::buildASTFromCodeWithArgs(
         source, tracer::clang_driver_arguments(arguments), "elf-signature.cc", "clang-tool",
         std::make_shared<clang::PCHContainerOperations>(),

@@ -51,6 +51,7 @@ struct SymbolContract {
   std::string encoded_parameters;    // demangled "(T, U)" of the symbol, when it has one
   std::string encoded_result;        // demangled return type, when the mangling encodes it
   std::string receiver;              // "", "void*", "const void*", ...
+  std::string declarations;          // forward declarations emitted after the supplied headers
   // Record sizes recorded in debug information, to cross-check by-value roles.
   std::optional<std::uint64_t> result_size;
   std::vector<std::optional<std::uint64_t>> argument_sizes;

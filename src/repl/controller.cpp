@@ -1314,7 +1314,8 @@ void discover_writers(const Command &command, api::ObjectWatchRequest &request) 
 Controller::PreparedPackage Controller::prepare_package(const std::string &selector,
                                                          const Command &options) {
   const bool elf_mode = options.has("--signature");
-  const bool indexed = !elf_mode && (options.has("--module-index") || !options.has("--include"));
+  const bool indexed = !elf_mode && (options.has("--module-index") || options.has("--id") ||
+                                 !options.has("--include"));
   // Headers are the type definitions of a callable selected by ELF symbol or index entry.
   const bool type_context = (elf_mode || indexed) && options.has("--include");
   std::vector<std::string> arguments{preparer_executable(), "--selector", selector};
