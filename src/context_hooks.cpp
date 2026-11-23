@@ -5,6 +5,8 @@
 #include <string_view>
 
 #include <clang/AST/DeclCXX.h>
+#include <clang/AST/ExprCXX.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Frontend/ASTUnit.h>
@@ -18,7 +20,13 @@
 
 namespace tracer {
 namespace {
-struct Insert { std::size_t offset; std::string text; std::size_t length = 0; };
+struct Insert {
+  std::size_t offset;
+  std::string text;
+  std::size_t length = 0;
+  // Orders the edits of nested target calls that start at one offset.
+  std::size_t extent = 0;
+};
 const clang::ClassTemplateSpecializationDecl *state_token(clang::QualType type) {
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   const auto *special = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(record);
@@ -398,6 +406,61 @@ private:
     return result;
   }
 };
+
+// Rewrites every call of a target function into a call through the
+// target-call bridge. The analysis has already rejected the reachable calls the
+// bridge cannot carry; a call that is left alone here stays an unresolved
+// reference, which the closed module loader refuses.
+class TargetCallLowering final
+    : public clang::RecursiveASTVisitor<TargetCallLowering> {
+public:
+  explicit TargetCallLowering(clang::ASTUnit &unit) : unit_(unit) {}
+
+  bool VisitCallExpr(clang::CallExpr *call) {
+    auto &context = unit_.getASTContext();
+    ContextTargetCallSite site;
+    std::string reason;
+    if (classify_context_target_call(context, *call, site, reason) !=
+            ContextTargetCallKind::supported ||
+        templated(*call))
+      return true;
+    const auto key = site.bridge.key();
+    std::size_t index = 0;
+    while (index < bridges.size() && bridges[index].key() != key) ++index;
+    std::vector<ContextTargetEdit> edits;
+    if (!context_target_call_edits(context, *call, site,
+                                   context_target_callee(site.bridge, index),
+                                   edits))
+      return true;
+    if (index == bridges.size()) bridges.push_back(std::move(site.bridge));
+    for (auto &edit : edits)
+      insertions.push_back(
+          {edit.offset, std::move(edit.text), edit.length, edit.extent});
+    return true;
+  }
+
+  std::vector<ContextTargetBridge> bridges;
+  std::vector<Insert> insertions;
+
+private:
+  // One source text can stand for several instantiations with different
+  // callees, so calls inside templates are not rewritten.
+  bool templated(const clang::Stmt &statement) {
+    auto &context = unit_.getASTContext();
+    auto parents = context.getParents(statement);
+    while (!parents.empty()) {
+      const auto node = parents[0];
+      if (const auto *declaration = node.get<clang::Decl>()) {
+        if (declaration->isTemplated()) return true;
+        if (llvm::isa<clang::TranslationUnitDecl>(declaration)) return false;
+      }
+      parents = context.getParents(node);
+    }
+    return false;
+  }
+
+  clang::ASTUnit &unit_;
+};
 } // namespace
 
 ContextHookParseCopy prepare_context_hook_parse_copy(
@@ -465,9 +528,21 @@ GeneratedContextHooks generate_context_hooks(
     result.hooks.clear();
     return result;
   }
+  TargetCallLowering target_calls(unit);
+  target_calls.TraverseDecl(unit.getASTContext().getTranslationUnitDecl());
+  if (!target_calls.bridges.empty()) {
+    for (auto &edit : target_calls.insertions)
+      visitor.insertions.push_back(std::move(edit));
+    // The declarations use builtin types only, so they can precede everything.
+    visitor.insertions.push_back(
+        {0, context_target_declarations(target_calls.bridges)});
+    result.target_bridges = std::move(target_calls.bridges);
+  }
   result.compilation_copy = sm.getBufferData(sm.getMainFileID()).str();
   std::sort(visitor.insertions.begin(), visitor.insertions.end(),
-      [](const auto &a, const auto &b) { return a.offset > b.offset; });
+      [](const auto &a, const auto &b) {
+        return a.offset != b.offset ? a.offset > b.offset : a.extent < b.extent;
+      });
   for (const auto &insertion : visitor.insertions) {
     if (insertion.length)
       result.compilation_copy.replace(insertion.offset, insertion.length,
@@ -575,4 +650,10 @@ including lifecycle/native cleanup, counts no_active_hook without throwing.
 Visitors cannot leak borrowed references. Reachable indirect/opaque/native calls,
 unsupported reachable effects, escaping borrows and invalid lifecycle/access
 combinations must reject activation before wrapper entry.
+
+A call of a function of the target process is the one opaque call that is
+admitted. It is rewritten here into target_call<bridge, R, P...>(...), which
+reaches the function through a native capability generated for this callback
+(context_target.hpp). It is admitted only in a short hook and outside visitors,
+so the target never runs under a payload lock.
 */

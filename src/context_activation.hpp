@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,13 @@ struct ContextActivationRequest final {
   std::size_t maximum_object_bytes = 4096;
   std::size_t maximum_object_alignment = 64;
   decltype(&detail::tracer_enqueue_log) callback_log = nullptr;
+  // Compiles the generated target side of the target-call bridge in the
+  // target's own runtime and returns the address of each named function, in
+  // order. Needed only when a hook calls a function of the target process;
+  // without it such a callback is rejected.
+  std::function<llvm::Expected<std::vector<std::uintptr_t>>(
+      const std::string &source, const std::vector<std::string> &symbols)>
+      target_calls;
 };
 
 struct ContextActivationError final {

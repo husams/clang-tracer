@@ -1505,6 +1505,20 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:prepared-history-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/concrete/history.hpp")
       set_tests_properties(native_repl_prepared_history PROPERTIES TIMEOUT 240)
+      # The hook's target-call bridge binds the target functions by name, so
+      # the fixture exports them like a shared library does.
+      add_executable(repl-context-target-calls-target
+        tests/fixtures/context_target_calls/items.cpp)
+      set_target_properties(repl-context-target-calls-target PROPERTIES
+        CXX_STANDARD 17 ENABLE_EXPORTS ON)
+      target_compile_options(repl-context-target-calls-target PRIVATE
+        -g -O0 -fno-inline -fno-omit-frame-pointer -fcf-protection=none)
+      add_test(NAME native_repl_context_target_calls
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_context_target_calls.sh"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-context-target-calls-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/context_target_calls")
+      set_tests_properties(native_repl_context_target_calls PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_hidden_helper_symbols
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_hidden_helper_symbols.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>

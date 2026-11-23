@@ -130,6 +130,26 @@ private:
   bool entered_ = false;
 };
 
+// Tracking -> Application for the duration of one target function that a hook
+// calls through the target-call bridge. Like the original dispatch it is
+// refused while a payload or control guard is held: target code must never run
+// under a context lock. The hook stays installed on the native side and is
+// masked here, so the target function cannot reach the context of the hook
+// that called it.
+class TargetDispatch final {
+public:
+  TargetDispatch() noexcept;
+  ~TargetDispatch() noexcept;
+  TargetDispatch(const TargetDispatch &) = delete;
+  TargetDispatch &operator=(const TargetDispatch &) = delete;
+  TargetDispatch(TargetDispatch &&) = delete;
+  TargetDispatch &operator=(TargetDispatch &&) = delete;
+  bool entered() const noexcept { return entered_; }
+private:
+  Snapshot prior_{};
+  bool entered_ = false;
+};
+
 class CurrentHook final {
 public:
   explicit CurrentHook(void *hook) noexcept;
