@@ -47,6 +47,7 @@
 #include "context_schema.hpp"
 #include "context_stdlib.hpp"
 #include "context_support_effects.hpp"
+#include "context_target.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 
@@ -1665,9 +1666,56 @@ prepare_context_source(const ContextActivationRequest &request,
     return fail("invalid_context_owner: " + error_text(owner_code.takeError()));
   }
 
+  // Target functions the hooks call: the generated target side is compiled by
+  // the caller in the target's own runtime, and its entry points become native
+  // capabilities of this callback module only.
+  auto native_capabilities = native_addresses(request.callback_log);
+  std::string native_declarations = "#include \"context_facade.hpp\"\n";
+  if (!hooks.target_bridges.empty()) {
+    if (!request.target_calls) {
+      return fail("unsupported_context_activation: the callback calls target "
+                  "function " +
+                  hooks.target_bridges.front().name +
+                  ", which needs the agent's target-call bridge");
+    }
+    std::vector<std::string> symbols{kContextTargetReleaseText};
+    for (std::size_t index = 0; index < hooks.target_bridges.size(); ++index) {
+      symbols.push_back(context_target_bridge_symbol(index));
+    }
+    auto addresses = request.target_calls(
+        context_target_thunks(hooks.target_bridges), symbols);
+    if (!addresses) {
+      const auto text = error_text(addresses.takeError());
+      // The JIT linker lists the symbols it could not bind after this marker.
+      const auto unbound = text.find("Symbols not found:");
+      std::string names, missing;
+      for (const auto &bridge : hooks.target_bridges) {
+        names += (names.empty() ? "" : ", ") + bridge.name;
+        if (unbound != std::string::npos && !bridge.virtual_dispatch &&
+            text.find(" " + bridge.symbol + " ", unbound) != std::string::npos) {
+          missing += (missing.empty() ? "" : ", ") + bridge.name + " (" +
+                     bridge.symbol + ")";
+        }
+      }
+      if (!missing.empty()) {
+        return fail("invalid_context_target_call: the attached process does "
+                    "not export target function " +
+                    missing +
+                    "; the target-call bridge binds a function by its symbol");
+      }
+      return fail("invalid_context_target_call: the target-call bridge for " +
+                  names + " could not be built: " + text);
+    }
+    if (addresses->size() != symbols.size()) {
+      return fail("invalid_context_target_call: incomplete target-call bridge");
+    }
+    native_declarations += context_target_declarations(hooks.target_bridges);
+    for (std::size_t index = 0; index < symbols.size(); ++index) {
+      native_capabilities.push_back({"::" + symbols[index], (*addresses)[index]});
+    }
+  }
   auto native_imports = ContextNativeSymbol::catalog(
-      "#include \"context_facade.hpp\"\n", arguments,
-      native_addresses(request.callback_log));
+      native_declarations, arguments, native_capabilities);
   if (!native_imports) {
     return fail("invalid_context_activation: native facade catalog failed: " +
                 error_text(native_imports.takeError()));

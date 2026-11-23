@@ -19,6 +19,7 @@ void verify_context_binding();
 void verify_generated_owner();
 void verify_context_hooks();
 void verify_context_facade();
+void verify_context_target_calls();
 void verify_context_runtime();
 void verify_context_activation();
 void verify_context_nested_live();
@@ -233,6 +234,8 @@ int main(int argc, char **argv) {
         verify_context_nested_live();
       else if (selected == "--hooks-only")
         verify_context_hooks();
+      else if (selected == "--target-calls-only")
+        verify_context_target_calls();
       else if (selected == "--schema-only")
         verify_context_schema();
       else if (selected == "--stdlib-only")
@@ -246,6 +249,7 @@ int main(int argc, char **argv) {
     verify_context_stdlib();
     verify_context_binding();
     verify_context_hooks();
+    verify_context_target_calls();
     verify_context_facade();
     verify_context_runtime();
     verify_context_activation();

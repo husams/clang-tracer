@@ -66,6 +66,72 @@ returned from a helper. The callback is rejected with
 `unsupported_context_effect` and the line and column of the cast or the
 `return`.
 
+### Call functions of the target
+
+A hook can call a function or a method of the target process, for example a
+`serialize()` that the application already has:
+
+```cpp
+void post(const tracer::Call& call) {
+  Payload payload;
+  for (const demo::Item* item : call.argument<0>())
+    payload.items.push_back(item->serialize());   // runs in the target
+  call.context().init_scope<Scope>(std::move(payload));
+  call.context().event("demo.populated");
+}
+```
+
+A context hook runs in the engine's own C++ runtime, with its own allocator and
+exception handling, and the target function runs in the target's runtime. The
+engine therefore puts a bridge between them. The function is a target function
+when it has no body in the callback and is declared by the prepared adapter, by
+the callback, or by a project header. A prepared adapter declares the virtual
+methods of a class; declare any other function in the callback. The bridge
+finds a function by its symbol, the same way an ordinary callback does, so the
+target has to export it. A function that cannot be found rejects the callback
+when it is validated or installed.
+
+The bridge carries:
+
+- arguments that are arithmetic or enumeration values, pointers and lvalue
+  references, and the receiver of a method;
+- a result that is `void`, an arithmetic or enumeration value, a pointer, an
+  lvalue reference, or a `std::string` by value. The text of a `std::string` is
+  copied into the hook's runtime, so it can be stored in the state. A pointer
+  or reference result still points into the target: read it, do not keep it.
+
+Rules:
+
+- The target function never runs under a context lock. A hook that takes an
+  injected state, calls `get`, or uses the `state` shorthand cannot call a
+  target function, and neither can a `with` visitor. Call the function first
+  and then store the value through `with`. The callback is rejected with
+  `invalid_context_access_plan`.
+- The call has to be written in the callback source itself, in a function that
+  is not a template. A helper that calls a target function has to be `inline`
+  or `static`. Pass every argument explicitly; default arguments are not
+  filled in.
+- A class passed or returned by value (other than a `std::string` result), an
+  overloaded operator, a constructor, a destructor and a function with a
+  variable argument list cannot be called. The callback is rejected with
+  `unsupported_context_effect`, the name of the function, the reason and the
+  position of the call.
+- Functions of the C library and the C++ standard library are not target
+  functions. The existing rules for them do not change.
+- An object that the hook built cannot be given to the target to modify: a
+  hook-local `std::string` passed through a non-const reference or pointer, or
+  a non-const method called on a hook-local copy. The target would allocate
+  with its own runtime into an object that the hook's runtime frees. Passing
+  it through a reference or pointer to `const` is allowed.
+
+At run time, when the target function throws, the exception is caught on the
+target side and the call throws an exception of the hook's own runtime
+instead. A hook that does not catch it ends as a failed hook: its event is not
+published and the original call continues. A hook can catch it with
+`catch (...)`; the exception of the target is not available. A probe on the
+target function, or on anything it calls, is not traced while the hook runs,
+and a thread that the function creates does not inherit the context.
+
 Generated owner construction can initialize a payload from the source hook's
 root call with `T(const tracer::ScopeInit&)`; `init.root_call()` exposes that
 call only during initialization. For generic declarations, use

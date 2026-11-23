@@ -14,6 +14,7 @@
 #include <clang/Lex/Lexer.h>
 
 #include "context_support_effects.hpp"
+#include "context_target.hpp"
 #include "tracer/compat.hpp"
 
 namespace tracer {
@@ -761,9 +762,10 @@ public:
             ContextDeclarations &result,
             clang::ASTContext &context,
             std::vector<const clang::FunctionDecl *> &calls,
-            const SystemEntry *entry)
+            const SystemEntry *entry,
+            const clang::FunctionDecl *function)
       : plan_(plan), result_(result), context_(context), calls_(calls),
-        entry_(entry) {}
+        entry_(entry), function_(function) {}
 
   // Call-site location of every entry of the calls vector, same order.
   const std::vector<clang::SourceLocation> &locations() const {
@@ -787,6 +789,7 @@ public:
       return true;
     if (!method ||
         method->getParent()->getQualifiedNameAsString() != "tracer::Context") {
+      if (target_call(call)) return true;
       if (const auto *callee = call->getDirectCallee()) calls_.push_back(callee);
       synchronize(call->getBeginLoc());
       return true;
@@ -824,10 +827,15 @@ public:
         contract.TraverseStmt(lambda->getBody());
         std::vector<const clang::FunctionDecl *> pending = contract.calls;
         std::vector<const clang::FunctionDecl *> visited;
+        std::string target_in_visitor;
         while (!pending.empty()) {
           const auto *callee = pending.back();
           pending.pop_back();
           const auto qualified_name = callee->getQualifiedNameAsString();
+          if (is_context_target_function(context_, callee)) {
+            target_in_visitor = qualified_name;
+            continue;
+          }
           // Standard-library member implementations may return references to
           // their own receiver (for example basic_string::operator+=). That
           // implementation detail does not let the visitor retain its
@@ -850,7 +858,15 @@ public:
           contract.returns_borrow |= nested.returns_borrow;
           pending.insert(pending.end(), nested.calls.begin(), nested.calls.end());
         }
-        if (contract.event || contract.initializes_scope ||
+        if (!target_in_visitor.empty()) {
+          // The visitor holds the state's access interval; target code must
+          // not run under it.
+          plan_.invalid_access = true;
+          plan_.invalid_access_effect =
+              "target function " + target_in_visitor +
+              " is called inside a with() visitor, while the state is "
+              "locked; call it before the visitor";
+        } else if (contract.event || contract.initializes_scope ||
             contract.returns_borrow) {
           plan_.invalid_access = true;
           if (contract.event)
@@ -906,6 +922,7 @@ public:
 
   bool VisitCallExpr(clang::CallExpr *call) {
     if (!llvm::isa<clang::CXXMemberCallExpr>(call)) {
+      if (target_call(call)) return true;
       if (const auto *callee = call->getDirectCallee())
         calls_.push_back(callee);
       else
@@ -996,6 +1013,55 @@ public:
   }
 
 private:
+  // True when the callee is a function of the target process. The call then
+  // goes through the target-call bridge and its callee is not scanned; a call
+  // the bridge cannot carry rejects the hook here.
+  bool target_call(clang::CallExpr *call) {
+    ContextTargetCallSite site;
+    std::string reason;
+    const auto kind =
+        classify_context_target_call(context_, *call, site, reason);
+    if (kind == ContextTargetCallKind::not_target) return false;
+    const auto name = call->getDirectCallee()->getQualifiedNameAsString();
+    if (kind == ContextTargetCallKind::supported) {
+      std::vector<ContextTargetEdit> edits;
+      if (entry_) {
+        reason = "it is called inside a standard library function";
+      } else if (function_ && function_->getTemplateInstantiationPattern()) {
+        reason = "it is called from a template; call it from a function that "
+                 "is not a template";
+      } else if (function_ && context_.GetGVALinkageForFunction(function_) ==
+                                  clang::GVA_StrongExternal) {
+        // Such a function is also compiled into the state owner's module,
+        // which has no bridge.
+        reason = "it is called from " + function_->getQualifiedNameAsString() +
+                 ", which is neither inline nor static; declare that function "
+                 "inline or static";
+      } else if (!context_target_call_edits(context_, *call, site, {}, edits)) {
+        reason = "the call is not written directly in the callback source (it "
+                 "comes from a macro or an included file)";
+      }
+    }
+    if (!reason.empty()) {
+      reject("call to target function " + name + ": " + reason,
+             call->getBeginLoc());
+      return true;
+    }
+    if (!plan_.target_calls) {
+      plan_.target_calls = true;
+      plan_.target_call = name;
+      auto &sources = context_.getSourceManager();
+      const auto presumed =
+          sources.getPresumedLoc(sources.getExpansionLoc(call->getBeginLoc()));
+      if (presumed.isValid()) {
+        plan_.target_call_file = presumed.getFilename();
+        plan_.target_call_line = presumed.getLine();
+        plan_.target_call_column = presumed.getColumn();
+      }
+    }
+    return true;
+  }
+
   void reject(const std::string &reason, clang::SourceLocation location,
               bool without_summary = false) {
     reject_effect(plan_, context_.getSourceManager(), entry_, location, reason,
@@ -1012,6 +1078,8 @@ private:
   clang::ASTContext &context_;
   std::vector<const clang::FunctionDecl *> &calls_;
   const SystemEntry *entry_;
+  // The function whose body is being scanned.
+  const clang::FunctionDecl *function_;
   std::vector<clang::SourceLocation> locations_;
 };
 
@@ -1030,7 +1098,7 @@ void scan_reachable(const clang::FunctionDecl *function, ContextHookPlan &plan,
   if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function))
     unique_add(plan.reachable_methods, method->getNameAsString());
   std::vector<const clang::FunctionDecl *> calls;
-  HookCalls visitor(plan, result, context, calls, entry);
+  HookCalls visitor(plan, result, context, calls, entry, function);
   visitor.TraverseStmt(const_cast<clang::Stmt *>(function->getBody()));
   auto &sources = context.getSourceManager();
   const auto &locations = visitor.locations();
@@ -1836,7 +1904,8 @@ public:
         }
       }
       if (hook.invalid_access) {
-        if (::tracer::compat::starts_with(hook.invalid_access_effect, "init_scope")) {
+        if (::tracer::compat::starts_with(hook.invalid_access_effect, "init_scope") ||
+            ::tracer::compat::starts_with(hook.invalid_access_effect, "target function")) {
           result_.error = "invalid_context_access_plan: " + hook.invalid_access_effect;
         } else {
           result_.error = "invalid_context_borrow: " + hook.invalid_access_effect;
@@ -1874,6 +1943,23 @@ public:
       if (hook.initializes_scope && hook.direct_frame) {
         result_.error = "invalid_context_access_plan: init_scope is not "
                         "allowed while a direct access frame is held";
+        return false;
+      }
+      if (hook.target_calls && hook.direct_frame) {
+        // A direct frame keeps its states locked for the whole hook.
+        result_.error =
+            "invalid_context_access_plan: target function " + hook.target_call +
+            " cannot be called in a hook that holds a direct access frame (an "
+            "injected state, get() or the state shorthand); use with() for "
+            "the state and call the function outside the visitor";
+        if (hook.target_call_line) {
+          result_.error_file = hook.target_call_file;
+          result_.error_line = hook.target_call_line;
+          result_.error_column = hook.target_call_column;
+          result_.error += " at " + hook.target_call_file + ":" +
+                           std::to_string(hook.target_call_line) + ":" +
+                           std::to_string(hook.target_call_column);
+        }
         return false;
       }
       uses_context |= !hook.injected.empty() || !hook.direct.empty() ||

@@ -1341,6 +1341,29 @@ extern "C" void tracer_shared_original_leave(void *opaque) noexcept {
   if (auto *token = static_cast<SharedInvocationToken *>(opaque))
     token->original.reset();
 }
+// The generated target side of a context hook's target-call bridge brackets
+// the target function with these. The function runs as application code, but
+// it is not part of the traced call: probes it reaches are not traced
+// (callback_depth stays raised for the whole hook) and a thread it creates
+// does not inherit the context.
+struct TargetCallScope {
+  tracer::context_execution::TargetDispatch dispatch;
+  tracer::context_scheduler::ScopedPthreadBypass threads;
+};
+thread_local std::optional<TargetCallScope> target_call_scope;
+extern "C" bool tracer_target_call_enter() noexcept {
+  if (target_call_scope)
+    return false;
+  target_call_scope.emplace();
+  if (!target_call_scope->dispatch.entered()) {
+    target_call_scope.reset();
+    return false;
+  }
+  return true;
+}
+extern "C" void tracer_target_call_leave() noexcept {
+  target_call_scope.reset();
+}
 extern "C" void tracer_shared_leave(void *opaque) noexcept {
   auto *token = static_cast<SharedInvocationToken *>(opaque);
   if (!token || !token->occupied.load(std::memory_order_acquire) ||
@@ -7317,6 +7340,29 @@ bool compile_shared_probe(Probe &p,
                 : wrapper_snapshots;
   activation.compiler_arguments = arguments;
   activation.callback_log = &tracer::detail::tracer_enqueue_log;
+  // Target functions that the hooks call are entered through generated code
+  // that runs in the target's own runtime, so it is compiled here, by the
+  // interpreter that also links the wrapper against the process.
+  activation.target_calls =
+      [&p, &specification](const std::string &source,
+                           const std::vector<std::string> &symbols)
+      -> llvm::Expected<std::vector<std::uintptr_t>> {
+    std::string failure;
+    if (!parse_and_materialize(p, *p.interpreter, source, failure))
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), failure);
+    std::vector<std::uintptr_t> addresses;
+    for (const auto &symbol : symbols) {
+      auto address = p.interpreter->getSymbolAddress(symbol);
+      if (!address) {
+        failure = llvm::toString(address.takeError());
+        append_orc_errors(p, failure);
+        append_unresolved_link_candidates(p, specification, failure);
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), failure);
+      }
+      addresses.push_back(static_cast<std::uintptr_t>(address_value(*address)));
+    }
+    return addresses;
+  };
   if (!specification.callback_package_path().empty())
     activation.file_name = specification.callback_package_path();
   std::copy_n(p.request.source_lineage_id, activation.source_lineage_id.size(),
@@ -7596,6 +7642,8 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_shared_dispatch", &tracer_shared_dispatch);
   bind("tracer_shared_original_enter", &tracer_shared_original_enter);
   bind("tracer_shared_original_leave", &tracer_shared_original_leave);
+  bind("tracer_target_call_enter", &tracer_target_call_enter);
+  bind("tracer_target_call_leave", &tracer_target_call_leave);
   bind("tracer_callback_lifecycle_enter", &tracer_callback_lifecycle_enter);
   bind("tracer_callback_cleanup_enter", &tracer_callback_cleanup_enter);
   bind("tracer_callback_lifecycle_leave", &tracer_callback_lifecycle_leave);

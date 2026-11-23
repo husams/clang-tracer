@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "context_prepared_adapter.hpp"
+#include "context_target.hpp"
 
 namespace clang { class ASTUnit; }
 
@@ -42,6 +43,9 @@ struct GeneratedContextHooks {
   std::string compilation_copy;
   std::string facade_namespace;
   std::vector<GeneratedContextHook> hooks;
+  // Target functions the source calls. Each call was rewritten to go through
+  // context_target_bridge_symbol(index), declared at the top of the copy.
+  std::vector<ContextTargetBridge> target_bridges;
   std::string error;
 };
 

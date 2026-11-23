@@ -5,7 +5,7 @@ add_library(tracer_context_analysis STATIC src/context_analysis.cpp src/context_
   src/context_hooks.cpp src/context_schema.cpp src/context_receiver.cpp src/context_stdlib.cpp
   src/context_unwind.cpp src/context_support_effects.cpp src/context_registry.cpp
   src/context_facade.cpp src/context_runtime.cpp src/context_activation.cpp src/context_paths.cpp
-  src/context_query.cpp src/runtime_identity.cpp)
+  src/context_query.cpp src/context_target.cpp src/runtime_identity.cpp)
 set_target_properties(tracer_context_analysis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # LLVM's default SDK profile may omit RTTI for its polymorphic base classes.
 # The importer and memory-manager translation units derive from LLVM/Clang
@@ -45,7 +45,8 @@ if(TARGET tracer_context_stdlib)
 endif()
 if(BUILD_TESTING)
   add_executable(context-analysis-tests tests/context_analysis_tests.cpp tests/context_binding_checks.cpp
-    tests/context_owner_checks.cpp tests/context_hooks_checks.cpp tests/context_facade_checks.cpp
+    tests/context_owner_checks.cpp tests/context_hooks_checks.cpp tests/context_target_checks.cpp
+    tests/context_facade_checks.cpp
     tests/context_runtime_checks.cpp tests/context_schema_checks.cpp
     tests/context_activation_checks.cpp
     tests/context_delivery_checks.cpp tests/context_collector_checks.cpp

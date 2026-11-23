@@ -137,6 +137,26 @@ OriginalDispatch::~OriginalDispatch() noexcept {
   }
 }
 
+TargetDispatch::TargetDispatch() noexcept : prior_(current()) {
+  if (tls.mode != Mode::Tracking || tls.hook == nullptr || tls.access != 0 ||
+      tls.control != 0) {
+    global_diagnostics.record(Severity::error, Reason::invalid_transition,
+                              Phase::access, Action::call_rejected);
+    return;
+  }
+  tls.mode = Mode::Application;
+  tls.hook = nullptr;
+  tls.suppression = 0;
+  entered_ = true;
+}
+TargetDispatch::~TargetDispatch() noexcept {
+  if (entered_) {
+    tls.mode = prior_.mode;
+    tls.hook = prior_.current_hook;
+    tls.suppression = prior_.suppression_depth;
+  }
+}
+
 CurrentHook::CurrentHook(void *hook) noexcept : prior_(tls.hook) {
   if (tls.mode != Mode::Tracking || tls.hook || !hook) {
     global_diagnostics.record(Severity::error, Reason::invalid_transition,

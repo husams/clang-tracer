@@ -19,6 +19,10 @@
 #include "tracer/compat.hpp"
 #include "tracer/context.hpp"
 
+// Defined by the generated target side of the target-call bridge; releases a
+// std::string result that the target's runtime owns.
+extern "C" void clangtracer_target_release_text(void *) noexcept;
+
 namespace tracer::context_facade {
 
 using StateId = std::uint64_t;
@@ -303,6 +307,94 @@ template <class Scope> void end_scope() {
   const auto status = binding->table->end_scope(
       binding->runtime, ScopeTraits<Scope>::id);
   if (status != 0) throw ContextError{status};
+}
+
+// Hook side of the target-call bridge (context_target.hpp). The generated call
+//   target_call<clangtracer_target_call_N, R, P...>(arguments...)
+// passes each argument as a scalar or an address to the bridge function, which
+// runs the target function in the target's own runtime. Nothing the target
+// allocated is owned here: a std::string result is copied byte by byte and
+// then released on the target side.
+struct TargetText final {
+  const char *data = nullptr;
+  std::size_t size = 0;
+  void *handle = nullptr;
+};
+// Thrown into the hook when the target function threw, or when the call was
+// refused because the hook holds a context guard.
+inline constexpr unsigned kTargetCallFailed = 0x54434c46U;
+
+template <class P, class = void> struct TargetArgument;
+template <class T> struct TargetArgument<T &, void> {
+  static const void *erase(T &value) noexcept {
+    return static_cast<const void *>(__builtin_addressof(value));
+  }
+};
+template <class T> struct TargetArgument<T *, void> {
+  static const void *erase(T *value) noexcept {
+    return static_cast<const void *>(value);
+  }
+};
+template <> struct TargetArgument<std::nullptr_t, void> {
+  static const void *erase(std::nullptr_t) noexcept { return nullptr; }
+};
+template <class T>
+struct TargetArgument<T, std::enable_if_t<std::is_arithmetic_v<T>>> {
+  static T erase(T value) noexcept { return value; }
+};
+template <class T>
+struct TargetArgument<T, std::enable_if_t<std::is_enum_v<T>>> {
+  static std::underlying_type_t<T> erase(T value) noexcept {
+    return static_cast<std::underlying_type_t<T>>(value);
+  }
+};
+
+template <class R, class = void> struct TargetResult;
+template <> struct TargetResult<void, void> {
+  void *address() noexcept { return nullptr; }
+  void take() noexcept {}
+};
+template <class R>
+struct TargetResult<R, std::enable_if_t<std::is_arithmetic_v<R>>> {
+  R value{};
+  void *address() noexcept { return &value; }
+  R take() noexcept { return value; }
+};
+template <class R> struct TargetResult<R, std::enable_if_t<std::is_enum_v<R>>> {
+  std::underlying_type_t<R> value{};
+  void *address() noexcept { return &value; }
+  R take() noexcept { return static_cast<R>(value); }
+};
+template <class T> struct TargetResult<T *, void> {
+  const void *value = nullptr;
+  void *address() noexcept { return &value; }
+  T *take() noexcept { return static_cast<T *>(const_cast<void *>(value)); }
+};
+template <class T> struct TargetResult<T &, void> {
+  const void *value = nullptr;
+  void *address() noexcept { return &value; }
+  T &take() noexcept { return *static_cast<T *>(const_cast<void *>(value)); }
+};
+template <> struct TargetResult<std::string, void> {
+  TargetText text{};
+  TargetResult() = default;
+  TargetResult(const TargetResult &) = delete;
+  TargetResult &operator=(const TargetResult &) = delete;
+  ~TargetResult() noexcept {
+    if (text.handle) ::clangtracer_target_release_text(text.handle);
+  }
+  void *address() noexcept { return &text; }
+  std::string take() { return std::string(text.data, text.size); }
+};
+
+template <class T> struct TargetParameter { using type = T; };
+
+template <auto &Bridge, class R, class... P>
+R target_call(typename TargetParameter<P>::type... argument) {
+  TargetResult<R> result;
+  if (!Bridge(result.address(), TargetArgument<P>::erase(argument)...))
+    throw ContextError{kTargetCallFailed};
+  return result.take();
 }
 
 // The host calls this generation-local symbol after private ORC publication.

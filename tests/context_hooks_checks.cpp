@@ -314,12 +314,14 @@ void verify_context_hooks() {
         "effect summary at context-hooks-rejected.cc:6:");
     if (indirect.error_line != 6 || !indirect.error_column)
       throw std::runtime_error("indirect call was not located");
+    // A function without a body that the toolchain headers declare is not a
+    // function of the target; context_target_checks.cpp covers those.
     const auto bodiless = rejected(
-        "void pre(const Call& c) { external(1); }",
-        "unsupported_context_effect: external has no visible body or "
+        "void pre(const Call& c) { std::puts(\"x\"); }",
+        "unsupported_context_effect: puts has no visible body or "
         "validated engine effect summary at context-hooks-rejected.cc:6:",
-        "int external(int);");
-    if (bodiless.error.find("external::external") != std::string::npos)
+        "#include <cstdio>");
+    if (bodiless.error.find("puts::puts") != std::string::npos)
       throw std::runtime_error("bodiless callee name was printed twice");
   }
 

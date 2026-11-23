@@ -43,6 +43,14 @@ struct ContextHookPlan {
   std::string unsupported_file;
   unsigned unsupported_line = 0;
   unsigned unsupported_column = 0;
+  // The hook reaches a call of a function of the target process, which goes
+  // through the target-call bridge (context_target.hpp). Name and presumed
+  // location of the first such call.
+  bool target_calls = false;
+  std::string target_call;
+  std::string target_call_file;
+  unsigned target_call_line = 0;
+  unsigned target_call_column = 0;
   bool invalid_access = false;
   std::string invalid_access_effect;
   bool has_reference_capture = false;
