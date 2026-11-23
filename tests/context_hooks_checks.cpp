@@ -245,19 +245,60 @@ void verify_context_hooks() {
           std::string::npos)
     throw std::runtime_error("reserved facade lowering lost user source or did not apply");
 
-  const auto rejected = [&](const std::string &body, const char *diagnostic) {
-    const auto source = "struct S{}; struct D : shared_state<S>{}; struct H { "
-        "H(State<D>); void helper(const Call& c) { c.context().event(\"x\"); } " +
-        body + " };";
-    auto invalid = clang::tooling::buildASTFromCodeWithArgs(
-        "#include \"tracer/callback.hpp\"\n" + source, args,
-        "context-hooks-rejected.cc");
-    if (!invalid || invalid->getDiagnostics().hasErrorOccurred())
-      throw std::runtime_error("negative context-hook fixture did not parse");
-    const auto planned = tracer::analyze_context_declarations(invalid->getASTContext());
-    if (planned.error.find(diagnostic) == std::string::npos)
-      throw std::runtime_error("unsafe reachable hook behavior was not rejected");
+  // The hook is on line 6 of the fixture; `prefix` declares free helpers on
+  // line 4, before the class.
+  const auto analyze_hook = [&](const std::string &body,
+                                const std::string &prefix) {
+    const auto source =
+        "#include \"tracer/callback.hpp\"\n#include <vector>\n"
+        "struct S{}; struct D : shared_state<S>{ int value = 0; std::vector<int> items; std::vector<std::string> names; };\n" +
+        prefix + "\nstruct H { H(State<D>); void helper(const Call& c) { "
+        "c.context().event(\"x\"); }\n" + body + " };";
+    auto fixture = clang::tooling::buildASTFromCodeWithArgs(
+        source, args, "context-hooks-rejected.cc");
+    if (!fixture || fixture->getDiagnostics().hasErrorOccurred())
+      throw std::runtime_error("context-hook fixture did not parse: " + body);
+    return tracer::analyze_context_declarations(fixture->getASTContext());
   };
+  const auto rejected = [&](const std::string &body, const char *diagnostic,
+                            const std::string &prefix = {}) {
+    const auto planned = analyze_hook(body, prefix);
+    if (planned.error.find(diagnostic) == std::string::npos)
+      throw std::runtime_error("unsafe reachable hook behavior was not rejected: " +
+                               body + " => " + planned.error);
+    return planned;
+  };
+  const auto accepted = [&](const std::string &body,
+                            const std::string &prefix = {}) {
+    const auto planned = analyze_hook(body, prefix);
+    if (!planned.error.empty())
+      throw std::runtime_error("hook without context-owned pointers was rejected: " +
+                               body + " => " + planned.error);
+  };
+  // A pointer that can lead back to context state is rejected at its cast or
+  // return, with the position of the construct.
+  const auto leaks = [&](const std::string &body, const char *reason,
+                         const std::string &prefix = {}) {
+    const auto planned = rejected(body, "unsupported_context_effect: ", prefix);
+    if (planned.error.find(reason) == std::string::npos ||
+        planned.error.find("has no visible body") != std::string::npos)
+      throw std::runtime_error("pointer to context state was rejected for the wrong "
+                               "reason: " + body + " => " + planned.error);
+    const std::string suffix =
+        " at context-hooks-rejected.cc:" + std::to_string(planned.error_line) +
+        ":" + std::to_string(planned.error_column);
+    if (!planned.error_line || !planned.error_column ||
+        planned.error_file != "context-hooks-rejected.cc" ||
+        planned.error.size() < suffix.size() ||
+        planned.error.compare(planned.error.size() - suffix.size(),
+                              suffix.size(), suffix) != 0)
+      throw std::runtime_error("context effect error lacks its location: " +
+                               planned.error);
+    return planned;
+  };
+  const char *cast_reason = "pointer cast of context-owned state";
+  const char *return_reason = "pointer to context-owned state returned";
+
   rejected("void pre(const Call& c) { c.context().with<D>([](D& s) { return &s; }); }",
            "invalid_context_borrow");
   rejected("void pre(const Call& c) { c.context().with<D>([&](D& s) { helper(c); }); }",
@@ -266,8 +307,116 @@ void verify_context_hooks() {
            "unsupported_context_effect");
   rejected("void pre(const Call& c) { int local = 0; static int* saved; "
            "saved = &local; }", "unsupported_context_effect");
-  rejected("void pre(const Call& c) { (void)reinterpret_cast<int*>(1); }",
-           "unsupported_context_effect");
+  {
+    const auto indirect = rejected(
+        "void pre(const Call& c) { void (*f)() = nullptr; f(); }",
+        "indirect call expression has no visible body or validated engine "
+        "effect summary at context-hooks-rejected.cc:6:");
+    if (indirect.error_line != 6 || !indirect.error_column)
+      throw std::runtime_error("indirect call was not located");
+    const auto bodiless = rejected(
+        "void pre(const Call& c) { external(1); }",
+        "unsupported_context_effect: external has no visible body or "
+        "validated engine effect summary at context-hooks-rejected.cc:6:",
+        "int external(int);");
+    if (bodiless.error.find("external::external") != std::string::npos)
+      throw std::runtime_error("bodiless callee name was printed twice");
+  }
+
+  // Pointers that never touch context state are not restricted.
+  accepted("void pre(const Call& c) { int local = 0; "
+           "(void)reinterpret_cast<const char*>(&local); }");
+  accepted("void pre(const Call& c) { (void)reinterpret_cast<int*>(1); }");
+  accepted("void pre(const Call& c) { int local = 0; "
+           "long address = reinterpret_cast<long>(&local); (void)address; }");
+  accepted("void pre(const Call& c) { int local = 0; "
+           "const char* p = bytes(&local); (void)p; }",
+           "inline const char* bytes(const int* p) { "
+           "return static_cast<const char*>(static_cast<const void*>(p)); }");
+  accepted("void pre(const Call& c) { std::vector<int> v{1, 2}; "
+           "const int* p = first(v); (void)p; }",
+           "inline const int* first(const std::vector<int>& v) { "
+           "return v.empty() ? nullptr : &v.front(); }");
+  // An index read from state is a plain scalar, not a pointer into the state.
+  accepted("void pre(const Call& c) { char buffer[8] = {}; "
+           "int n = c.context().get<D>().value; const char* p = buffer + n; "
+           "(void)reinterpret_cast<const unsigned char*>(p); }");
+
+  // Storing into the state does not make unrelated target pointers derived.
+  accepted("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+           "char storage[64] = {}; const char* base = storage; "
+           "d.names.push_back(*reinterpret_cast<const std::string*>(base)); "
+           "const auto& id = *reinterpret_cast<const std::string*>(base + 32); "
+           "(void)id; }");
+  // Neither does a value copied out of it.
+  accepted("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+           "std::string local; local = d.names.empty() ? \"\" : d.names.front(); "
+           "char storage[8] = {}; const char* p = storage; "
+           "(void)reinterpret_cast<const unsigned char*>(p); }");
+
+  // Pointers derived from the state may not leave its access interval.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "long address = reinterpret_cast<long>(&d); (void)address; }",
+        cast_reason);
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "long address = reinterpret_cast<long>(&d.value); (void)address; }",
+        cast_reason);
+  leaks("void pre(const Call& c) { (void)leak(c.context().get<D>()); }",
+        return_reason, "inline int* leak(D& d) { return &d.value; }");
+  // Argument to parameter.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "(void)as_number(&d); }", cast_reason,
+        "inline long as_number(void* p) { return reinterpret_cast<long>(p); }");
+  // Through a local pointer.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "auto* p = &d; long address = reinterpret_cast<long>(p); "
+        "(void)address; }", cast_reason);
+  // Through an out-parameter.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "int* p = nullptr; store(p, d.value); "
+        "long address = reinterpret_cast<long>(p); (void)address; }",
+        cast_reason, "inline void store(int*& out, int& v) { out = &v; }");
+  // Through memcpy.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "const int* source = &d.value; const int* copy = nullptr; "
+        "__builtin_memcpy(&copy, &source, sizeof(source)); "
+        "long address = reinterpret_cast<long>(copy); (void)address; }",
+        cast_reason);
+  // Through a union that reinterprets the pointer as an integer.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "union U { const int* p; long l; }; U u{&d.value}; long l = u.l; "
+        "int* back = reinterpret_cast<int*>(l); (void)back; }", cast_reason);
+  // Through a range-for over state, and through a lambda called with state.
+  leaks("void pre(const Call& c) { for (int& x : c.context().get<D>().items) { "
+        "long address = reinterpret_cast<long>(&x); (void)address; } }",
+        cast_reason);
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "auto number = [](void* p) { return reinterpret_cast<long>(p); }; "
+        "(void)number(&d); }", cast_reason);
+  // Through a container that swapped contents with the state.
+  leaks("void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "std::vector<int> local; d.items.swap(local); "
+        "long address = reinterpret_cast<long>(local.data()); (void)address; }",
+        cast_reason);
+  // Through a returned reference to state.
+  leaks("void pre(const Call& c) { long address = "
+        "reinterpret_cast<long>(&ref(c)); (void)address; }", cast_reason,
+        "inline int& ref(const Call& c) { return c.context().get<D>().value; }");
+  // Through a visitor parameter.
+  rejected("void pre(const Call& c) { c.context().with<D>([&](D& s) { "
+           "long address = reinterpret_cast<long>(&s); (void)address; }); }",
+           "invalid_context_borrow");
+  {
+    // The cast is on line 6, at the position of `reinterpret_cast`.
+    const std::string body =
+        "void pre(const Call& c) { auto& d = c.context().get<D>(); "
+        "long address = reinterpret_cast<long>(&d); (void)address; }";
+    const auto planned = leaks(body, cast_reason);
+    if (planned.error_line != 6 ||
+        planned.error_column != body.find("reinterpret_cast") + 1)
+      throw std::runtime_error("cast diagnostic points at the wrong position: " +
+                               planned.error);
+  }
 
   const std::string shorthand =
       "struct Scope{}; struct D : shared_state<Scope>{ int value=0; }; "

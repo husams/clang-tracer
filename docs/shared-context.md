@@ -57,6 +57,15 @@ visitor call. A shared state must own its string data. Declare a
 Preparation rejects a `std::string_view` member, including one nested in a
 record or container.
 
+A hook, and any helper it calls, can read the target through pointers: cast an
+argument, walk an object, return a pointer from a helper. Copy what you need
+into the state as owned values. A pointer that can refer to context state is
+different: one that comes from `get`, `with`, an injected state parameter or the
+`state` shorthand, or from anything computed from them, cannot be cast or
+returned from a helper. The callback is rejected with
+`unsupported_context_effect` and the line and column of the cast or the
+`return`.
+
 Generated owner construction can initialize a payload from the source hook's
 root call with `T(const tracer::ScopeInit&)`; `init.root_call()` exposes that
 call only during initialization. For generic declarations, use

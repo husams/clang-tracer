@@ -282,6 +282,29 @@ void retained_support_generation() {
           "transitive support generations leaked after final return");
 }
 
+// A record declared through a macro has no spelling of its own; capturing it
+// must still succeed and must not depend on the run.
+void macro_declared_record() {
+  const std::string source =
+      "#define DECLARE_TAG(Name) struct Name { long id; char label[8]; };\n"
+      "DECLARE_TAG(MacroTag)\n"
+      "long identify(MacroTag tag) noexcept { return tag.id; }\n";
+  const auto records = [](const tracer::ContextCompilationContract &contract) {
+    std::vector<tracer::ContextTypeLayout> found;
+    for (const auto &bridge : contract.bridges)
+      for (const auto &record : bridge.records)
+        if (record.name.find("MacroTag") != std::string::npos)
+          found.push_back(record);
+    return found;
+  };
+  const auto first = records(compile(source).contract);
+  const auto second = records(compile(source).contract);
+  require(first.size() == 1 && !first.front().definition.empty() &&
+              first.front().definition.find(";field:") != std::string::npos,
+          "macro-declared record was not captured");
+  require(first == second, "macro-declared record capture is not deterministic");
+}
+
 void bounded_native_support() {
   using Role = tracer::PrivateContextCode::Role;
   const std::string source =
@@ -531,6 +554,7 @@ extern "C" int sealed_owner_test() noexcept {
   retained_support_generation();
   bounded_native_support();
   cpp_bridge_pointees();
+  macro_declared_record();
   private_memory_support();
   finalizer_return_pins_generation();
   const auto contract =

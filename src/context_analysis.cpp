@@ -1,11 +1,14 @@
 #include "context_analysis.hpp"
 
 #include <algorithm>
+#include <map>
+#include <set>
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/StmtCXX.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Basic/Version.h>
 #include <clang/Lex/Lexer.h>
@@ -718,19 +721,59 @@ ContextDependency generic_dependency(clang::QualType scope,
   return dependency;
 }
 
+// A standard-library function reached from user code. Problems found inside it
+// are reported at the user's call, naming the function.
+struct SystemEntry {
+  clang::SourceLocation location;
+  std::string name;
+};
+using SystemEntries = std::map<const clang::FunctionDecl *, SystemEntry>;
+
+constexpr const char *kNoEffectSummary =
+    " has no visible body or validated engine effect summary";
+
+// The first rejection of a hook wins, so the text and the location always
+// describe the same construct.
+void reject_effect(ContextHookPlan &plan, clang::SourceManager &sources,
+                   const SystemEntry *entry, clang::SourceLocation location,
+                   const std::string &reason, bool without_summary = false) {
+  if (plan.unsupported_effects && !plan.unsupported_effect.empty()) return;
+  plan.unsupported_effects = true;
+  if (entry) {
+    plan.unsupported_effect = entry->name +
+        " is not a supported operation in a context hook (" + reason +
+        " inside it)";
+    location = entry->location;
+  } else {
+    plan.unsupported_effect = reason + (without_summary ? kNoEffectSummary : "");
+  }
+  if (location.isInvalid()) return;
+  const auto presumed = sources.getPresumedLoc(sources.getExpansionLoc(location));
+  if (presumed.isInvalid()) return;
+  plan.unsupported_file = presumed.getFilename();
+  plan.unsupported_line = presumed.getLine();
+  plan.unsupported_column = presumed.getColumn();
+}
+
 class HookCalls final : public clang::RecursiveASTVisitor<HookCalls> {
 public:
   HookCalls(ContextHookPlan &plan,
             ContextDeclarations &result,
             clang::ASTContext &context,
-            std::vector<const clang::FunctionDecl *> &calls)
-      : plan_(plan), result_(result), context_(context), calls_(calls) {}
+            std::vector<const clang::FunctionDecl *> &calls,
+            const SystemEntry *entry)
+      : plan_(plan), result_(result), context_(context), calls_(calls),
+        entry_(entry) {}
+
+  // Call-site location of every entry of the calls vector, same order.
+  const std::vector<clang::SourceLocation> &locations() const {
+    return locations_;
+  }
 
   bool VisitCXXMemberCallExpr(clang::CXXMemberCallExpr *call) {
-    if (!append_container_mutation(call, calls_)) {
-      plan_.unsupported_effects = true;
-      plan_.unsupported_effect = "custom std container allocator";
-    }
+    if (!append_container_mutation(call, calls_))
+      reject("custom std container allocator", call->getBeginLoc());
+    synchronize(call->getBeginLoc());
     auto *method = call->getMethodDecl();
     if (method && method->getParent()->getQualifiedNameAsString() ==
                       "tracer::Call") {
@@ -745,6 +788,7 @@ public:
     if (!method ||
         method->getParent()->getQualifiedNameAsString() != "tracer::Context") {
       if (const auto *callee = call->getDirectCallee()) calls_.push_back(callee);
+      synchronize(call->getBeginLoc());
       return true;
     }
     const auto name = method->getNameAsString();
@@ -771,7 +815,8 @@ public:
           ? llvm::dyn_cast<clang::LambdaExpr>(call->getArg(0)->IgnoreParenImpCasts())
           : nullptr;
       if (!lambda) {
-        plan_.unsupported_effects = true;
+        reject("visitor passed to with() is not a lambda expression",
+               call->getBeginLoc());
       } else {
         VisitorContract contract(context_.getSourceManager());
         for (const auto *parameter : lambda->getCallOperator()->parameters())
@@ -864,41 +909,21 @@ public:
       if (const auto *callee = call->getDirectCallee())
         calls_.push_back(callee);
       else
-        plan_.unsupported_effects = true;
+        reject("indirect call expression", call->getBeginLoc(), true);
     }
+    synchronize(call->getBeginLoc());
     return true;
   }
 
-  bool VisitExplicitCastExpr(clang::ExplicitCastExpr *cast) {
-    const auto *operand = cast->getSubExpr()->IgnoreParenImpCasts();
-    if (llvm::isa<clang::CXXNullPtrLiteralExpr>(operand)) return true;
-    if (cast->getType()->isPointerType() ||
-        operand->getType()->isPointerType()) {
-      plan_.unsupported_effects = true;
-      plan_.unsupported_effect = "unchecked pointer cast";
-    }
-    return true;
-  }
-
-  bool VisitReturnStmt(clang::ReturnStmt *statement) {
-    const auto *value = statement->getRetValue();
-    if (value && (value->getType()->isPointerType() ||
-                  value->getType()->isReferenceType())) {
-      plan_.unsupported_effects = true;
-      plan_.unsupported_effect = "pointer/reference escape from reachable helper";
-    }
-    return true;
-  }
-
-  bool VisitCXXNewExpr(clang::CXXNewExpr *) {
-    plan_.unsupported_effects = true;
-    plan_.unsupported_effect = "raw owning allocation in reachable hook";
+  bool VisitCXXNewExpr(clang::CXXNewExpr *expression) {
+    reject("raw owning allocation in reachable hook", expression->getBeginLoc());
     return true;
   }
 
   bool VisitVarDecl(clang::VarDecl *variable) {
     if (variable->isLocalVarDeclOrParm() && !variable->hasGlobalStorage())
       append_cleanup(variable->getType(), calls_);
+    synchronize(variable->getLocation());
     return true;
   }
 
@@ -906,6 +931,7 @@ public:
     const auto *constructor = construction->getConstructor();
     if (user_provided_type_method(constructor))
       calls_.push_back(constructor);
+    synchronize(construction->getBeginLoc());
     return true;
   }
 
@@ -914,6 +940,7 @@ public:
     if (const auto *destructor = temporary->getTemporary()->getDestructor();
         user_provided_type_method(destructor))
       calls_.push_back(destructor);
+    synchronize(temporary->getBeginLoc());
     return true;
   }
 
@@ -925,6 +952,7 @@ public:
       if (const auto *destructor = record->getDestructor(); destructor &&
           user_provided_type_method(destructor))
         calls_.push_back(destructor);
+    synchronize(expression->getBeginLoc());
     return true;
   }
 
@@ -937,10 +965,9 @@ public:
     if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(lhs))
       if (const auto *variable = llvm::dyn_cast<clang::VarDecl>(reference->getDecl()))
         escapes |= variable->hasGlobalStorage();
-    if (escapes) {
-      plan_.unsupported_effects = true;
-      plan_.unsupported_effect = "pointer stored outside hook-local lifetime";
-    }
+    if (escapes)
+      reject("pointer stored outside hook-local lifetime",
+             operation->getBeginLoc());
     return true;
   }
 
@@ -969,27 +996,48 @@ public:
   }
 
 private:
+  void reject(const std::string &reason, clang::SourceLocation location,
+              bool without_summary = false) {
+    reject_effect(plan_, context_.getSourceManager(), entry_, location, reason,
+                  without_summary);
+  }
+  // Callees are appended to calls_ by several helpers; stamp whatever they
+  // added with the location of the construct being visited.
+  void synchronize(clang::SourceLocation location) {
+    locations_.resize(calls_.size(), location);
+  }
+
   ContextHookPlan &plan_;
   ContextDeclarations &result_;
   clang::ASTContext &context_;
   std::vector<const clang::FunctionDecl *> &calls_;
+  const SystemEntry *entry_;
+  std::vector<clang::SourceLocation> locations_;
 };
 
 void scan_reachable(const clang::FunctionDecl *function, ContextHookPlan &plan,
                     ContextDeclarations &result,
                     clang::ASTContext &context,
-                    std::vector<const clang::FunctionDecl *> &visited) {
+                    std::vector<const clang::FunctionDecl *> &visited,
+                    SystemEntries &entries,
+                    const SystemEntry *entry = nullptr) {
   if (!function || !function->hasBody()) return;
   const auto *canonical_decl = function->getCanonicalDecl();
   if (std::find(visited.begin(), visited.end(), canonical_decl) != visited.end())
     return;
   visited.push_back(canonical_decl);
+  if (entry) entries[canonical_decl] = *entry;
   if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function))
     unique_add(plan.reachable_methods, method->getNameAsString());
   std::vector<const clang::FunctionDecl *> calls;
-  HookCalls visitor(plan, result, context, calls);
+  HookCalls visitor(plan, result, context, calls, entry);
   visitor.TraverseStmt(const_cast<clang::Stmt *>(function->getBody()));
-  for (const auto *callee : calls) {
+  auto &sources = context.getSourceManager();
+  const auto &locations = visitor.locations();
+  for (std::size_t index = 0; index < calls.size(); ++index) {
+    const auto *callee = calls[index];
+    const auto location = index < locations.size() ? locations[index]
+                                                   : clang::SourceLocation();
     if (callee->getBuiltinID() == 0) {
       static const std::vector<std::string> supported_std_effects = {
           "operator[]", "push_back", "emplace_back", "emplace", "insert",
@@ -1005,15 +1053,577 @@ void scan_reachable(const clang::FunctionDecl *function, ContextHookPlan &plan,
                                        callee->getNameAsString()) != supported_std_effects.end();
       if (supported) continue;
       if (!callee->hasBody()) {
-        plan.unsupported_effects = true;
-        plan.unsupported_effect = name + "::" + callee->getNameAsString();
+        reject_effect(plan, sources, entry, location, name + kNoEffectSummary);
         continue;
       }
     }
-    if (callee->hasBody())
-      scan_reachable(callee->getDefinition(), plan, result, context, visited);
+    if (!callee->hasBody()) continue;
+    const auto *definition = callee->getDefinition();
+    SystemEntry system_entry;
+    const SystemEntry *callee_entry = nullptr;
+    if (sources.isInSystemHeader(definition->getLocation())) {
+      if (entry) {
+        callee_entry = entry;
+      } else {
+        system_entry = {location, callee->getQualifiedNameAsString()};
+        callee_entry = &system_entry;
+      }
+    }
+    scan_reachable(definition, plan, result, context, visited, entries,
+                   callee_entry);
   }
 }
+
+// Decides which pointers could refer to context-owned state, so a pointer cast
+// or a returned pointer is only rejected when it can launder one. The analysis
+// is flow-insensitive and interprocedural over the functions the hook reaches:
+// values derive from the context accessors, the injected state parameters, the
+// state shorthand and visitor parameters, and the derivation follows
+// initializers, assignments, arguments, out-parameters and returns.
+class ContextProvenance {
+public:
+  struct Violation {
+    const clang::FunctionDecl *function = nullptr;
+    clang::SourceLocation location;
+    const char *reason = nullptr;
+  };
+
+  ContextProvenance(const clang::FunctionDecl *hook,
+                    const std::vector<const clang::FunctionDecl *> &visited) {
+    for (const auto *canonical : visited) {
+      const clang::FunctionDecl *definition = nullptr;
+      if (!canonical->hasBody(definition) || !definition) continue;
+      definitions_.push_back(definition);
+      scanned_[canonical->getCanonicalDecl()] = definition;
+    }
+    if (hook)
+      if (const clang::FunctionDecl *definition = nullptr;
+          hook->hasBody(definition) && definition)
+        for (unsigned i = 1; i < definition->getNumParams(); ++i)
+          taint(definition->getParamDecl(i));
+    for (const auto *definition : definitions_) seed_parameters(definition);
+  }
+
+  // Runs the analysis; true when a pointer to context-owned state leaves its
+  // access interval.
+  bool find(Violation &violation) {
+    unsigned pass = 0;
+    do {
+      changed_ = false;
+      for (const auto *definition : definitions_) {
+        Flow flow(*this, definition);
+        flow.run();
+      }
+    } while (changed_ && ++pass < kMaxPasses);
+    // No fixed point: fall back to rejecting every pointer cast and return.
+    conservative_ = changed_;
+    for (const auto *definition : definitions_) {
+      Sinks sinks(*this, definition);
+      sinks.run();
+      if (sinks.found) {
+        violation = sinks.violation;
+        return true;
+      }
+    }
+    return false;
+  }
+
+private:
+  static constexpr unsigned kMaxPasses = 64;
+
+  struct Reading {
+    bool derived = false;
+    bool union_member = false;
+  };
+
+  class Reader final : public clang::RecursiveASTVisitor<Reader> {
+  public:
+    Reader(const ContextProvenance &owner, const clang::FunctionDecl *method)
+        : owner_(owner), method_(method) {}
+    Reading reading;
+
+    bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr *) {
+      return true;
+    }
+    bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr *) { return true; }
+    bool TraverseLambdaExpr(clang::LambdaExpr *lambda) {
+      // The body is its own function; the closure derives from what it holds.
+      for (const auto &capture : lambda->captures()) {
+        if (capture.capturesThis()) {
+          reading.derived |= owner_.derived_this(method_);
+        } else if (capture.capturesVariable()) {
+          reading.derived |= owner_.tainted(capture.getCapturedVar());
+        }
+      }
+      return true;
+    }
+    bool VisitDeclRefExpr(clang::DeclRefExpr *reference) {
+      reading.derived |= owner_.tainted(reference->getDecl());
+      return true;
+    }
+    bool VisitCXXThisExpr(clang::CXXThisExpr *) {
+      reading.derived |= owner_.derived_this(method_);
+      return true;
+    }
+    bool VisitCXXMemberCallExpr(clang::CXXMemberCallExpr *call) {
+      const auto *method = call->getMethodDecl();
+      reading.derived |= method && method->getParent() &&
+          method->getParent()->getQualifiedNameAsString() == "tracer::Context";
+      return true;
+    }
+    bool VisitCallExpr(clang::CallExpr *call) {
+      reading.derived |= owner_.returns_derived(call->getDirectCallee());
+      return true;
+    }
+    bool VisitMemberExpr(clang::MemberExpr *member) {
+      if (const auto *field =
+              llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl()))
+        reading.union_member |= field->getParent()->isUnion();
+      return true;
+    }
+
+  private:
+    const ContextProvenance &owner_;
+    const clang::FunctionDecl *method_;
+  };
+
+  class Flow final : public clang::RecursiveASTVisitor<Flow> {
+  public:
+    Flow(ContextProvenance &owner, const clang::FunctionDecl *root)
+        : owner_(owner), method_(owner.enclosing_method(root)) {
+      functions_.push_back(root);
+    }
+
+    void run() { owner_.traverse_body(*this, functions_.front()); }
+
+    bool TraverseLambdaExpr(clang::LambdaExpr *lambda) {
+      const auto *call_operator = lambda->getCallOperator();
+      owner_.register_lambda(call_operator);
+      functions_.push_back(call_operator);
+      const bool result =
+          clang::RecursiveASTVisitor<Flow>::TraverseLambdaExpr(lambda);
+      functions_.pop_back();
+      return result;
+    }
+
+    bool VisitVarDecl(clang::VarDecl *variable) {
+      if (owner_.state_like(variable->getType())) owner_.taint(variable);
+      const auto *init = variable->getInit();
+      if (init && owner_.flows(init, variable->getType(), method_))
+        owner_.taint(variable);
+      return true;
+    }
+
+    bool VisitCXXForRangeStmt(clang::CXXForRangeStmt *loop) {
+      if (loop->getRangeInit() && loop->getLoopVariable() &&
+          owner_.reading(loop->getRangeInit(), method_).derived)
+        owner_.taint(loop->getLoopVariable());
+      return true;
+    }
+
+    bool VisitBinaryOperator(clang::BinaryOperator *operation) {
+      if (operation->isAssignmentOp() &&
+          owner_.carries(operation->getRHS(), method_))
+        owner_.taint_bases(operation->getLHS());
+      return true;
+    }
+
+    bool VisitReturnStmt(clang::ReturnStmt *statement) {
+      const auto *value = statement->getRetValue();
+      if (!value) return true;
+      const auto *function = functions_.back();
+      if (owner_.flows(value, function->getReturnType(), method_))
+        owner_.mark_returns_derived(function);
+      return true;
+    }
+
+    bool VisitCXXMemberCallExpr(clang::CXXMemberCallExpr *call) {
+      const auto *method = call->getMethodDecl();
+      if (!method || method->getNameAsString() != "with" ||
+          method->getParent()->getQualifiedNameAsString() != "tracer::Context" ||
+          !call->getNumArgs())
+        return true;
+      // The visitor parameters borrow the state.
+      if (const auto *lambda = llvm::dyn_cast<clang::LambdaExpr>(
+              call->getArg(0)->IgnoreParenImpCasts()))
+        for (const auto *parameter : lambda->getCallOperator()->parameters())
+          owner_.taint(parameter);
+      return true;
+    }
+
+    bool VisitCallExpr(clang::CallExpr *call) {
+      const auto *callee = call->getDirectCallee();
+      std::vector<const clang::Expr *> arguments(call->arg_begin(),
+                                                 call->arg_end());
+      const clang::Expr *object = nullptr;
+      if (const auto *member = llvm::dyn_cast<clang::CXXMemberCallExpr>(call)) {
+        object = member->getImplicitObjectArgument();
+      } else if (const auto *op =
+                     llvm::dyn_cast<clang::CXXOperatorCallExpr>(call)) {
+        const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(callee);
+        if (method && method->isInstance() && !arguments.empty()) {
+          object = arguments.front();
+          arguments.erase(arguments.begin());
+        }
+        if (assignment_operator(op->getOperator()) && op->getNumArgs() == 2 &&
+            owner_.carries(op->getArg(1), method_))
+          owner_.taint_bases(op->getArg(0));
+      }
+      invoke(callee, object, arguments);
+      return true;
+    }
+
+    bool VisitCXXConstructExpr(clang::CXXConstructExpr *construction) {
+      std::vector<const clang::Expr *> arguments(construction->arg_begin(),
+                                                 construction->arg_end());
+      invoke(construction->getConstructor(), nullptr, arguments);
+      return true;
+    }
+
+  private:
+    static bool assignment_operator(clang::OverloadedOperatorKind kind) {
+      switch (kind) {
+      case clang::OO_Equal:
+      case clang::OO_PlusEqual:
+      case clang::OO_MinusEqual:
+      case clang::OO_StarEqual:
+      case clang::OO_SlashEqual:
+      case clang::OO_PercentEqual:
+      case clang::OO_CaretEqual:
+      case clang::OO_AmpEqual:
+      case clang::OO_PipeEqual:
+      case clang::OO_LessLessEqual:
+      case clang::OO_GreaterGreaterEqual:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    static bool writable_through(clang::QualType type) {
+      if (type.isNull()) return false;
+      return (type->isPointerType() || type->isLValueReferenceType()) &&
+             !type->getPointeeType().isConstQualified();
+    }
+
+    // Whether the callee can store through this argument. Without a
+    // parameter (variadic) only the argument's own type tells.
+    static bool writable_argument(clang::QualType parameter,
+                                  const clang::Expr *argument) {
+      return writable_through(parameter.isNull() ? argument->getType()
+                                                 : parameter);
+    }
+
+    static bool mutable_object(const clang::FunctionDecl *callee) {
+      const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(callee);
+      return !method || !method->isConst();
+    }
+
+    void invoke(const clang::FunctionDecl *callee, const clang::Expr *object,
+                const std::vector<const clang::Expr *> &arguments) {
+      const auto *definition = owner_.definition(callee);
+      const auto parameter_type = [&](std::size_t index) {
+        return callee && index < callee->getNumParams()
+                   ? callee->getParamDecl(index)->getType()
+                   : clang::QualType();
+      };
+      bool any = object && owner_.carries(object, method_);
+      const bool object_carries = any;
+      std::vector<bool> flowing(arguments.size());
+      for (std::size_t i = 0; i < arguments.size(); ++i) {
+        flowing[i] = owner_.flows(arguments[i], parameter_type(i), method_);
+        any |= flowing[i];
+      }
+      if (!any && !definition) return;
+      if (!definition) {
+        // No body to follow: assume the call may copy anything it is given
+        // into anything it can write.
+        if (object && mutable_object(callee)) owner_.taint_bases(object);
+        for (std::size_t i = 0; i < arguments.size(); ++i)
+          if (writable_argument(parameter_type(i), arguments[i]))
+            owner_.taint_bases(arguments[i]);
+        return;
+      }
+      for (std::size_t i = 0;
+           i < arguments.size() && i < definition->getNumParams(); ++i) {
+        const auto *parameter = definition->getParamDecl(i);
+        if (flowing[i]) owner_.taint(parameter);
+        if (owner_.tainted(parameter) && writable_through(parameter->getType()))
+          owner_.taint_bases(arguments[i]);
+      }
+      if (object_carries && llvm::isa<clang::CXXMethodDecl>(definition))
+        owner_.mark_derived_this(definition);
+      if (any && object && mutable_object(definition))
+        owner_.taint_bases(object);
+    }
+
+    ContextProvenance &owner_;
+    const clang::FunctionDecl *method_;
+    std::vector<const clang::FunctionDecl *> functions_;
+  };
+
+  class Sinks final : public clang::RecursiveASTVisitor<Sinks> {
+  public:
+    Sinks(ContextProvenance &owner, const clang::FunctionDecl *root)
+        : owner_(owner), root_(root), method_(owner.enclosing_method(root)) {}
+    bool found = false;
+    Violation violation;
+
+    void run() { owner_.traverse_body(*this, root_); }
+
+    bool VisitExplicitCastExpr(clang::ExplicitCastExpr *cast) {
+      // Nothing is converted by these, so no address can be hidden in them.
+      if (cast->getCastKind() == clang::CK_NoOp ||
+          cast->getCastKind() == clang::CK_ToVoid)
+        return true;
+      const auto *operand = cast->getSubExpr();
+      const auto *stripped = operand->IgnoreParenImpCasts();
+      if (llvm::isa<clang::CXXNullPtrLiteralExpr>(stripped)) return true;
+      const auto to = cast->getType();
+      if (!to->isPointerType() && !stripped->getType()->isPointerType())
+        return true;
+      if (!to->isPointerType() &&
+          (to->isVoidType() || to->isRecordType() || to->isBooleanType()))
+        return true;
+      if (!owner_.conservative_ && !owner_.reading(operand, method_).derived)
+        return true;
+      return report(cast->getBeginLoc(), "pointer cast of context-owned state");
+    }
+
+    bool VisitReturnStmt(clang::ReturnStmt *statement) {
+      const auto *value = statement->getRetValue();
+      if (!value || !value->getType()->isPointerType()) return true;
+      if (!owner_.conservative_ && !owner_.reading(value, method_).derived)
+        return true;
+      return report(statement->getBeginLoc(),
+                    "pointer to context-owned state returned from a reachable "
+                    "function");
+    }
+
+  private:
+    bool report(clang::SourceLocation location, const char *reason) {
+      found = true;
+      violation = {root_, location, reason};
+      return false;
+    }
+
+    ContextProvenance &owner_;
+    const clang::FunctionDecl *root_;
+    const clang::FunctionDecl *method_;
+  };
+
+  template <typename Visitor>
+  void traverse_body(Visitor &visitor, const clang::FunctionDecl *definition) {
+    if (const auto *constructor =
+            llvm::dyn_cast<clang::CXXConstructorDecl>(definition))
+      for (const auto *initializer : constructor->inits())
+        if (initializer->getInit())
+          visitor.TraverseStmt(initializer->getInit());
+    visitor.TraverseStmt(const_cast<clang::Stmt *>(definition->getBody()));
+  }
+
+  // The method `this` belongs to: lambdas use the this of their context.
+  const clang::FunctionDecl *
+  enclosing_method(const clang::FunctionDecl *function) const {
+    while (const auto *method =
+               llvm::dyn_cast_or_null<clang::CXXMethodDecl>(function)) {
+      if (!method->getParent()->isLambda()) return function;
+      function = llvm::dyn_cast_or_null<clang::FunctionDecl>(
+          method->getParent()->getLambdaContextDecl());
+    }
+    return function;
+  }
+
+  const clang::FunctionDecl *definition(const clang::FunctionDecl *callee) const {
+    if (!callee) return nullptr;
+    const auto found = scanned_.find(callee->getCanonicalDecl());
+    return found == scanned_.end() ? nullptr : found->second;
+  }
+
+  void register_lambda(const clang::CXXMethodDecl *call_operator) {
+    if (scanned_.emplace(call_operator->getCanonicalDecl(), call_operator).second)
+      seed_parameters(call_operator);
+  }
+
+  void seed_parameters(const clang::FunctionDecl *function) {
+    for (const auto *parameter : function->parameters())
+      if (state_like(parameter->getType())) taint(parameter);
+  }
+
+  void taint(const clang::VarDecl *variable) {
+    // The call object never holds context state; its accessors stay clean.
+    if (is_record(variable->getType(), "tracer::Call")) return;
+    if (tainted_.insert(variable).second) changed_ = true;
+  }
+
+  void mark_derived_this(const clang::FunctionDecl *function) {
+    if (derived_this_.insert(function->getCanonicalDecl()).second)
+      changed_ = true;
+  }
+
+  void mark_returns_derived(const clang::FunctionDecl *function) {
+    if (returns_derived_.insert(function->getCanonicalDecl()).second)
+      changed_ = true;
+  }
+
+  bool derived_this(const clang::FunctionDecl *method) const {
+    return method && derived_this_.count(method->getCanonicalDecl());
+  }
+
+  bool returns_derived(const clang::FunctionDecl *callee) const {
+    return callee && returns_derived_.count(callee->getCanonicalDecl());
+  }
+
+  bool tainted(const clang::ValueDecl *declaration) const {
+    if (const auto *variable =
+            llvm::dyn_cast_or_null<clang::VarDecl>(declaration)) {
+      // The state shorthand placeholder, as VisitDeclRefExpr sees it.
+      if (!llvm::isa<clang::ParmVarDecl>(variable) && variable->getIdentifier() &&
+          variable->getName() == "state")
+        return true;
+      return tainted_.count(variable) != 0;
+    }
+    if (const auto *binding =
+            llvm::dyn_cast_or_null<clang::BindingDecl>(declaration))
+      return tainted(binding->getDecomposedDecl());
+    return false;
+  }
+
+  Reading reading(const clang::Expr *expression,
+                  const clang::FunctionDecl *method) const {
+    Reader reader(*this, method);
+    reader.TraverseStmt(const_cast<clang::Expr *>(expression));
+    return reader.reading;
+  }
+
+  static bool plain_scalar(clang::QualType type) {
+    return !type.isNull() && !type->isDependentType() &&
+           (type->isIntegralOrEnumerationType() || type->isFloatingType() ||
+            type->isVoidType());
+  }
+
+  // The value itself can lead back to context state: arithmetic does not,
+  // unless it was read through a union that could hold a pointer.
+  bool carries(const clang::Expr *expression,
+               const clang::FunctionDecl *method) const {
+    const auto read = reading(expression, method);
+    return read.derived && (!plain_scalar(expression->getType()) ||
+                            read.union_member);
+  }
+
+  // A value bound to a reference refers to the object itself, so a scalar
+  // member of the state is as good as a pointer there.
+  bool flows(const clang::Expr *expression, clang::QualType destination,
+             const clang::FunctionDecl *method) const {
+    const auto read = reading(expression, method);
+    if (!read.derived) return false;
+    return (!destination.isNull() && destination->isReferenceType()) ||
+           !plain_scalar(expression->getType()) || read.union_member;
+  }
+
+  static bool is_record(clang::QualType type, const char *name) {
+    if (type.isNull() || type->isDependentType()) return false;
+    const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
+    return record && record->getQualifiedNameAsString() == name;
+  }
+
+  bool state_like(clang::QualType type) {
+    if (type.isNull() || type->isDependentType()) return false;
+    type = type.getNonReferenceType();
+    while (!type.isNull()) {
+      if (type->isPointerType())
+        type = type->getPointeeType().getNonReferenceType();
+      else if (type->isArrayType())
+        type = type->getAsArrayTypeUnsafe()->getElementType();
+      else
+        break;
+    }
+    if (type.isNull() || type->isDependentType()) return false;
+    const auto *record = type->getAsCXXRecordDecl();
+    if (!record) return false;
+    const auto cached = state_types_.find(record);
+    if (cached != state_types_.end()) return cached->second;
+    std::vector<ContextDependency> found;
+    markers(record, found);
+    const bool state = !found.empty() ||
+        record->getQualifiedNameAsString() == "tracer::Context" ||
+        specialization(type, "tracer::State");
+    state_types_[record] = state;
+    return state;
+  }
+
+  // The variables an lvalue or pointer expression designates part of.
+  void bases(const clang::Expr *expression,
+             std::vector<const clang::VarDecl *> &found) const {
+    while (expression) {
+      expression = expression->IgnoreParens();
+      if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(expression)) {
+        expression = cast->getSubExpr();
+      } else if (const auto *reference =
+                     llvm::dyn_cast<clang::DeclRefExpr>(expression)) {
+        const auto *declaration = reference->getDecl();
+        if (const auto *binding = llvm::dyn_cast<clang::BindingDecl>(declaration))
+          declaration = binding->getDecomposedDecl();
+        if (const auto *variable = llvm::dyn_cast_or_null<clang::VarDecl>(declaration))
+          found.push_back(variable);
+        return;
+      } else if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expression)) {
+        expression = member->getBase();
+      } else if (const auto *subscript =
+                     llvm::dyn_cast<clang::ArraySubscriptExpr>(expression)) {
+        expression = subscript->getBase();
+      } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expression)) {
+        expression = unary->getSubExpr();
+      } else if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expression)) {
+        if (binary->isAssignmentOp() || binary->getOpcode() == clang::BO_Comma) {
+          expression = binary->isAssignmentOp() ? binary->getLHS() : binary->getRHS();
+        } else {
+          bases(binary->getLHS(), found);
+          expression = binary->getRHS();
+        }
+      } else if (const auto *conditional =
+                     llvm::dyn_cast<clang::AbstractConditionalOperator>(expression)) {
+        bases(conditional->getTrueExpr(), found);
+        expression = conditional->getFalseExpr();
+      } else if (const auto *member_call =
+                     llvm::dyn_cast<clang::CXXMemberCallExpr>(expression)) {
+        expression = member_call->getImplicitObjectArgument();
+      } else if (const auto *call = llvm::dyn_cast<clang::CallExpr>(expression)) {
+        // operator[], operator*, std::move and the like hand back their argument.
+        expression = call->getNumArgs() ? call->getArg(0) : nullptr;
+      } else if (const auto *temporary =
+                     llvm::dyn_cast<clang::MaterializeTemporaryExpr>(expression)) {
+        expression = temporary->getSubExpr();
+      } else if (const auto *bound =
+                     llvm::dyn_cast<clang::CXXBindTemporaryExpr>(expression)) {
+        expression = bound->getSubExpr();
+      } else if (const auto *cleanups =
+                     llvm::dyn_cast<clang::ExprWithCleanups>(expression)) {
+        expression = cleanups->getSubExpr();
+      } else if (const auto *construction =
+                     llvm::dyn_cast<clang::CXXConstructExpr>(expression)) {
+        expression = construction->getNumArgs() ? construction->getArg(0) : nullptr;
+      } else {
+        return;
+      }
+    }
+  }
+
+  void taint_bases(const clang::Expr *expression) {
+    std::vector<const clang::VarDecl *> found;
+    bases(expression, found);
+    for (const auto *variable : found) taint(variable);
+  }
+
+  std::vector<const clang::FunctionDecl *> definitions_;
+  std::map<const clang::FunctionDecl *, const clang::FunctionDecl *> scanned_;
+  std::set<const clang::VarDecl *> tainted_;
+  std::set<const clang::FunctionDecl *> derived_this_;
+  std::set<const clang::FunctionDecl *> returns_derived_;
+  std::map<const clang::CXXRecordDecl *, bool> state_types_;
+  bool changed_ = false;
+  bool conservative_ = false;
+};
 
 class Declarations final : public clang::RecursiveASTVisitor<Declarations> {
 public:
@@ -1213,7 +1823,18 @@ public:
       for (const auto *parameter : method->parameters())
         has_state_parameter |= parameter->getNameAsString() == "state";
       std::vector<const clang::FunctionDecl *> visited;
-      scan_reachable(method, hook, result_, context_, visited);
+      SystemEntries entries;
+      scan_reachable(method, hook, result_, context_, visited, entries);
+      if (!hook.invalid_access && !hook.unsupported_effects) {
+        ContextProvenance provenance(method, visited);
+        ContextProvenance::Violation violation;
+        if (provenance.find(violation)) {
+          const auto found = entries.find(violation.function->getCanonicalDecl());
+          reject_effect(hook, context_.getSourceManager(),
+                        found == entries.end() ? nullptr : &found->second,
+                        violation.location, violation.reason);
+        }
+      }
       if (hook.invalid_access) {
         if (::tracer::compat::starts_with(hook.invalid_access_effect, "init_scope")) {
           result_.error = "invalid_context_access_plan: " + hook.invalid_access_effect;
@@ -1239,11 +1860,15 @@ public:
         }
       }
       if (hook.unsupported_effects) {
-        result_.error = "unsupported_context_effect: " +
-                        (hook.unsupported_effect.empty()
-                             ? std::string("indirect call expression")
-                             : hook.unsupported_effect) +
-                        " has no visible body or validated engine effect summary";
+        result_.error = "unsupported_context_effect: " + hook.unsupported_effect;
+        if (hook.unsupported_line) {
+          result_.error_file = hook.unsupported_file;
+          result_.error_line = hook.unsupported_line;
+          result_.error_column = hook.unsupported_column;
+          result_.error += " at " + hook.unsupported_file + ":" +
+                           std::to_string(hook.unsupported_line) + ":" +
+                           std::to_string(hook.unsupported_column);
+        }
         return false;
       }
       if (hook.initializes_scope && hook.direct_frame) {
