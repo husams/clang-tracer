@@ -123,6 +123,26 @@ clang::QualType arg(const clang::ClassTemplateSpecializationDecl *s,
              : clang::QualType{};
 }
 
+// Generated code never emits a Codec for a record in namespace std; only the
+// hand-written specializations in context_codec.hpp exist.
+bool standard_record(const clang::CXXRecordDecl *record) {
+  return record && record->getQualifiedNameAsString().rfind("std::", 0) == 0;
+}
+
+// Generated code has to spell the record's name.  A record, or one of the
+// records enclosing it, that has neither an identifier nor a typedef name for
+// linkage has no such spelling.
+bool unnamable_record(const clang::CXXRecordDecl *record) {
+  for (const clang::DeclContext *context = record;
+       context && llvm::isa<clang::RecordDecl>(context);
+       context = context->getParent()) {
+    const auto *tag = llvm::cast<clang::RecordDecl>(context);
+    if (!tag->getIdentifier() && !tag->getTypedefNameForAnonDecl())
+      return true;
+  }
+  return false;
+}
+
 bool owning_snapshot_pointer(const std::string &name) {
   return name == "std::unique_ptr" || name == "std::shared_ptr";
 }
@@ -153,8 +173,19 @@ struct Builder {
       cache;
   std::size_t fields = 0, messages = 0;
   std::string error;
+  std::vector<std::string> member_path;
   bool snapshot = false;
   const SnapshotFieldSelection *selection = nullptr;
+
+  std::string member_suffix() const {
+    std::string joined;
+    for (const auto &name : member_path) {
+      if (name.empty())
+        continue;
+      joined += (joined.empty() ? "" : ".") + name;
+    }
+    return joined.empty() ? std::string{} : " (member " + joined + ")";
+  }
 
   bool system_default_specialization(
       const clang::ClassTemplateSpecializationDecl *s) const {
@@ -230,7 +261,9 @@ struct Builder {
         error = "bit-field state member unsupported";
         return;
       }
+      member_path.push_back(f->getNameAsString());
       auto sf = describe(f->getType(), f->getNameAsString(), id++, depth);
+      member_path.pop_back();
       if (!error.empty()) {
         return;
       }
@@ -613,6 +646,21 @@ struct Builder {
     auto *r = t->getAsCXXRecordDecl();
     if (!r || !r->hasDefinition()) {
       error = "incomplete or unsupported field type: " + name;
+      return out;
+    }
+    if (standard_record(r)) {
+      // std::any and std::monostate are handled above in snapshot mode; in
+      // state mode their hand-written codecs stay in use.
+      const auto standard =
+          without_std_inline_namespace(r->getQualifiedNameAsString());
+      if (snapshot || (standard != "std::monostate" && standard != "std::any")) {
+        error = "unsupported standard type: " + standard + member_suffix();
+        return out;
+      }
+    }
+    if (!r->isUnion() && unnamable_record(r)) {
+      error = std::string("unsupported unnamed ") +
+              (r->isClass() ? "class" : "struct") + " type" + member_suffix();
       return out;
     }
     out.kind = SchemaKind::message;
@@ -1030,8 +1078,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
       }
     }
     auto *r = t->getAsCXXRecordDecl();
-    if (r && r->hasDefinition() &&
-        r->getQualifiedNameAsString().rfind("std::", 0) != 0) {
+    if (r && r->hasDefinition() && !standard_record(r)) {
       gather_record(r->getDefinition());
     }
   };
@@ -1044,8 +1091,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
       result.error = "recursive codec type is unsupported";
       return;
     }
-    if (r->getQualifiedNameAsString().empty() ||
-        r->getDescribedClassTemplate()) {
+    if (unnamable_record(r) || r->getDescribedClassTemplate()) {
       result.error = "anonymous or primary-template state class cannot receive "
                      "an automatic codec";
       return;
@@ -1270,8 +1316,7 @@ render_context_codec_sources(clang::ASTContext& ast,
       }
     }
     const auto *record = type->getAsCXXRecordDecl();
-    if (!record || !record->hasDefinition() ||
-        record->getQualifiedNameAsString().rfind("std::", 0) == 0) {
+    if (!record || !record->hasDefinition() || standard_record(record)) {
       return;
     }
     record = record->getDefinition();

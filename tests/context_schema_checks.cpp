@@ -197,6 +197,52 @@ struct ViewList : tracer::shared_state<ViewScope> { std::vector<std::string_view
         "admitted or rejected without a hash-specialization diagnostic: " +
         user_hash_schema.error);
   }
+  // A member that the generated codec cannot spell is reported by the schema check, with the
+  // member path, so that code generation never produces a codec that does not compile (#182).
+  auto capture_ast = clang::tooling::buildASTFromCodeWithArgs(R"cpp(
+#include <system_error>
+#include <thread>
+struct WithThreadId { std::thread::id id; };
+struct WithErrorCode { int head; std::error_code code; };
+struct Outer { int head; WithThreadId inner; };
+struct WithUnnamed { struct { int x; } inner; };
+struct WithUnnamedArray { struct { int x; } items[2]; };
+typedef struct { int y; } Named;
+struct WithNamed { Named named; };
+)cpp", arguments, "capture-install-fixture.cc");
+  if (!capture_ast || capture_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("capture install fixture failed to parse");
+  auto &capture_context = capture_ast->getASTContext();
+  const auto capture_codec = [&](const char *name, CodecAccess access) {
+    SchemaRecordFinder finder;
+    finder.name = name;
+    finder.TraverseDecl(capture_context.getTranslationUnitDecl());
+    if (!finder.record)
+      throw std::runtime_error(std::string("capture fixture record is absent: ") + name);
+    return render_payload_codec_source(
+        capture_context, clang::QualType(finder.record->getTypeForDecl(), 0), access);
+  };
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    const std::pair<const char *, const char *> unsupported[] = {
+        {"WithThreadId", "unsupported standard type: std::thread::id (member id)"},
+        {"WithErrorCode", "unsupported standard type: std::error_code (member code)"},
+        {"Outer", "unsupported standard type: std::thread::id (member inner.id)"},
+        {"WithUnnamed", "unsupported unnamed struct type (member inner)"},
+    };
+    for (const auto &[name, message] : unsupported) {
+      const auto result = capture_codec(name, access);
+      if (result || result.error != message)
+        throw std::runtime_error(std::string("expected '") + message + "' for " + name +
+                                 ", got '" + result.error + "'");
+    }
+    // A record that a typedef names for linkage has a spelling, so it is still captured.
+    const auto named = capture_codec("WithNamed", access);
+    if (!named)
+      throw std::runtime_error("typedef-named unnamed struct member was rejected: " + named.error);
+  }
+  const auto unnamed_array = capture_codec("WithUnnamedArray", CodecAccess::snapshot_members);
+  if (unnamed_array || unnamed_array.error != "unsupported unnamed struct type (member items)")
+    throw std::runtime_error("unnamed struct array member: " + unnamed_array.error);
   google::protobuf::DescriptorPool pool;
   google::protobuf::FileDescriptorSet definitions;
   if (!definitions.ParseFromString(schema.record->descriptor_set))

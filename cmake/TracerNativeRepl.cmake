@@ -1047,6 +1047,21 @@ function(tracer_add_native_repl)
           "${_std_headers_link_flags}" "${_std_headers_dwarfdump}")
       # Exit 77: no llvm-dwarfdump, so the comparison with the DWARF template tags did not run.
       set_tests_properties(native_repl_std_headers PROPERTIES TIMEOUT 1500 SKIP_RETURN_CODE 77)
+      # A value that automatic capture cannot encode must not keep a probe from installing; the
+      # fixture is rebuilt by the test with the GCC of the SDK when there is one.
+      add_executable(repl-capture-install-target tests/fixtures/repl_capture_install.cpp
+        tests/fixtures/repl_capture_install_main.cpp)
+      set_target_properties(repl-capture-install-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-capture-install-target PRIVATE -g -O0 -fno-inline
+        -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
+      target_link_options(repl-capture-install-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_capture_install
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_capture_install.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-capture-install-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${_std_headers_gxx}"
+          "${_std_headers_link_flags}")
+      set_tests_properties(native_repl_capture_install PROPERTIES TIMEOUT 900)
       add_executable(repl-variadic-target tests/fixtures/repl_variadic.cpp)
       set_target_properties(repl-variadic-target PROPERTIES CXX_STANDARD 17)
       target_compile_options(repl-variadic-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer

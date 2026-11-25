@@ -226,7 +226,8 @@ std::string schema_bytes(const context_engine::SchemaRecord &schema,
 
 ValueSnapshotCode
 make_value_snapshot_code(clang::ASTContext &ast,
-                         const clangtracer::v1::ProbeSpec &spec, bool follow_members) {
+                         const clangtracer::v1::ProbeSpec &spec, bool follow_members,
+                         const std::string &capture_unavailable) {
   ValueSnapshotCode code;
   const auto snapshot_encoders = tracer::find_snapshot_encoders(ast);
   code.has_custom_encoder = snapshot_encoders.requested;
@@ -738,6 +739,10 @@ make_value_snapshot_code(clang::ASTContext &ast,
     if (!receiver.isNull())
       add(0, Role::receiver, receiver);
   }
+  if (!capture_unavailable.empty())
+    for (auto &entry : entries)
+      if (entry.error.empty())
+        entry.error = capture_unavailable;
   for (auto &entry : entries) {
     if (entry.error.empty()) {
       configure_record_policy(entry);
@@ -937,6 +942,9 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
     }
   }
   code.declarations = scope + code.declarations;
+  code.has_automatic_capture =
+      std::any_of(entries.begin(), entries.end(),
+                  [](const auto &entry) { return entry.error.empty(); });
   const bool has_dynamic_capture =
       std::any_of(entries.begin(), entries.end(), [](const auto &entry) {
         return entry.error.empty() && !entry.dynamic_projections.empty();
@@ -950,6 +958,10 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
   // fallback that drops them can be exercised.
   if (code.has_followed_members && std::getenv("TRACER_TEST_BREAK_FOLLOWED_MEMBERS"))
     code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_FOLLOWED_MEMBERS\");\n";
+  // Test-only switch: makes any capture code fail to compile so the fallback that reports the
+  // captured values as unsupported can be exercised.
+  if (code.has_automatic_capture && std::getenv("TRACER_TEST_BREAK_CAPTURE"))
+    code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_CAPTURE\");\n";
   const bool has_automatic_capture =
       std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
         return node.member.polymorphic && !node.member.projections.empty();

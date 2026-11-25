@@ -2339,6 +2339,18 @@ target's environment forces that fallback for testing. In a followed member a
 left out by the checks or the read budget looks the same as one with no
 pointee.
 
+A value that automatic capture cannot encode never keeps the probe from
+installing: its snapshot is `UNSUPPORTED` and the timing, the other arguments and
+the result are kept. A standard-library member without a codec
+(`std::thread::id`, `std::error_code`, `std::exception_ptr`) and a member of an
+unnamed struct type are reported with the type and the member path, for example
+`unsupported standard type: std::thread::id (member id)`. If the generated
+capture code does not compile for another reason, the probe is installed with
+every captured value reported `UNSUPPORTED` and the compiler's first error, and
+the validation report says that automatic value capture was disabled. A
+callback that does not compile, a header whose layout differs from the target's
+and an invalid prepared package are still rejected.
+
 Prepared packages of probes that share application types each declare those
 types. One REPL session keeps the first declaration of a type and drops the
 repeats from later packages, reporting them as `reused imported types: ...`,
