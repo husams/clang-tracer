@@ -19,6 +19,7 @@
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/stubs/strutil.h>
+#include <google/protobuf/unknown_field_set.h>
 #include <google/protobuf/wire_format_lite.h>
 
 namespace tracer_repl {
@@ -31,6 +32,18 @@ std::string snapshot_option(const Options &options, const char *name) {
     if (option.name_size() == 1 && option.name(0).name_part() == name &&
         option.has_string_value())
       return option.string_value();
+  return {};
+}
+
+
+// The C++ type of a wide enumeration, which is stored as a plain integer field; empty for
+// any other field. See kEnumTypeOption.
+std::string wide_enum_type(const Descriptor &field) {
+  const auto &options = field.options().unknown_fields();
+  for (int i = 0; i < options.field_count(); ++i)
+    if (options.field(i).number() == tracer::context_engine::kEnumTypeOption &&
+        options.field(i).type() == google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED)
+      return options.field(i).length_delimited();
   return {};
 }
 
@@ -201,15 +214,18 @@ class SnapshotDecoder {
     case Descriptor::CPPTYPE_INT64:
       return EventValue{
           std::int64_t(repeated ? r->GetRepeatedInt64(message, &field, index)
-                                : r->GetInt64(message, &field))};
+                                : r->GetInt64(message, &field)),
+          wide_enum_type(field)};
     case Descriptor::CPPTYPE_UINT32:
       return EventValue{
           std::uint64_t(repeated ? r->GetRepeatedUInt32(message, &field, index)
-                                 : r->GetUInt32(message, &field))};
+                                 : r->GetUInt32(message, &field)),
+          wide_enum_type(field)};
     case Descriptor::CPPTYPE_UINT64:
       return EventValue{
           std::uint64_t(repeated ? r->GetRepeatedUInt64(message, &field, index)
-                                 : r->GetUInt64(message, &field))};
+                                 : r->GetUInt64(message, &field)),
+          wide_enum_type(field)};
     case Descriptor::CPPTYPE_FLOAT:
       return EventValue{double(repeated
                                    ? r->GetRepeatedFloat(message, &field, index)

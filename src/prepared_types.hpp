@@ -33,6 +33,9 @@ inline std::string type_name(clang::ASTContext &ast, clang::QualType type) {
   clang::PrintingPolicy policy(ast.getLangOpts());
   policy.SuppressTagKeyword = true;
   policy.FullyQualifiedName = true;
+  // An unnamed record is spelled without the file and line that declare it: the header and
+  // its adapter declare it at different places.
+  policy.AnonymousTagLocations = false;
   return type.getCanonicalType().getAsString(policy);
 }
 

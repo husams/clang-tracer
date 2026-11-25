@@ -100,6 +100,80 @@ template <class T> T scalar_as(const ScalarValue &value) {
   throw std::invalid_argument(
       "event value type does not match requested C++ type");
 }
+
+template <class T> struct is_int128 : std::false_type {};
+#if defined(__SIZEOF_INT128__)
+template <> struct is_int128<__int128> : std::true_type {};
+template <> struct is_int128<unsigned __int128> : std::true_type {};
+#endif
+
+// The value of a captured long double: `bytes` holds it in the target's `format`, least
+// significant byte first. It is exact when the local long double has that format, and the
+// nearest local value otherwise.
+inline long double decode_long_double(std::string_view format, std::string_view bytes) {
+  const auto bits = [&](std::size_t first, std::size_t count) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < count; ++i)
+      value |= std::uint64_t(static_cast<unsigned char>(bytes[first + i])) << (8 * i);
+    return value;
+  };
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  constexpr bool little_endian = true;
+#else
+  constexpr bool little_endian = false;
+#endif
+  const auto same_format = [&](int digits) {
+    return little_endian && std::numeric_limits<long double>::digits == digits &&
+           bytes.size() <= sizeof(long double);
+  };
+  const auto exact = [&] {
+    long double value = 0;
+    __builtin_memcpy(&value, bytes.data(), bytes.size());
+    return value;
+  };
+  const auto special = [](bool nan) {
+    return nan ? std::numeric_limits<long double>::quiet_NaN()
+               : std::numeric_limits<long double>::infinity();
+  };
+  long double magnitude = 0;
+  bool negative = false;
+  if (format == "x87-extended-80" && bytes.size() == 10) {
+    if (same_format(64))
+      return exact();
+    const auto significand = bits(0, 8);
+    const auto exponent = static_cast<int>(bits(8, 2) & 0x7fff);
+    negative = (bits(8, 2) & 0x8000) != 0;
+    magnitude = exponent == 0x7fff
+                    ? special((significand << 1) != 0)
+                    : std::ldexp(static_cast<long double>(significand),
+                                 (exponent ? exponent : 1) - 16383 - 63);
+  } else if (format == "ieee-binary128" && bytes.size() == 16) {
+    if (same_format(113))
+      return exact();
+    const auto low = bits(0, 8), high = bits(8, 8);
+    const auto exponent = static_cast<int>((high >> 48) & 0x7fff);
+    const auto fraction = high & 0xffffffffffffULL;
+    negative = (high >> 63) != 0;
+    if (exponent == 0x7fff) {
+      magnitude = special(fraction != 0 || low != 0);
+    } else {
+      auto significand = std::ldexp(static_cast<long double>(fraction), 64) +
+                         static_cast<long double>(low);
+      if (exponent)
+        significand += std::ldexp(1.0L, 112);
+      magnitude = std::ldexp(significand, (exponent ? exponent : 1) - 16383 - 112);
+    }
+  } else if (format == "ieee-binary64" && bytes.size() == 8) {
+    const auto raw = bits(0, 8);
+    double value = 0;
+    __builtin_memcpy(&value, &raw, sizeof(value));
+    return value;
+  } else {
+    throw std::invalid_argument("event long double has an unsupported format: " +
+                                std::string(format));
+  }
+  return negative ? -magnitude : magnitude;
+}
 } // namespace detail
 
 // All strings, nested fields and elements own their data. Copies remain usable
@@ -176,7 +250,21 @@ public:
       throw std::invalid_argument("event value is not a string");
     } else if constexpr (std::is_enum_v<T>) {
       return static_cast<T>(as<std::underlying_type_t<T>>());
+    } else if constexpr (detail::is_int128<std::remove_cv_t<T>>::value) {
+      return this->template wide_integer<std::remove_cv_t<T>>();
     } else if constexpr (std::is_arithmetic_v<T>) {
+      if constexpr (std::is_floating_point_v<T>) {
+        // A captured long double. A narrower type is an explicit request for the nearest
+        // value it has.
+        if (std::holds_alternative<Object>(data_)) {
+          const auto value = long_double();
+          if constexpr (!std::is_same_v<std::remove_cv_t<T>, long double>)
+            if (std::isfinite(value) && (value > std::numeric_limits<T>::max() ||
+                                         value < std::numeric_limits<T>::lowest()))
+              throw std::out_of_range("event float is outside requested range");
+          return static_cast<T>(value);
+        }
+      }
       if (const auto *v = std::get_if<bool>(&data_))
         return detail::scalar_as<T>(ScalarValue{*v});
       if (const auto *v = std::get_if<std::int64_t>(&data_))
@@ -194,6 +282,58 @@ public:
   Reconstructed<std::remove_cv_t<T>> as() const {
     return EventCodec<std::remove_cv_t<T>>::decode(*this);
   }
+
+private:
+  long double long_double() const {
+    const auto &object = std::get<Object>(data_);
+    const auto format = object.find("format"), bytes = object.find("bytes");
+    const auto *format_text =
+        format == object.end() ? nullptr : std::get_if<std::string>(&format->second.data_);
+    const auto *value_bytes =
+        bytes == object.end() ? nullptr : std::get_if<std::string>(&bytes->second.data_);
+    if (!format_text || !value_bytes)
+      throw std::invalid_argument("event value is not a scalar");
+    return detail::decode_long_double(*format_text, *value_bytes);
+  }
+
+#if defined(__SIZEOF_INT128__)
+  // A 128-bit integer is captured as two 64-bit halves: value = high * 2^64 + low, and the
+  // high half of a signed one carries the sign. A 64-bit event integer widens.
+  template <class T> T wide_integer() const {
+    using Unsigned = unsigned __int128;
+    constexpr bool wants_signed = std::is_same_v<T, __int128>;
+    const auto out_of_range = [] {
+      return std::out_of_range("event integer is outside requested range");
+    };
+    if (const auto *v = std::get_if<std::int64_t>(&data_)) {
+      if (!wants_signed && *v < 0)
+        throw out_of_range();
+      return static_cast<T>(*v);
+    }
+    if (const auto *v = std::get_if<std::uint64_t>(&data_))
+      return static_cast<T>(*v);
+    const auto *object = std::get_if<Object>(&data_);
+    if (!object)
+      throw std::invalid_argument("event value is not an integer");
+    const auto low = object->find("low"), high = object->find("high");
+    const auto *low_bits =
+        low == object->end() ? nullptr : std::get_if<std::uint64_t>(&low->second.data_);
+    if (!low_bits || high == object->end())
+      throw std::invalid_argument("event value is not an integer");
+    if (const auto *signed_high = std::get_if<std::int64_t>(&high->second.data_)) {
+      if (!wants_signed && *signed_high < 0)
+        throw out_of_range();
+      return static_cast<T>((static_cast<Unsigned>(static_cast<std::uint64_t>(*signed_high)) << 64) |
+                            *low_bits);
+    }
+    const auto *unsigned_high = std::get_if<std::uint64_t>(&high->second.data_);
+    if (!unsigned_high)
+      throw std::invalid_argument("event value is not an integer");
+    if (wants_signed && (*unsigned_high >> 63) != 0)
+      throw out_of_range();
+    return static_cast<T>((static_cast<Unsigned>(*unsigned_high) << 64) | *low_bits);
+  }
+#endif
 };
 
 namespace detail {
@@ -434,6 +574,38 @@ template <> struct EventCodec<std::monostate> {
     if (!value.fields().empty())
       throw std::invalid_argument("event monostate is not empty");
     return {};
+  }
+};
+
+// The explicit null marker a std::nullptr_t is captured as.
+template <> struct EventCodec<std::nullptr_t> {
+  static std::nullptr_t decode(const EventValue &value) {
+    if (!value.field("null").template as<bool>())
+      throw std::invalid_argument("event null marker is not set");
+    return nullptr;
+  }
+};
+
+// A pointer to a data member is the offset of the member, which is also its local value
+// when both sides use the Itanium C++ ABI and lay the class out alike. A pointer to a
+// member function names code of the target: only a null one has a local value.
+template <class C, class M> struct EventCodec<M C::*> {
+  static M C::*decode(const EventValue &value) {
+    if (value.field("null").template as<bool>())
+      return nullptr;
+    if constexpr (std::is_member_function_pointer_v<M C::*>) {
+      throw std::invalid_argument(
+          "a member function pointer of the target has no local value");
+    } else {
+      if (value.field("abi").template as<std::string>() != "itanium" ||
+          sizeof(M C::*) != sizeof(std::ptrdiff_t))
+        throw std::invalid_argument("event member pointer uses another C++ ABI");
+      const auto offset =
+          static_cast<std::ptrdiff_t>(value.field("offset").template as<std::int64_t>());
+      M C::*result = nullptr;
+      __builtin_memcpy(&result, &offset, sizeof(offset));
+      return result;
+    }
   }
 };
 

@@ -53,7 +53,9 @@ enum class SchemaKind : std::uint8_t {
   list,
   set,
   unordered_set,
-  unordered_map
+  unordered_map,
+  // Raw bytes: a union's object representation, a long double's value bytes.
+  bytes
 };
 enum class CapturePathSelector : std::uint8_t {
   field_number,
@@ -79,7 +81,8 @@ struct CaptureLimitView {
 
 struct SchemaField {
   std::string name, cpp_type, enum_name;
-  std::vector<std::pair<std::string, std::int32_t>> enum_values;
+  // An unsigned enumerator above INT64_MAX keeps its bit pattern; see enum_unsigned.
+  std::vector<std::pair<std::string, std::int64_t>> enum_values;
   std::uint32_t number = 0;
   SchemaKind kind = SchemaKind::message;
   unsigned bit_width = 0;
@@ -87,6 +90,10 @@ struct SchemaField {
   std::shared_ptr<const struct SchemaMessage> message;
   std::shared_ptr<const SchemaField> key, value;
   std::size_t fixed_count = 0;
+  // A wide enumeration does not fit a protobuf enum, whose numbers are 32-bit: its
+  // underlying type is wider than 32 bits or an enumerator is outside the int32 range.
+  // It is stored as an integer of the underlying width and signedness.
+  bool enum_wide = false, enum_unsigned = false;
 };
 
 struct SchemaMessage {

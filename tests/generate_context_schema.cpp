@@ -207,6 +207,13 @@ int main(int argc, char **argv) {
       throw std::runtime_error("generic object alias missing");
     emit_payload("generic_object", object_alias.alias->getUnderlyingType(),
                  0x47);
+    FoundAlias abi_alias;
+    abi_alias.wanted = "Abi";
+    abi_alias.TraverseDecl(
+        generic_ast->getASTContext().getTranslationUnitDecl());
+    if (!abi_alias.alias)
+      throw std::runtime_error("generic scalar record alias missing");
+    emit_payload("generic_scalars", abi_alias.alias->getUnderlyingType(), 0x48);
     out << "}\n";
     for (const auto &codec : codecs)
       out << codec << "\n";

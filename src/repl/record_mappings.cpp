@@ -255,16 +255,28 @@ class Generator {
       return false;
     }
     type = type.getCanonicalType();
-    if (type.isVolatileQualified() || type->isReferenceType() || type->isPointerType()) {
+    // A volatile scalar was loaded once when it was captured and is assigned like any other.
+    if ((type.isVolatileQualified() && !type->isScalarType()) || type->isReferenceType() ||
+        type->isPointerType()) {
       reason = "pointer/reference/volatile fields require a custom codec";
       return false;
     }
     type = type.getUnqualifiedType();
     if (type->isEnumeralType() || type->isArithmeticType()) {
-      if (ast_.getTypeSize(type) <= 64) {
+      if (ast_.getTypeSize(type) <= 64 ||
+          type->isSpecificBuiltinType(clang::BuiltinType::Int128) ||
+          type->isSpecificBuiltinType(clang::BuiltinType::UInt128) ||
+          type->isSpecificBuiltinType(clang::BuiltinType::LongDouble)) {
         return true;
       }
       reason = "numeric fields wider than 64 bits are unsupported";
+      return false;
+    }
+    if (type->isNullPtrType() || type->isMemberDataPointerType()) {
+      return true;
+    }
+    if (type->isMemberFunctionPointerType()) {
+      reason = "a member function pointer of the target has no local value";
       return false;
     }
     auto* record = type->getAsCXXRecordDecl();
@@ -789,7 +801,7 @@ class Generator {
         mapped.wire_name = mapped.owner + "::" + mapped.wire_name;
       }
       const auto type = field->getType().getCanonicalType();
-      if (type.isVolatileQualified()) {
+      if (type.isVolatileQualified() && (!type->isScalarType() || type->isPointerType())) {
         return fail(field_name + ": pointer/reference/volatile fields require a custom codec");
       }
       if (type->isReferenceType()) {

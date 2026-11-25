@@ -81,6 +81,17 @@ private:
                          bool pointer_layouts,
                          const std::vector<const clang::CXXRecordDecl *> &snapshot_types) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
+    // A union is declared where it is a member or a referent. One that the callable takes or
+    // returns by value, or whose method is selected, is part of the call itself.
+    const auto reject_union = [](const clang::CXXRecordDecl *record) {
+      if (record && record->isUnion())
+        unsupported(*record, "union layout requires an explicit adapter");
+    };
+    reject_union(function.getReturnType().getCanonicalType()->getAsCXXRecordDecl());
+    for (const auto *parameter : function.parameters())
+      reject_union(parameter->getType().getCanonicalType()->getAsCXXRecordDecl());
+    if (selected_method_)
+      reject_union(selected_method_->getParent());
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
       register_nested(*selected_method_->getParent());
@@ -151,10 +162,38 @@ private:
     return source;
   }
 
+  // The type of a declarator after its array extents.
+  clang::QualType array_element(clang::QualType type) {
+    while (const auto *array = ast_.getAsArrayType(type))
+      type = array->getElementType();
+    return type;
+  }
+
   std::string spelling(clang::QualType type, llvm::StringRef name = {}) {
+    type = type.getCanonicalType();
+    std::string declarator = name.str();
+    // Clang prints the class of a canonical member pointer type without its scope, so a
+    // declarator that reaches one is spelled here: `int ::shop::Order::*name`.
+    while (array_element(type)->isMemberPointerType()) {
+      if (const auto *array = ast_.getAsConstantArrayType(type)) {
+        declarator += "[" + std::to_string(array->getSize().getZExtValue()) + "]";
+        type = array->getElementType();
+        continue;
+      }
+      const auto *member = type->getAs<clang::MemberPointerType>();
+      if (!member)
+        break;
+      const auto qualifiers = type.getLocalQualifiers().getAsString();
+      declarator = "::" + spelling(record_type(ast_, member->getMostRecentCXXRecordDecl())) +
+                   "::*" + (qualifiers.empty() ? "" : " " + qualifiers) +
+                   (declarator.empty() ? "" : " " + declarator);
+      type = member->getPointeeType().getCanonicalType();
+      if (type->isArrayType())
+        declarator = "(" + declarator + ")";
+    }
     std::string result;
     llvm::raw_string_ostream out(result);
-    type.getCanonicalType().print(out, policy_, name);
+    type.print(out, policy_, declarator);
     return result;
   }
 
@@ -413,8 +452,20 @@ private:
       source += name + " ";
     source += ": " + spelling(decl->getIntegerType()) + " {\n";
     for (const auto *value : decl->enumerators()) {
+      const auto &initial = value->getInitVal();
       llvm::SmallString<32> number;
-      value->getInitVal().toString(number, 10);
+      if (initial.isSigned() && initial.isMinSignedValue() && initial.getBitWidth() >= 64) {
+        // No literal has the most negative value: `-9223372036854775808` negates a number
+        // that does not fit.
+        auto next = initial;
+        ++next;
+        next.toString(number, 10);
+        number += " - 1";
+      } else {
+        initial.toString(number, 10);
+        if (initial.isUnsigned() && initial.getActiveBits() > 63)
+          number += "ULL";
+      }
       source += value->getNameAsString() + " = " + number.str().str() + ",\n";
     }
     place_declaration(*decl, source + (by_typedef ? "} " + name + ";\n" : "};\n"));
@@ -567,6 +618,12 @@ private:
       visit(type->getPointeeType(), false);
     } else if (type->isReferenceType()) {
       visit(type.getNonReferenceType(), complete);
+    } else if (const auto *member = type->getAs<clang::MemberPointerType>()) {
+      // A member pointer has the same layout whether or not its class is complete.
+      visit(record_type(ast_, member->getMostRecentCXXRecordDecl()), false);
+      visit(member->getPointeeType(), false);
+    } else if (type->isNullPtrType()) {
+      standard_headers_.insert("cstddef");
     } else if (const auto *function = type->getAs<clang::FunctionProtoType>()) {
       visit(function->getReturnType(), false);
       for (auto parameter : function->param_types())
@@ -709,8 +766,6 @@ private:
     if (!emitted_.insert(identity).second)
       return;
     emitting_.insert(identity);
-    if (record.isUnion())
-      unsupported(record, "union layout requires an explicit adapter");
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
     std::string source = specialization_prefix(record) + (unnamed ? "typedef " : "") +
                          std::string(record.getKindName()) + " alignas(" +
@@ -751,22 +806,8 @@ private:
           emit_constant(*constant);
       }
     }
-    for (const auto *field : record.fields()) {
-      visit(field->getType());
-      std::string member;
-      if (field->hasAttr<clang::NoUniqueAddressAttr>())
-        member += "[[no_unique_address]] ";
-      if (field->hasAttr<clang::PackedAttr>())
-        member += "__attribute__((packed)) ";
-      if (const auto alignment = field->getMaxAlignment())
-        member += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
-      if (field->isMutable())
-        member += "mutable ";
-      member += spelling(field->getType(), field->getName());
-      if (field->isBitField())
-        member += " : " + std::to_string(field->getBitWidthValue());
-      members.emplace_back(field->getAccess(), member + ";\n");
-    }
+    for (auto &member : member_declarations(record, record.isUnion()))
+      members.push_back(std::move(member));
     bool emitted_selected = false;
     bool emitted_default_constructor = false;
     for (const auto *method : record.methods()) {
@@ -848,6 +889,92 @@ private:
       add(wanted, member);
     emitting_.erase(identity);
     place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
+  }
+
+  // An unnamed union that no typedef names has no declaration apart from the member whose
+  // type it is, and neither has an unnamed record inside one.
+  const clang::CXXRecordDecl *inline_record(clang::QualType type, bool inside_union) {
+    const auto *record = array_element(type.getCanonicalType())->getAsCXXRecordDecl();
+    record = record ? record->getDefinition() : nullptr;
+    return record && !record->getIdentifier() && !record->getTypedefNameForAnonDecl() &&
+                   (record->isUnion() || inside_union)
+               ? record
+               : nullptr;
+  }
+
+  std::string inline_definition(const clang::CXXRecordDecl &record) {
+    const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
+    std::string source = std::string(record.getKindName()) + " alignas(" +
+                         std::to_string(alignment) + ") ";
+    if (record.hasAttr<clang::PackedAttr>())
+      source += "__attribute__((packed)) ";
+    source += record.isClass() ? "{\npublic:\n" : "{\n";
+    for (const auto &[access, member] : member_declarations(record, /*inside_union=*/true))
+      source += member;
+    return source + "}";
+  }
+
+  // What precedes the type of a data member.
+  std::string member_prefix(const clang::FieldDecl &field) {
+    std::string prefix;
+    if (field.hasAttr<clang::NoUniqueAddressAttr>())
+      prefix += "[[no_unique_address]] ";
+    if (field.hasAttr<clang::PackedAttr>())
+      prefix += "__attribute__((packed)) ";
+    if (const auto alignment = field.getMaxAlignment())
+      prefix += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
+    if (field.isMutable())
+      prefix += "mutable ";
+    return prefix;
+  }
+
+  // The data members of `record`, each with its access. Consecutive members declared with
+  // one unnamed type, as in `union { ... } a, b[2];`, share its single definition, so the
+  // type stays one type.
+  std::vector<std::pair<clang::AccessSpecifier, std::string>>
+  member_declarations(const clang::CXXRecordDecl &record, bool inside_union) {
+    std::vector<std::pair<clang::AccessSpecifier, std::string>> members;
+    const std::vector<const clang::FieldDecl *> fields(record.field_begin(), record.field_end());
+    // The qualifiers of an unnamed member type, and the name and array extents after it.
+    const auto qualifiers = [&](const clang::FieldDecl &field) {
+      const auto text =
+          array_element(field.getType().getCanonicalType()).getLocalQualifiers().getAsString();
+      return text.empty() ? text : text + " ";
+    };
+    const auto declarator = [&](const clang::FieldDecl &field) {
+      auto declared = field.getNameAsString();
+      auto type = field.getType().getCanonicalType();
+      for (; const auto *array = ast_.getAsConstantArrayType(type); type = array->getElementType())
+        declared += "[" + std::to_string(array->getSize().getZExtValue()) + "]";
+      if (ast_.getAsArrayType(type))
+        unsupported(field, "an array of unknown bound of an unnamed type is unsupported");
+      return declared;
+    };
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+      const auto &field = *fields[index];
+      const auto *unnamed = inline_record(field.getType(), inside_union);
+      if (!unnamed) {
+        visit(field.getType());
+        auto member = member_prefix(field) + spelling(field.getType(), field.getName());
+        if (field.isBitField())
+          member += " : " + std::to_string(field.getBitWidthValue());
+        members.emplace_back(field.getAccess(), member + ";\n");
+        continue;
+      }
+      auto declarators = declarator(field);
+      while (index + 1 < fields.size() &&
+             inline_record(fields[index + 1]->getType(), inside_union) == unnamed) {
+        const auto &next = *fields[++index];
+        if (member_prefix(next) != member_prefix(field) || qualifiers(next) != qualifiers(field) ||
+            next.getAccess() != field.getAccess())
+          unsupported(next, "members that share an unnamed type must be declared alike");
+        declarators += ", " + declarator(next);
+      }
+      members.emplace_back(field.getAccess(),
+                           member_prefix(field) + qualifiers(field) + inline_definition(*unnamed) +
+                               (declarators.empty() ? "" : " " + declarators) + ";\n");
+    }
+    return members;
   }
 
   // The declarations queued for `owner`, each one a public member.
