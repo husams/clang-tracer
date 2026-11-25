@@ -491,6 +491,8 @@ struct Probe {
   std::string session_id;
   long long (*callback)(const tracer::TraceContext *, void *, bool *) = nullptr;
   std::vector<std::string> argument_names;
+  // Members automatic capture leaves out of the values the wrapper snapshots.
+  std::vector<std::string> capture_notes;
   bool class_callback = false;
   bool has_pre = false;
   bool has_post = false;
@@ -1426,6 +1428,35 @@ void set_error(tracer::Request *request, const char *text) noexcept {
 }
 
 bool valid_type(tracer::ValueType type, bool result);
+
+// Hands the members the capture leaves out back to the server, one note per line,
+// beside the callback source it passed. Nothing is written when there are none.
+void write_capture_notes(const char *source_path, const std::vector<std::string> &notes) {
+  if (notes.empty() || !source_path || !source_path[0])
+    return;
+  std::string text;
+  for (auto note : notes) {
+    std::replace(note.begin(), note.end(), '\n', ' ');
+    std::replace(note.begin(), note.end(), '\r', ' ');
+    text += note + "\n";
+  }
+  const int descriptor = ::open((std::string(source_path) + ".notes").c_str(),
+                                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (descriptor < 0)
+    return;
+  const char *data = text.data();
+  std::size_t left = text.size();
+  while (left) {
+    const auto written = ::write(descriptor, data, left);
+    if (written < 0 && errno == EINTR)
+      continue;
+    if (written <= 0)
+      break;
+    data += written;
+    left -= static_cast<std::size_t>(written);
+  }
+  ::close(descriptor);
+}
 
 bool read_probe_spec(tracer::Request& request, std::vector<tracer::ValueType>& arguments,
                      clangtracer::v1::ProbeSpec& spec, std::string& error) {
@@ -6253,7 +6284,7 @@ public:
     result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
     if (!validate_snapshot_encoder(shape, result_.snapshots, result_.error))
       return;
-    if (result_.snapshots.has_followed_members)
+    if (result_.snapshots.has_followed_members || result_.snapshots.has_omitted_members)
       result_.snapshots_plain = tracer::make_value_snapshot_code(context, spec_, false);
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
@@ -7244,6 +7275,21 @@ bool initialize_prepared_code(clang::Interpreter &interpreter,
   return true;
 }
 
+// The members the capture code of an installed or validated probe leaves out: the
+// session reads them from the probe, a validation report carries them as notes.
+void report_capture_notes(Probe &p, clangtracer::v1::ValidationReport *report,
+                          const std::vector<std::string> &notes) {
+  p.capture_notes = notes;
+  if (!report)
+    return;
+  for (const auto &text : notes) {
+    auto *note = report->add_diagnostics();
+    note->set_stage("snapshot");
+    note->set_severity("note");
+    note->set_message(text);
+  }
+}
+
 bool compile_shared_probe(Probe &p,
                           const clangtracer::v1::ProbeSpec &specification,
                           const std::vector<std::string> &arguments,
@@ -7292,16 +7338,18 @@ bool compile_shared_probe(Probe &p,
       callback_includes + requested_header_source +
       (has_real_headers ? enum_declarations : recovered_record_declarations(specification)) +
       receiver_alias + argument_aliases(specification);
-  // Followed members must never turn a probe that worked into one that does not
-  // compile: when the wrapper fails to compile with them, it is built without.
-  const bool can_fall_back = snapshots.has_followed_members && plain_snapshots;
+  // Followed members and partial records must never turn a probe that worked into
+  // one that does not compile: when the wrapper fails to compile with them, it is
+  // built without.
+  const bool can_fall_back =
+      (snapshots.has_followed_members || snapshots.has_omitted_members) && plain_snapshots;
   const auto fall_back_note = [&] {
     if (!report)
       return;
     auto *note = report->add_diagnostics();
     note->set_stage("snapshot");
     note->set_severity("note");
-    note->set_message("followed pointer and reference members were disabled because the "
+    note->set_message("followed members and partial record capture were disabled because the "
                       "generated capture code did not compile");
   };
   const auto plain_wrapper = [&] {
@@ -7338,6 +7386,7 @@ bool compile_shared_probe(Probe &p,
   const auto *effective_snapshots =
       use_plain ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
                 : wrapper_snapshots;
+  report_capture_notes(p, report, use_plain ? plain_snapshots->notes : snapshots.notes);
   activation.compiler_arguments = arguments;
   activation.callback_log = &tracer::detail::tracer_enqueue_log;
   // Target functions that the hooks call are entered through generated code
@@ -8549,8 +8598,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return ast && !capture.had_error();
     };
     baseline_preflight_succeeded = build_complete(snapshots, complete_capture);
-    if (!baseline_preflight_succeeded && snapshots.has_followed_members) {
-      // Followed pointer and reference members must never turn a probe that
+    std::vector<std::string> capture_notes = snapshots.notes;
+    if (!baseline_preflight_succeeded &&
+        (snapshots.has_followed_members || snapshots.has_omitted_members)) {
+      // Followed members and partial records must never turn a probe that
       // worked into one that does not compile: capture without them instead.
       const auto fallback = tracer::make_value_snapshot_code(
           user_ast->getASTContext(), specification, false);
@@ -8567,13 +8618,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
           auto *note = report->add_diagnostics();
           note->set_stage("snapshot");
           note->set_severity("note");
-          note->set_message("followed pointer and reference members were disabled because the "
+          note->set_message("followed members and partial record capture were disabled because the "
                             "generated capture code did not compile");
         }
         followed_members_disabled = true;
         baseline_preflight_succeeded = true;
+        capture_notes = fallback.notes;
       }
     }
+    if (baseline_preflight_succeeded)
+      report_capture_notes(p, report, capture_notes);
     if (!baseline_preflight_succeeded) {
       baseline_error = complete_capture.message();
       if (baseline_error.empty()) {
@@ -8817,10 +8871,13 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         run_callback_tool(make_final_action, complete_source, [&] {
           return final_shape.valid && import_error.empty();
         });
+    const tracer::ValueSnapshotCode *used_snapshots = &receiver_shape.snapshots;
     if ((!complete_syntax_ok || !final_shape.valid || !import_error.empty()) &&
-        receiver_shape.snapshots.has_followed_members) {
-      // Followed members must never turn a probe that worked into one that
-      // does not compile: capture without them instead.
+        (receiver_shape.snapshots.has_followed_members ||
+         receiver_shape.snapshots.has_omitted_members)) {
+      // Followed members and partial records must never turn a probe that worked
+      // into one that does not compile: capture without them instead.
+      used_snapshots = &receiver_shape.snapshots_plain;
       assemble(receiver_shape.snapshots_plain);
       complete_syntax_ok = run_callback_tool(make_final_action, complete_source, [&] {
         return final_shape.valid && import_error.empty();
@@ -8829,10 +8886,12 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         auto *note = report->add_diagnostics();
         note->set_stage("snapshot");
         note->set_severity("note");
-        note->set_message("followed pointer and reference members were disabled because the "
+        note->set_message("followed members and partial record capture were disabled because the "
                           "generated capture code did not compile");
       }
     }
+    if (complete_syntax_ok && final_shape.valid && import_error.empty())
+      report_capture_notes(p, report, used_snapshots->notes);
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;
       if (error.empty()) {
@@ -8900,18 +8959,26 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
   out.set_status(static_cast<Snapshot::Status>(in.status));
   if (in.cpp_type) out.set_cpp_type(in.cpp_type);
   if (in.detail) out.set_detail(in.detail);
-  if (in.status != tracer::ValueSnapshot::Complete)
+  if (in.status != tracer::ValueSnapshot::Complete &&
+      in.status != tracer::ValueSnapshot::Partial)
     return;
   if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
       in.payload_size > tracer::snapshot_slice_request().load() ||
       (!in.payload && in.payload_size != 0) ||
       in.container_role_count > 128 || in.record_type_count > 128 ||
+      (in.unavailable_count && !in.unavailable) ||
       (in.member_count && (!member_depth || !in.members ||
                            in.member_count > tracer::snapshot_member_request().load()))) {
     out.set_status(Snapshot::FAILED);
     out.set_detail("invalid snapshot storage or capture bounds");
     return;
   }
+  for (std::size_t i = 0; i < in.unavailable_count; ++i)
+    if (!in.unavailable[i].record_type || !in.unavailable[i].name) {
+      out.set_status(Snapshot::FAILED);
+      out.set_detail("invalid snapshot storage or capture bounds");
+      return;
+    }
   out.set_root_type(in.root_type);
   out.set_descriptor_set(in.descriptor, in.descriptor_size);
   if (in.payload_size)
@@ -8920,6 +8987,15 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
     out.add_container_roles(in.container_roles[i]);
   for (std::size_t i = 0; i < in.record_type_count; ++i)
     out.add_record_types(in.record_types[i]);
+  for (std::size_t i = 0; i < in.unavailable_count; ++i) {
+    const auto &item = in.unavailable[i];
+    auto &encoded = *out.add_unavailable();
+    encoded.set_record_type(item.record_type);
+    encoded.set_name(item.name);
+    if (item.cpp_type) encoded.set_cpp_type(item.cpp_type);
+    if (item.reason) encoded.set_reason(item.reason);
+    encoded.set_number(item.number);
+  }
   for (std::size_t i = 0; i < in.member_count; ++i) {
     const auto &member = in.members[i];
     if (!member.name || !member.snapshot)
@@ -9627,6 +9703,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
+    write_capture_notes(request->source_path, p->capture_notes);
     if (p->request.patch_backend == tracer::NativePatch::CallSite) {
       if (!tracer::native_detour::prepare_call_relay(
               p->request.patch_address, p->trampoline, p->mapping_size, p->wrapper,

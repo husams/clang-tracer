@@ -26,7 +26,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 32 requires dynamically growing probe storage in the target agent.
 // Version 33 replaces fixed argument/named-value arrays with invocation views;
 // signature argument types are loaded from the serialized ProbeSpec.
-inline constexpr std::uint32_t kBootstrapVersion = 33;
+// Version 34 adds partial value snapshots and the table of members left out.
+inline constexpr std::uint32_t kBootstrapVersion = 34;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -95,6 +96,15 @@ enum class TracePhase : std::uint32_t { Pre = 1, Post = 2, Exception = 3 };
 enum class LogLevel : std::uint8_t { Info, Warning, Error };
 
 struct ValueSnapshot;
+// A member automatic capture left out of a record when the capture code was
+// generated: it is never in the payload, whatever the object holds.
+struct ValueSnapshotUnavailable {
+  const char *record_type = nullptr; // Protobuf message name of the record, as in record_types.
+  const char *name = nullptr;
+  const char *cpp_type = nullptr;
+  const char *reason = nullptr;
+  std::uint32_t number = 0; // The field number the member keeps reserved.
+};
 struct ValueSnapshotMember {
   const char *name = nullptr;
   const ValueSnapshot *snapshot = nullptr;
@@ -108,7 +118,10 @@ struct ValueSnapshot {
     Complete = 1,
     Unsupported = 2,
     LimitExceeded = 3,
-    Failed = 4
+    Failed = 4,
+    // The payload is valid; the members listed in `unavailable` were left out
+    // when the capture code was generated.
+    Partial = 5
   };
   const char *cpp_type = nullptr;
   const char *root_type = nullptr;
@@ -124,6 +137,8 @@ struct ValueSnapshot {
   std::size_t record_type_count = 0;
   const ValueSnapshotMember *members = nullptr;
   std::size_t member_count = 0;
+  const ValueSnapshotUnavailable *unavailable = nullptr;
+  std::size_t unavailable_count = 0;
 };
 
 struct TraceValue {

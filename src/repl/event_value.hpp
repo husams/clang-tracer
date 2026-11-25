@@ -116,6 +116,8 @@ private:
   std::string type_;
   std::string descriptor_type_;
   std::string container_role_;
+  // Members of this record that capture left out when the probe was installed.
+  std::map<std::string, std::string> unavailable_;
 
 public:
   EventValue() = default;
@@ -125,22 +127,46 @@ public:
   EventValue &operator=(EventValue &&) noexcept = default;
   ~EventValue();
   explicit EventValue(Data data, std::string cpp_type = {},
-                      std::string descriptor_type = {}, std::string container_role = {})
+                      std::string descriptor_type = {}, std::string container_role = {},
+                      std::map<std::string, std::string> unavailable = {})
       : data_(std::move(data)), type_(std::move(cpp_type)),
-        descriptor_type_(std::move(descriptor_type)), container_role_(std::move(container_role)) {}
+        descriptor_type_(std::move(descriptor_type)), container_role_(std::move(container_role)),
+        unavailable_(std::move(unavailable)) {}
   bool matches_record_type(std::string_view name) const;
   const std::string &cpp_type() const { return type_; }
   const std::string &descriptor_type() const { return descriptor_type_; }
   const Data &data() const { return data_; }
   const std::string &container_role() const { return container_role_; }
+  // Member name -> why capture left it out; empty for a record captured whole.
+  const std::map<std::string, std::string> &unavailable() const { return unavailable_; }
+  // True when this record, or one nested in it, was captured without a member.
+  bool is_partial() const {
+    if (!unavailable_.empty())
+      return true;
+    if (const auto *object = std::get_if<Object>(&data_)) {
+      for (const auto &item : *object)
+        if (item.second.is_partial())
+          return true;
+    } else if (const auto *array = std::get_if<Array>(&data_)) {
+      for (const auto &item : *array)
+        if (item.is_partial())
+          return true;
+    }
+    return false;
+  }
   bool is_null() const { return std::holds_alternative<std::monostate>(data_); }
   const EventValue &field(const std::string &name) const {
     const auto *object = std::get_if<Object>(&data_);
     if (!object)
       throw std::invalid_argument("event value is not a class/struct");
     const auto found = object->find(name);
-    if (found == object->end())
+    if (found == object->end()) {
+      const auto left_out = unavailable_.find(name);
+      if (left_out != unavailable_.end())
+        throw std::out_of_range("event field was not captured: " + name + ": " +
+                                left_out->second);
       throw std::out_of_range("event field unavailable: " + name);
+    }
     return found->second;
   }
   const Object &fields() const {
@@ -500,7 +526,7 @@ template <class T> struct EventCodec<std::optional<T>> {
       while (!type.empty() && type.back() == ' ')
         type.remove_suffix(1);
       return EventValue{value.data(), std::string(type), value.descriptor_type(),
-                        value.container_role()}.template as<T>();
+                        value.container_role(), value.unavailable()}.template as<T>();
     }
     return value.template as<T>();
   }

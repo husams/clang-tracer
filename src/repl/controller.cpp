@@ -1750,6 +1750,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
     out_ << std::dec;
   }
   out_ << '\n';
+  for (const auto &note : result.capture_notes())
+    out_ << "capture note: " << note << '\n';
   return result.id();
 }
 

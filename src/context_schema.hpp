@@ -3,7 +3,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -89,9 +92,21 @@ struct SchemaField {
   std::size_t fixed_count = 0;
 };
 
+// A member that capture leaves out of a record. It keeps its field number.
+struct SchemaUnavailable {
+  // `name` is unique among the fields and the members left out of one message. It is
+  // the member's own name unless that is shared with another member of the message
+  // (then `Owner::name`), or an unnamed member's description, which carries its field
+  // number when several share it: "(anonymous union #3)". `owner` is the record that
+  // declares the member, which can be a base of the message's record.
+  std::string name, cpp_type, reason, owner;
+  std::uint32_t number = 0;
+};
+
 struct SchemaMessage {
   std::string cpp_type, full_name;
   std::vector<SchemaField> fields;
+  std::vector<SchemaUnavailable> unavailable;
 };
 
 struct SchemaRecord final {
@@ -150,11 +165,27 @@ SchemaResult build_state_schema(clang::ASTContext &,
                                 SchemaLimits = {});
 enum class CodecAccess { public_members, snapshot_members };
 
+// The members one generated capture unit leaves out, with the reason. The schema
+// builder fills it; the codec generator and the type check read it, so the
+// descriptor and the codec cannot disagree about a field or its number.
+struct CapturePlan {
+  std::map<const clang::FieldDecl *, std::string> omitted; // member -> reason
+  std::set<const clang::FieldDecl *> described;            // members some schema kept
+  bool conflict = false; // A member was omitted after a schema had kept it.
+  // Extra per-member admission check: a reason, or empty to admit the member.
+  std::function<std::string(clang::QualType)> reject;
+  const std::string *reason(const clang::FieldDecl &field) const;
+  void omit(const clang::FieldDecl &field, std::string reason);
+};
+
 // Generic scoped payloads need no state/shared_state marker. The root
 // descriptor is a wrapper whose field 1 is named `value`.
 struct SnapshotFieldSelection {
   const clang::CXXRecordDecl *record = nullptr;
   std::vector<std::string> names;
+  // When set, a member that cannot be captured is left out instead of failing
+  // the whole value. Null behaves exactly as before.
+  CapturePlan *plan = nullptr;
   bool includes(const clang::CXXRecordDecl *root, const clang::FieldDecl &field) const;
 };
 

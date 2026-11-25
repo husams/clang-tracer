@@ -41,6 +41,215 @@ struct SchemaAliasFinder final : clang::RecursiveASTVisitor<SchemaAliasFinder> {
 } // namespace
 
 namespace tracer::context_engine {
+// A member capture leaves out keeps its field number, in the descriptor and in the
+// generated codec, for both ways of reading members.
+void verify_partial_schema(const std::vector<std::string> &arguments) {
+  const std::string source = R"cpp(
+#include <cstdint>
+namespace partial {
+union Raw { int a; float b; };
+struct First  { Raw raw; int b = 22; int c = 33; };
+struct Middle { int a = 11; Raw raw; int c = 33; };
+struct Last   { int a = 11; int b = 22; Raw raw; };
+struct Two    { Raw one; int keep = 1; Raw two; };
+struct Nothing { Raw only; };
+struct Nested { int tag = 4; Middle inner; };
+struct Anons { union { int a; float b; }; union { int c; float d; }; union { int e; float f; }; int g = 9; };
+struct Bits { int : 3; int : 4; int : 5; int x = 1; };
+struct Base { Raw m; };
+struct Derived : Base { int m = 6; };
+struct Early { int m = 7; };
+struct Late : Early { Raw m; };
+struct L { Raw lock; };
+struct R { Raw lock; };
+struct Both : L, R { int own = 3; };
+}
+)cpp";
+  auto ast = clang::tooling::buildASTFromCodeWithArgs(
+      source, arguments, "partial-schema-fixture.cc");
+  if (!ast || ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("partial schema fixture failed to parse");
+  struct Expected {
+    const char *name;
+    std::vector<std::pair<std::string, std::uint32_t>> kept;
+    std::vector<std::uint32_t> left_out;
+    // Source text that must come before the matching one in the generated codec.
+    std::vector<std::string> order;
+  };
+  const std::vector<Expected> cases{
+      {"First", {{"b", 2}, {"c", 3}}, {1}, {"++field_number;", "value.b", "value.c"}},
+      {"Middle", {{"a", 1}, {"c", 3}}, {2}, {"value.a", "++field_number;", "value.c"}},
+      {"Last", {{"a", 1}, {"b", 2}}, {3}, {"value.a", "value.b", "++field_number;"}},
+      {"Two", {{"keep", 2}}, {1, 3}, {"++field_number;", "value.keep", "++field_number;"}},
+  };
+  // Names in one message are unique across what is captured and what is left out.
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    struct Naming {
+      const char *record;
+      std::vector<std::string> kept, left_out;
+    };
+    const bool direct = access == CodecAccess::public_members;
+    const std::vector<Naming> naming{
+        {"Anons", {"g"},
+         {"(anonymous union #1)", "(anonymous union #2)", "(anonymous union #3)"}},
+        // An unnamed bit-field is only left out when members are read publicly.
+        {"Bits", {"x"},
+         direct ? std::vector<std::string>{"(unnamed bit-field #1)", "(unnamed bit-field #2)",
+                                           "(unnamed bit-field #3)"}
+                : std::vector<std::string>{}},
+        // The member that is captured keeps its name; the one left out names its owner.
+        {"Derived", {"m"}, {"partial::Base::m"}},
+        {"Late", {"m"}, {"partial::Late::m"}},
+        {"Both", {"own"}, {"partial::L::lock", "partial::R::lock"}},
+    };
+    for (const auto &expected : naming) {
+      SchemaRecordFinder finder;
+      finder.name = std::string("partial::") + expected.record;
+      finder.TraverseDecl(ast->getASTContext().getTranslationUnitDecl());
+      assert(finder.record);
+      const auto type = clang::QualType(finder.record->getTypeForDecl(), 0);
+      StateFamilyKey family;
+      family.source_lineage_id[0] = 0x53;
+      family.cpp_state_type = finder.name;
+      family.cpp_scope_type = "partial::Scope";
+      CapturePlan plan;
+      SnapshotFieldSelection selection;
+      selection.plan = &plan;
+      const auto schema =
+          build_payload_schema(ast->getASTContext(), type, family, {}, access, selection);
+      if (!schema)
+        throw std::runtime_error("partial naming schema failed: " + schema.error);
+      const auto &message = *schema.record->root->fields[0].message;
+      std::vector<std::string> kept, left_out;
+      for (const auto &field : message.fields)
+        kept.push_back(field.name);
+      for (const auto &item : message.unavailable)
+        left_out.push_back(item.name);
+      if (kept != expected.kept || left_out != expected.left_out)
+        throw std::runtime_error(std::string("unexpected member names in ") + expected.record);
+      std::set<std::string> distinct(kept.begin(), kept.end());
+      distinct.insert(left_out.begin(), left_out.end());
+      assert(distinct.size() == kept.size() + left_out.size());
+      // The owner is the record that declares the member, whatever the message is.
+      const std::string name = expected.record;
+      for (const auto &item : message.unavailable) {
+        assert(!item.owner.empty());
+        if (name == "Derived")
+          assert(item.owner == "partial::Base");
+        if (name == "Both")
+          assert(item.owner + "::lock" == item.name);
+        if (name == "Anons")
+          assert(item.owner == "partial::Anons");
+      }
+      const auto codec = render_payload_codec_source(ast->getASTContext(), type, access, selection);
+      if (!codec)
+        throw std::runtime_error("partial naming codec failed: " + codec.error);
+      auto codec_ast = clang::tooling::buildASTFromCodeWithArgs(
+          "#include \"context_codec.hpp\"\n" + source + codec.source, arguments,
+          "partial-naming-codec-fixture.cc");
+      if (!codec_ast || codec_ast->getDiagnostics().hasErrorOccurred())
+        throw std::runtime_error("generated partial naming codec did not compile");
+    }
+  }
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    for (const auto &expected : cases) {
+      SchemaRecordFinder finder;
+      finder.name = std::string("partial::") + expected.name;
+      finder.TraverseDecl(ast->getASTContext().getTranslationUnitDecl());
+      assert(finder.record);
+      const auto type = clang::QualType(finder.record->getTypeForDecl(), 0);
+      StateFamilyKey family;
+      family.source_lineage_id[0] = 0x51;
+      family.cpp_state_type = finder.name;
+      family.cpp_scope_type = "partial::Scope";
+      // Without a plan the whole value fails, with the old text.
+      const auto whole = build_payload_schema(ast->getASTContext(), type, family, {}, access);
+      assert(!whole && whole.error.find("union state layout is unsupported") != std::string::npos);
+      CapturePlan plan;
+      SnapshotFieldSelection selection;
+      selection.plan = &plan;
+      for (int round = 0; round < 2; ++round) { // A second schema agrees with the first.
+        const auto schema =
+            build_payload_schema(ast->getASTContext(), type, family, {}, access, selection);
+        if (!schema)
+          throw std::runtime_error("partial schema failed: " + schema.error);
+        assert(!plan.conflict);
+        assert(schema.record->root->fields.size() == 1 && schema.record->root->fields[0].message);
+        const auto &message = *schema.record->root->fields[0].message;
+        assert(message.fields.size() == expected.kept.size());
+        for (std::size_t i = 0; i < expected.kept.size(); ++i) {
+          assert(message.fields[i].name == expected.kept[i].first);
+          assert(message.fields[i].number == expected.kept[i].second);
+        }
+        assert(message.unavailable.size() == expected.left_out.size());
+        for (std::size_t i = 0; i < expected.left_out.size(); ++i) {
+          assert(message.unavailable[i].number == expected.left_out[i]);
+          assert(message.unavailable[i].cpp_type == "partial::Raw");
+          assert(message.unavailable[i].reason.find("union state layout is unsupported") !=
+                 std::string::npos);
+        }
+        if (std::string(expected.name) == "Two")
+          assert(message.unavailable[0].name == "one" && message.unavailable[1].name == "two");
+        else
+          assert(message.unavailable[0].name == "raw");
+      }
+      const auto codec = render_payload_codec_source(ast->getASTContext(), type, access, selection);
+      if (!codec)
+        throw std::runtime_error("partial codec failed: " + codec.error);
+      std::size_t at = 0;
+      for (const auto &part : expected.order) {
+        const auto found = codec.source.find(part, at);
+        assert(found != std::string::npos);
+        at = found + part.size();
+      }
+      // The same count of skipped numbers the descriptor leaves out.
+      std::size_t skipped = 0;
+      for (auto found = codec.source.find("++field_number;"); found != std::string::npos;
+           found = codec.source.find("++field_number;", found + 1))
+        ++skipped;
+      assert(skipped == expected.left_out.size());
+      auto codec_ast = clang::tooling::buildASTFromCodeWithArgs(
+          "#include \"context_codec.hpp\"\n" + source + codec.source, arguments,
+          "partial-codec-fixture.cc");
+      if (!codec_ast || codec_ast->getDiagnostics().hasErrorOccurred())
+        throw std::runtime_error("generated partial codec did not compile");
+    }
+    // A record that captures nothing is still a schema; the caller decides what that means.
+    SchemaRecordFinder nothing;
+    nothing.name = "partial::Nothing";
+    nothing.TraverseDecl(ast->getASTContext().getTranslationUnitDecl());
+    assert(nothing.record);
+    StateFamilyKey family;
+    family.source_lineage_id[0] = 0x52;
+    family.cpp_state_type = "partial::Nothing";
+    family.cpp_scope_type = "partial::Scope";
+    CapturePlan plan;
+    SnapshotFieldSelection selection;
+    selection.plan = &plan;
+    const auto schema = build_payload_schema(
+        ast->getASTContext(), clang::QualType(nothing.record->getTypeForDecl(), 0), family, {},
+        access, selection);
+    assert(schema && schema.record->root->fields[0].message->fields.empty() &&
+           schema.record->root->fields[0].message->unavailable.size() == 1);
+    // A nested record is partial in its own right and does not shift its parent's numbers.
+    SchemaRecordFinder nested;
+    nested.name = "partial::Nested";
+    nested.TraverseDecl(ast->getASTContext().getTranslationUnitDecl());
+    assert(nested.record);
+    family.cpp_state_type = "partial::Nested";
+    CapturePlan nested_plan;
+    selection.plan = &nested_plan;
+    const auto nested_schema = build_payload_schema(
+        ast->getASTContext(), clang::QualType(nested.record->getTypeForDecl(), 0), family, {},
+        access, selection);
+    assert(nested_schema);
+    const auto &outer = *nested_schema.record->root->fields[0].message;
+    assert(outer.fields.size() == 2 && outer.fields[1].number == 2 && outer.unavailable.empty());
+    assert(outer.fields[1].message && outer.fields[1].message->unavailable.size() == 1 &&
+           outer.fields[1].message->unavailable[0].number == 2);
+  }
+}
+
 void verify_context_schema() {
   std::ifstream fixture(TRACER_TEST_SOURCE_DIR
                         "/tests/fixtures/shared_context_nested.cpp");
@@ -490,6 +699,7 @@ struct EqualState : shared_state<Scope> { std::unordered_map<EqualRecord,int> va
   batch_receiver.close_epoch();
   assert(batch_ledger->retained_schema_bytes() == 0);
   verify_context_schema_roundtrip();
+  verify_partial_schema(arguments);
 }
 } // namespace tracer::context_engine
 

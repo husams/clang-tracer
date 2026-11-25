@@ -381,6 +381,7 @@ if (data.size()) {
      "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
      "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
      "to inspect captured fields without rebuilding an application type. "
+     "A snapshot of a record captured without a member it cannot encode reports it through unavailable() and is_partial(). "
      "Use stack() to iterate over the captured frames.", "Event"},
     {"Collection", "A retained set of events with capture counters and status.",
      R"(auto data = tracer.batch("results");
@@ -403,7 +404,11 @@ auto order = e.argument_snapshot(0);
 auto id = order.field("id").as<int>();
 std::cout << order.cpp_type() << ' ' << id << '\n';)",
      "Use fields() for object members and elements() or at() for array entries. "
-     "Missing fields and incompatible types throw. For conversion to an application type, see EventRecord.", "EventValue"},
+     "Missing fields and incompatible types throw. A record captured without a member it cannot encode, such as a "
+     "std::mutex, is partial: is_partial() is true (also for a record that holds a partial one), unavailable() maps "
+     "each member left out to the reason, and field() on it throws \"event field was not captured\" with that reason. "
+     "A conversion that needs such a member is rejected the same way. "
+     "For conversion to an application type, see EventRecord.", "EventValue"},
     {"ScalarValue", "The variant returned by argument_value() and result_value() for captured numeric or boolean values.",
      R"(auto e = tracer.batch("results").at(0);
 auto value = e.argument_value(0);
