@@ -259,6 +259,18 @@ function(tracer_add_native_repl)
     add_executable(repl-value-tests tests/repl_values.cpp)
     target_link_libraries(repl-value-tests PRIVATE tracer_repl_client)
     add_test(NAME native_repl_values COMMAND repl-value-tests)
+    if(TARGET generate-context-schema AND _snapshot_recursive_generated)
+      # Captures records that contain themselves with the generated codec and
+      # reads them back with the REPL's snapshot decoder.
+      add_executable(repl-recursive-snapshot-tests tests/repl_recursive_snapshots.cpp
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bounded_proto.cpp" ${_snapshot_recursive_generated})
+      target_include_directories(repl-recursive-snapshot-tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+      target_link_libraries(repl-recursive-snapshot-tests PRIVATE tracer_repl_client)
+      add_test(NAME native_repl_recursive_snapshots COMMAND repl-recursive-snapshot-tests)
+      set_tests_properties(native_repl_recursive_snapshots PROPERTIES TIMEOUT 60)
+    endif()
     add_executable(repl-snapshot-storage-tests tests/value_snapshot_storage.cpp "${CMAKE_CURRENT_SOURCE_DIR}/src/value_snapshot_storage.cpp")
     target_include_directories(repl-snapshot-storage-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(repl-snapshot-storage-tests PRIVATE Threads::Threads)
@@ -764,6 +776,11 @@ function(tracer_add_native_repl)
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_class_preparation PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_recursive_capture
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_recursive_capture.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_recursive_capture PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_aliases
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_aliases.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

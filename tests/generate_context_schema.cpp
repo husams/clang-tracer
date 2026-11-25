@@ -2,8 +2,11 @@
 #include "context_test_config.hpp"
 
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -106,12 +109,106 @@ void emit_schema(std::ostream &out, const char *prefix,
       out << '"' << role << "\",";
   out << "};\n";
 }
+// The descriptor message that names a C++ type (context_schema.cpp `ident`).
+std::string message_name(const std::string &cpp_type) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char byte : cpp_type) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream out;
+  out << "tracer.generated.state.M_" << std::hex << hash;
+  return out.str();
+}
+
+// Value snapshots of records that contain themselves: the schema of each root
+// as the capture code generator builds it, and one codec for all of them.
+void emit_recursive_snapshots(const char *path) {
+  using namespace tracer::context_engine;
+  auto ast = parse(read(std::string(TRACER_TEST_SOURCE_DIR) +
+                        "/tests/fixtures/snapshot_recursive.hpp"));
+  std::ofstream out(path);
+  if (!out)
+    throw std::runtime_error("cannot open recursive snapshot header output");
+  out << "#pragma once\n#include <cstddef>\n#include \"context_codec.hpp\"\n"
+         "namespace snapshot_recursive_generated {\n"
+         "struct Schema {\n  const char *cpp_type, *root;\n"
+         "  const unsigned char *descriptor;\n  std::size_t descriptor_size;\n"
+         "  const char *const *roles;\n  std::size_t role_count;\n"
+         "  const char *const *types;\n  std::size_t type_count;\n};\n";
+  std::vector<clang::QualType> roots;
+  for (const char *name :
+       {"TreeNode", "ListNode", "SharedNode", "Folder", "Hidden", "Grid", "Holder"}) {
+    Found finder;
+    finder.wanted = std::string("recursive_fixture::") + name;
+    finder.TraverseDecl(ast->getASTContext().getTranslationUnitDecl());
+    if (!finder.record)
+      throw std::runtime_error(std::string("recursive fixture record not found: ") + name);
+    const clang::QualType type(finder.record->getTypeForDecl(), 0);
+    roots.push_back(type);
+    StateFamilyKey family;
+    family.source_lineage_id[0] = 1;
+    family.cpp_state_type = finder.wanted;
+    family.cpp_scope_type = "tracer::EventValueSnapshot";
+    // The limits of a value snapshot (value_snapshot_codegen.cpp).
+    SchemaLimits limits;
+    limits.descriptor_bytes = 4096;
+    limits.fields = 128;
+    limits.depth = 16;
+    const auto schema =
+        build_payload_schema(ast->getASTContext(), type, std::move(family), limits,
+                             CodecAccess::snapshot_members, {}, SchemaRecursion::allow);
+    if (!schema)
+      throw std::runtime_error(std::string("recursive snapshot schema failed for ") + name +
+                               ": " + schema.error);
+    const auto &record = *schema.record;
+    std::set<std::string> types;
+    std::function<void(const SchemaField &)> field;
+    std::function<void(const SchemaMessage &)> message;
+    message = [&](const SchemaMessage &value) {
+      types.insert(message_name(value.cpp_type) + "=" + value.cpp_type);
+      for (const auto &item : value.fields)
+        field(item);
+    };
+    field = [&](const SchemaField &value) {
+      if (value.message)
+        message(*value.message);
+      if (value.value)
+        field(*value.value);
+      if (value.key)
+        field(*value.key);
+    };
+    message(*record.root);
+    emit_bytes(out, (std::string(name) + "_descriptor").c_str(), record.descriptor_set);
+    out << "inline constexpr const char* " << name << "_roles[] = {";
+    for (const auto &role : record.container_roles)
+      out << '"' << role << "\",";
+    out << "nullptr};\ninline constexpr const char* " << name << "_types[] = {";
+    for (const auto &type_name : types)
+      out << '"' << type_name << "\",";
+    out << "nullptr};\ninline constexpr Schema " << name << "{\"" << finder.wanted << "\", \""
+        << record.root_type << "\", " << name << "_descriptor, sizeof(" << name
+        << "_descriptor), " << name << "_roles, " << record.container_roles.size() << ", "
+        << name << "_types, " << types.size() << "};\n";
+  }
+  out << "}\n";
+  const auto codec = render_context_codec_sources(ast->getASTContext(), {}, roots,
+                                                  CodecAccess::snapshot_members, {},
+                                                  SchemaRecursion::allow);
+  if (!codec)
+    throw std::runtime_error("recursive snapshot codec generation failed: " + codec.error);
+  out << codec.source << "\n";
+  if (!out)
+    throw std::runtime_error("cannot write recursive snapshot header");
+}
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    if (argc != 2)
-      throw std::runtime_error("usage: generate-context-schema OUTPUT");
+    if (argc != 2 && argc != 3)
+      throw std::runtime_error("usage: generate-context-schema OUTPUT [RECURSIVE_SNAPSHOT_OUTPUT]");
+    if (argc == 3)
+      emit_recursive_snapshots(argv[2]);
     const Fixture fixtures[] = {
         {"demo", "tests/fixtures/shared_context_nested.cpp",
          "demo::RequestState", "demo::RequestScope", 0x11, true},

@@ -48,6 +48,31 @@ template <class T, bool = std::is_class_v<T>>
 struct reconstructed_codec : std::false_type {};
 template <class T>
 struct reconstructed_codec<T, true> : reconstructed_codec_impl<T> {};
+
+// A captured smart pointer is a record with the fields address, value (the
+// copy of the object it owns, when there is one), suppressed and omitted.
+// omitted says why an owned object has no copy: "alias" (the same object was
+// captured earlier in the snapshot, through another pointer), "cycle" (the
+// object is an owner of this pointer) or the capture limit that left it out
+// ("depth", "bytes", "elements", "string").
+
+// Spans one typed conversion: the objects its shared pointers rebuild are kept
+// until the outermost conversion returns, so an alias can share them.
+class PointeeScope {
+public:
+  PointeeScope() noexcept;
+  ~PointeeScope();
+  PointeeScope(const PointeeScope &) = delete;
+  PointeeScope &operator=(const PointeeScope &) = delete;
+};
+// The omitted field of a captured smart pointer; empty when it has none.
+std::string omitted_pointee(const EventValue &pointer);
+// Throws, naming the reason, when the pointer owns an object whose copy was
+// left out: a typed value built without it would not be the captured graph.
+void require_captured_pointee(const EventValue &pointer);
+// The object rebuilt for the pointer an alias refers to, or null.
+std::shared_ptr<const void> rebuilt_pointee(const EventValue &pointer);
+void keep_rebuilt_pointee(const EventValue &pointer, std::shared_ptr<const void> object);
 } // namespace detail
 
 template <class Class, class Member> struct EventMember {
@@ -187,11 +212,13 @@ public:
         return detail::scalar_as<T>(ScalarValue{*v});
       throw std::invalid_argument("event value is not a scalar");
     } else {
+      const detail::PointeeScope scope;
       return EventCodec<std::remove_cv_t<T>>::decode(*this);
     }
   }
   template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
   Reconstructed<std::remove_cv_t<T>> as() const {
+    const detail::PointeeScope scope;
     return EventCodec<std::remove_cv_t<T>>::decode(*this);
   }
 };
@@ -327,8 +354,10 @@ public:
     using Element = typename P::element_type;
     const auto &fields = source.fields();
     const auto found = fields.find("value");
-    if (found == fields.end() || found->second.is_null())
+    if (found == fields.end() || found->second.is_null()) {
+      detail::require_captured_pointee(source);
       return;
+    }
     ::new (slot(member)) P(hold_value<std::remove_cv_t<Element>>(found->second));
   }
 
@@ -574,31 +603,45 @@ struct EventCodec<std::unordered_set<T, Hash, Equal, Allocator>> {
 
 // Smart pointers carry their address and, when the pointee could be read, an
 // inline copy of it. A copy cannot own the live target object, so a pointer
-// without a captured pointee decodes as empty.
+// that owned nothing, or whose pointee could not be read, decodes as empty.
+// A pointer whose pointee the capture left out does not: an alias of an
+// object a std::shared_ptr already rebuilt shares that object, and every other
+// case (an ownership cycle, a capture limit) is an error, because the typed
+// value would not be the graph that was captured.
 template <class T> struct EventCodec<std::unique_ptr<T, std::default_delete<T>>> {
   static std::unique_ptr<T> decode(const EventValue &value) {
     static_assert(!detail::reconstructed_codec<std::remove_cv_t<T>>::value,
                   "a reconstructed record cannot be owned by a decoded unique_ptr");
     const auto &fields = value.fields();
     const auto found = fields.find("value");
-    if (found == fields.end() || found->second.is_null())
+    if (found == fields.end() || found->second.is_null()) {
+      detail::require_captured_pointee(value);
       return nullptr;
+    }
     return std::unique_ptr<T>(new T(found->second.template as<T>()));
   }
 };
 template <class T> struct EventCodec<std::shared_ptr<T>> {
   static std::shared_ptr<T> decode(const EventValue &value) {
+    const detail::PointeeScope scope;
     const auto &fields = value.fields();
     const auto found = fields.find("value");
-    if (found == fields.end() || found->second.is_null())
+    if (found == fields.end() || found->second.is_null()) {
+      if (auto shared = detail::rebuilt_pointee(value))
+        return std::const_pointer_cast<T>(std::static_pointer_cast<const T>(shared));
+      detail::require_captured_pointee(value);
       return nullptr;
+    }
+    std::shared_ptr<T> result;
     if constexpr (detail::reconstructed_codec<std::remove_cv_t<T>>::value) {
       auto holder = std::make_shared<Reconstructed<std::remove_cv_t<T>>>(
           found->second.template as<std::remove_cv_t<T>>());
-      return std::shared_ptr<T>(holder, holder->get());
+      result = std::shared_ptr<T>(holder, holder->get());
     } else {
-      return std::shared_ptr<T>(new T(found->second.template as<T>()));
+      result = std::shared_ptr<T>(new T(found->second.template as<T>()));
     }
+    detail::keep_rebuilt_pointee(value, result);
+    return result;
   }
 };
 template <class T> struct EventCodec<std::weak_ptr<T>> {
