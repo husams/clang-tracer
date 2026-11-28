@@ -2242,7 +2242,7 @@ sizes/depths, history and REPL retention, shared-context transport memory,
 operation timeouts, and memory read/scan requests retain their settings.
 Growing queues may use more memory when consumers are slow. Allocation,
 transport, and callback failures still report through existing diagnostics.
-The native bootstrap is version 33; update the server and agent together.</p>
+The native bootstrap is version 34; update the server and agent together.</p>
 <p>The preview runs without installing probes, stopping target threads or executing code inside
 the target. <code>--save</code> creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.</p>
@@ -3462,7 +3462,9 @@ pointer or reference to a private nested implementation class
 prepared adapter republishes nested class names. If the capture code that
 follows members does not compile, the probe is built without them and the
 validation report says so; setting <code>TRACER_TEST_BREAK_FOLLOWED_MEMBERS</code> in the
-target's environment forces that fallback for testing. In a followed member a
+target's environment forces that fallback for testing. The same fallback drops
+partial record capture (below), and <code>TRACER_TEST_BREAK_PARTIAL_CAPTURE</code> forces
+it. In a followed member a
 <code>weak_ptr</code> is always recorded as expired, and a smart pointer whose pointee was
 left out by the checks or the read budget looks the same as one with no
 pointee.</p>
@@ -3923,11 +3925,35 @@ from your constructor or factory. This custom conversion runs locally.</p>
 <p>Automatic target capture uses complete ABI-validated layouts and serializable
 fields, including nested records and supported STL members. Prepared layouts
 can include private and protected fields. Unions, bit-fields, volatile data,
-arbitrary raw pointees and wide/custom-character strings are unavailable for
-general automatic record capture.
+arbitrary raw pointees, wide/custom-character strings and standard types
+without a codec (such as <code>std::mutex</code> or <code>std::ostringstream</code>) are unavailable
+for general automatic record capture.
+One such member does not take the other members with it. A record that has
+members it cannot capture, and members it can, is captured as a <code>PARTIAL</code>
+snapshot: the members that can be captured keep their values and their field
+numbers, and each member that was left out is listed with the reason, in the
+event (<code>unavailable</code> on the snapshot, <code>status: PARTIAL</code>), when the probe is
+installed (<code>capture note:</code> lines after <code>installed probe=</code>) and in
+<code>%probe validate</code> (diagnostics of stage <code>snapshot</code> and severity <code>note</code>). In C++,
+<code>EventValue::unavailable()</code> maps each member left out to its reason,
+<code>is_partial()</code> is true for a record or any record nested in it, and
+<code>field(&quot;m&quot;)</code> on a member left out throws <code>std::out_of_range</code> (&quot;event field was
+not captured: m: REASON&quot;). A conversion that needs such a member, such as an
+<code>EventRecord&lt;T&gt;</code> mapping that names it, is rejected the same way; a mapping that
+names only captured members converts. The same holds for records inside
+vectors and maps, bases, results and, on the prepared route, receivers. A
+member left out is a fact about the code that was generated at install time,
+so it is missing from every event of the probe, unlike a value that a limit cuts
+at run time (that stays a <code>LIMIT_EXCEEDED</code> snapshot, or a note in <code>detail</code>). A
+record that captures nothing at all, such as <code>struct Blocked { std::mutex m; }</code>,
+stays <code>UNSUPPORTED</code> with the reason of its first member. If the generated code
+that captures partial records does not compile, the probe is built with the
+whole-record capture instead (the fallback above), and the validation report
+says so.
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
-or over-budget snapshots throw; partial objects are never returned as complete.
+or over-budget snapshots throw; a partial snapshot never pretends to hold the
+member it left out.
 Older recordings containing only object addresses need a new capture to supply
 contents. The old scalar variant/text APIs remain available.</p>
 <p>Snapshots survive detach, target exit, collection clearing and recording replay.

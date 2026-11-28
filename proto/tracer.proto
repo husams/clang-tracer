@@ -513,6 +513,7 @@ message Probe {
   string backend_reason = 24;
   uint64 patch_address = 25;
   uint64 relay_address = 26;
+  repeated string capture_notes = 27; // Members automatic capture leaves out, with the reason.
 }
 message ReloadProbeRequest {
   string session_id = 1;

@@ -27,6 +27,7 @@
 namespace tracer_repl {
 namespace {
 using Descriptor = google::protobuf::FieldDescriptor;
+using UnavailableMember = clangtracer::context::v1::SnapshotUnavailableMember;
 
 template <class Options>
 std::string snapshot_option(const Options &options, const char *name) {
@@ -70,6 +71,8 @@ std::string field_path(const std::string &parent, int number) {
 class SnapshotDecoder {
   std::map<std::string, std::string> roles_;
   std::map<std::string, std::string> types_;
+  // Members capture left out, by protobuf message name: member -> reason.
+  std::map<std::string, std::map<std::string, std::string>> unavailable_;
   std::size_t visited_ = 0;
   // The record messages open on the way to the current value, each with the
   // role path of its fields. A record that contains itself lists its roles
@@ -315,7 +318,9 @@ class SnapshotDecoder {
       return EventValue{
           record_fields(nested, record.path(), depth),
           mapped == types_.end() ? std::string() : mapped->second,
-          context_state_ ? std::string(type->full_name()) : std::string()};
+          context_state_ ? std::string(type->full_name()) : std::string(),
+          {},
+          unavailable_for(*type)};
     }
     }
     throw std::runtime_error("unsupported snapshot field");
@@ -335,6 +340,11 @@ class SnapshotDecoder {
     const auto role = roles_.find(path);
     return EventValue{std::move(values), {}, {},
                       role == roles_.end() ? std::string{} : role->second};
+  }
+
+  std::map<std::string, std::string> unavailable_for(const google::protobuf::Descriptor &type) const {
+    const auto found = unavailable_.find(std::string(type.full_name()));
+    return found == unavailable_.end() ? std::map<std::string, std::string>{} : found->second;
   }
 
   EventValue::Object record_fields(const google::protobuf::Message &message,
@@ -357,8 +367,13 @@ public:
   SnapshotDecoder(const std::string &payload,
                   const google::protobuf::RepeatedPtrField<std::string> &roles,
                   const google::protobuf::RepeatedPtrField<std::string> &types,
-                  bool context_state)
+                  bool context_state,
+                  const google::protobuf::RepeatedPtrField<UnavailableMember> *unavailable)
       : payload_(payload), context_state_(context_state) {
+    if (unavailable)
+      for (const auto &member : *unavailable)
+        if (!unavailable_[member.record_type()].emplace(member.name(), member.reason()).second)
+          throw std::runtime_error("invalid snapshot unavailable members");
     for (const auto &type : types) {
       const auto split = type.find('=');
       if (split == std::string::npos ||
@@ -378,14 +393,15 @@ public:
     if (!wrapped) {
       validate(*message.GetDescriptor(), payload_, "", false, false, 0);
       const OpenRecord record(*this, *message.GetDescriptor(), "");
-      return EventValue{record_fields(message, "", 0), type};
+      return EventValue{record_fields(message, "", 0), type, {}, {},
+                        unavailable_for(*message.GetDescriptor())};
     }
     validate(*message.GetDescriptor(), payload_, "1", true, false, 0);
     const auto *field = message.GetDescriptor()->FindFieldByNumber(1);
     if (!field || message.GetDescriptor()->field_count() != 1)
       throw std::runtime_error("invalid snapshot root schema");
     auto result = decode_field(message, *field, "1", 0);
-    return EventValue{result.data(), type, {}, result.container_role()};
+    return EventValue{result.data(), type, {}, result.container_role(), result.unavailable()};
   }
 };
 
@@ -395,7 +411,8 @@ EventValue decode_owned_value(
     const std::string &descriptors, const std::string &payload,
     const google::protobuf::RepeatedPtrField<std::string> &roles,
     const google::protobuf::RepeatedPtrField<std::string> &types,
-    bool context_state, bool wrapped) {
+    bool context_state, bool wrapped,
+    const google::protobuf::RepeatedPtrField<clangtracer::context::v1::SnapshotUnavailableMember> *unavailable) {
   const auto descriptor_limit = context_state ? 1024 * 1024 : 16384;
   const auto payload_limit = context_state ? 256 * 1024 : 65536;
   if (cpp_type.empty() || root_type.empty() ||
@@ -438,7 +455,8 @@ EventValue decode_owned_value(
   std::unique_ptr<google::protobuf::Message> value(prototype->New());
   if (!value->ParseFromString(payload))
     throw std::runtime_error("invalid event snapshot payload");
-  return SnapshotDecoder(payload, roles, types, context_state).decode(*value, cpp_type, wrapped);
+  return SnapshotDecoder(payload, roles, types, context_state, unavailable)
+      .decode(*value, cpp_type, wrapped);
 }
 
 // Places `child` at a dotted path of nested records, such as
@@ -457,7 +475,8 @@ bool insert_member(EventValue::Object &fields, const std::string &path, EventVal
   if (!insert_member(nested, path.substr(dot + 1), std::move(child)))
     return false;
   found->second = EventValue{std::move(nested), found->second.cpp_type(),
-                             found->second.descriptor_type(), found->second.container_role()};
+                             found->second.descriptor_type(), found->second.container_role(),
+                             found->second.unavailable()};
   return true;
 }
 
@@ -466,12 +485,12 @@ bool insert_member(EventValue::Object &fields, const std::string &path, EventVal
 EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot,
                            bool root) {
   using Snapshot = clangtracer::context::v1::ValueSnapshot;
-  if (snapshot.status() != Snapshot::COMPLETE)
+  if (snapshot.status() != Snapshot::COMPLETE && snapshot.status() != Snapshot::PARTIAL)
     throw std::runtime_error("event snapshot unavailable: " + snapshot.detail());
   auto value = decode_owned_value(snapshot.cpp_type(), snapshot.root_type(),
                                  snapshot.descriptor_set(), snapshot.payload(),
                                  snapshot.container_roles(), snapshot.record_types(),
-                                 false, true);
+                                 false, true, &snapshot.unavailable());
   // A root that carries a note had members left out by a limit.
   const bool noted = root && !snapshot.detail().empty() &&
                      std::holds_alternative<EventValue::Object>(value.data());
@@ -483,7 +502,8 @@ EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapsh
     if (member.name().empty() || !member.has_snapshot() ||
         !names.insert(member.name()).second)
       throw std::runtime_error("invalid or duplicate event snapshot member");
-    if (member.snapshot().status() == Snapshot::COMPLETE)
+    if (member.snapshot().status() == Snapshot::COMPLETE ||
+        member.snapshot().status() == Snapshot::PARTIAL)
       (void)insert_member(fields, member.name(), decode_snapshot(member.snapshot(), false));
     // A limit that left part of a followed member out says which option to raise.
     if (!member.snapshot().detail().empty()) {
@@ -494,7 +514,7 @@ EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapsh
   if (noted)
     (void)insert_member(fields, "snapshot_cut", EventValue{snapshot.detail()});
   return EventValue{std::move(fields), value.cpp_type(), value.descriptor_type(),
-                    value.container_role()};
+                    value.container_role(), value.unavailable()};
 }
 
 namespace {
@@ -684,6 +704,12 @@ class ReceiverDelta {
       return;
     if (const auto *old = std::get_if<EventValue::Object>(&before.data())) {
       if (const auto *next = std::get_if<EventValue::Object>(&after.data())) {
+        // A member capture left out of either sample cannot be compared.
+        std::map<std::string, std::string> left_out = before.unavailable();
+        for (const auto &[name, reason] : after.unavailable())
+          left_out.emplace(name, reason);
+        for (const auto &[name, reason] : left_out)
+          gap(path.empty() ? name : path + "." + name, "not captured: " + reason);
         for (const auto &[name, value] : *old) {
           if ((value.cpp_type() == "std::any" || value.cpp_type() == "::std::any") &&
               old->count(name + "_snapshot") && next->count(name + "_snapshot"))
@@ -784,6 +810,7 @@ std::vector<SnapshotChange> compare_snapshots(const Snapshot &before, const Snap
     for (const auto *sample : {&before, &after})
       for (const auto &member : sample->members())
         if (member.snapshot().status() != Snapshot::COMPLETE &&
+            member.snapshot().status() != Snapshot::PARTIAL &&
             (fields.empty() || std::any_of(fields.begin(), fields.end(), [&](const auto &field) {
               return contains_path(member.name(), field);
             })))

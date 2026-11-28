@@ -45,6 +45,20 @@ template <> struct EventRecord<repl_fixture::Record> {
         event_member("samples", &repl_fixture::Record::samples));
   }
 };
+// Mappings over a record captured without one of its members.
+struct PartialGuarded { int guarded = 0; };
+struct PartialNeedsLock { int guarded = 0; int m = 0; };
+template <> struct EventRecord<PartialGuarded> {
+  static constexpr const char *type_name = "pc::Mutex";
+  static auto fields() { return std::make_tuple(event_member("guarded", &PartialGuarded::guarded)); }
+};
+template <> struct EventRecord<PartialNeedsLock> {
+  static constexpr const char *type_name = "pc::Mutex";
+  static auto fields() {
+    return std::make_tuple(event_member("guarded", &PartialNeedsLock::guarded),
+                           event_member("m", &PartialNeedsLock::m));
+  }
+};
 } // namespace tracer_repl
 
 using namespace tracer_repl;
@@ -584,6 +598,164 @@ void complex_values() {
       [&] { snapshot(message).argument_as<int>(0); },
       "schema integer overflow cannot silently truncate");
 }
+// Records captured without a member they cannot encode: the other members decode, the one
+// left out is reported with its reason, and nothing pretends to have read it.
+void partial_values() {
+  using FD = google::protobuf::FieldDescriptorProto;
+  google::protobuf::FileDescriptorSet files;
+  auto *file = files.add_file();
+  file->set_name("partial_snapshot.proto");
+  file->set_package("repl.partial");
+  file->set_syntax("proto3");
+  const auto field = [](auto *message, const char *name, int number, FD::Type type,
+                        bool repeated = false, const char *target = "") {
+    auto *f = message->add_field();
+    f->set_name(name);
+    f->set_number(number);
+    f->set_type(type);
+    f->set_label(repeated ? FD::LABEL_REPEATED : FD::LABEL_OPTIONAL);
+    if (*target)
+      f->set_type_name(target);
+  };
+  // The record's second member is std::mutex m: it keeps number 2 and is not in the schema.
+  auto *mutex = file->add_message_type();
+  mutex->set_name("Mutex");
+  field(mutex, "guarded", 1, FD::TYPE_SINT32);
+  auto *mutex_root = file->add_message_type();
+  mutex_root->set_name("MutexRoot");
+  field(mutex_root, "value", 1, FD::TYPE_MESSAGE, false, ".repl.partial.Mutex");
+  auto *items = file->add_message_type();
+  items->set_name("Items");
+  field(items, "items", 1, FD::TYPE_MESSAGE, true, ".repl.partial.Mutex");
+  auto *items_root = file->add_message_type();
+  items_root->set_name("ItemsRoot");
+  field(items_root, "value", 1, FD::TYPE_MESSAGE, false, ".repl.partial.Items");
+  auto *entry = file->add_message_type();
+  entry->set_name("Entry");
+  field(entry, "key", 1, FD::TYPE_STRING);
+  field(entry, "value", 2, FD::TYPE_MESSAGE, false, ".repl.partial.Mutex");
+  auto *by_name = file->add_message_type();
+  by_name->set_name("ByName");
+  field(by_name, "by_name", 1, FD::TYPE_MESSAGE, true, ".repl.partial.Entry");
+  auto *by_name_root = file->add_message_type();
+  by_name_root->set_name("ByNameRoot");
+  field(by_name_root, "value", 1, FD::TYPE_MESSAGE, false, ".repl.partial.ByName");
+
+  const auto frame = [](char tag, const std::string &body) {
+    return std::string(1, tag) + std::string(1, static_cast<char>(body.size())) + body;
+  };
+  // field 1, a zigzag sint32
+  const auto mutex_body = [](int guarded) { return std::string{0x08, static_cast<char>(guarded * 2)}; };
+  const std::string reason = "union state layout is unsupported: pthread_mutex_t";
+  const auto make = [&](const char *cpp_type, const char *root, const std::string &payload,
+                        clangtracer::context::v1::ValueSnapshot::Status status) {
+    clangtracer::context::v1::ValueSnapshot captured;
+    captured.set_cpp_type(cpp_type);
+    captured.set_root_type(root);
+    captured.set_descriptor_set(files.SerializeAsString());
+    captured.set_payload(payload);
+    captured.set_status(status);
+    captured.add_record_types("repl.partial.Mutex=pc::Mutex");
+    return captured;
+  };
+  const auto leave_out = [&](clangtracer::context::v1::ValueSnapshot &captured) {
+    auto *left_out = captured.add_unavailable();
+    left_out->set_record_type("repl.partial.Mutex");
+    left_out->set_name("m");
+    left_out->set_cpp_type("std::mutex");
+    left_out->set_reason(reason);
+    left_out->set_number(2);
+  };
+  const auto event_of = [&](const clangtracer::context::v1::ValueSnapshot &captured) {
+    api::TraceEvent message;
+    auto *argument = message.add_arguments();
+    argument->set_type(api::OBJECT);
+    argument->set_unsigned_value(1);
+    *argument->mutable_snapshot() = captured;
+    return snapshot(message);
+  };
+  using Status = clangtracer::context::v1::ValueSnapshot;
+  const auto mentions = [](auto call, std::initializer_list<const char *> parts) {
+    try {
+      call();
+    } catch (const std::out_of_range &error) {
+      const std::string text = error.what();
+      return std::all_of(parts.begin(), parts.end(), [&](const char *part) {
+        return text.find(part) != std::string::npos;
+      });
+    }
+    return false;
+  };
+
+  // One partial record.
+  auto partial = make("pc::Mutex", "repl.partial.MutexRoot", frame(0x0a, mutex_body(5)), Status::PARTIAL);
+  leave_out(partial);
+  const auto event = event_of(partial);
+  const auto value = event.argument_snapshot(0);
+  require(value.field("guarded").as<int>() == 5, "captured members of a partial record decode");
+  require(value.is_partial() && value.unavailable().size() == 1 &&
+              value.unavailable().at("m") == reason,
+          "the member left out is listed with its reason");
+  require(mentions([&] { value.field("m"); }, {"was not captured", ": m: ", reason.c_str()}),
+          "reading a member that was left out names it and says why");
+  require(value.fields().count("m") == 0, "a member left out is not among the fields");
+  require(event.argument_as<PartialGuarded>(0).guarded == 5,
+          "a mapping that needs only captured members converts");
+  require(mentions([&] { event.argument_as<PartialNeedsLock>(0); }, {"m", reason.c_str()}),
+          "a mapping that needs the member left out is rejected, naming it");
+
+  // The same record captured whole is unchanged.
+  auto whole = make("pc::Mutex", "repl.partial.MutexRoot", frame(0x0a, mutex_body(5)), Status::COMPLETE);
+  const auto whole_value = event_of(whole).argument_snapshot(0);
+  require(!whole_value.is_partial() && whole_value.unavailable().empty() &&
+              whole_value.field("guarded").as<int>() == 5,
+          "a complete record has nothing left out");
+  require(mentions([&] { whole_value.field("m"); }, {"event field unavailable: m"}) &&
+              !mentions([&] { whole_value.field("m"); }, {"was not captured"}),
+          "a complete record keeps the old error for a missing field");
+  require(event_of(whole).argument_as<PartialGuarded>(0).guarded == 5, "complete mapping still converts");
+
+  // A partial record inside a vector.
+  auto in_vector = make("pc::Items", "repl.partial.ItemsRoot",
+                        frame(0x0a, frame(0x0a, mutex_body(1)) + frame(0x0a, mutex_body(2))), Status::PARTIAL);
+  in_vector.set_cpp_type("pc::Items");
+  in_vector.add_container_roles("1.1=vector");
+  in_vector.add_record_types("repl.partial.Items=pc::Items");
+  leave_out(in_vector);
+  const auto list = event_of(in_vector).argument_snapshot(0);
+  const auto &elements = list.field("items").elements();
+  require(list.is_partial() && list.unavailable().empty() && elements.size() == 2 &&
+              elements[0].field("guarded").as<int>() == 1 && elements[1].field("guarded").as<int>() == 2 &&
+              elements[0].unavailable().count("m") == 1 && elements[1].unavailable().at("m") == reason,
+          "every element of a vector of partial records carries what it lacks");
+  require(mentions([&] { elements[1].field("m"); }, {"was not captured", reason.c_str()}),
+          "an element reports the member it lacks");
+
+  // A partial record as a map value.
+  const auto entry_body = [&](const char *key, int guarded) {
+    return frame(0x0a, key) + frame(0x12, mutex_body(guarded));
+  };
+  auto in_map = make("pc::ByName", "repl.partial.ByNameRoot",
+                     frame(0x0a, frame(0x0a, entry_body("x", 8)) + frame(0x0a, entry_body("y", 9))),
+                     Status::PARTIAL);
+  in_map.add_container_roles("1.1=map");
+  in_map.add_record_types("repl.partial.ByName=pc::ByName");
+  leave_out(in_map);
+  const auto map = event_of(in_map).argument_snapshot(0);
+  const auto &pairs = map.field("by_name").elements();
+  require(map.is_partial() && pairs.size() == 2 && pairs[0].field("key").as<std::string>() == "x" &&
+              pairs[0].field("value").field("guarded").as<int>() == 8 &&
+              pairs[1].field("key").as<std::string>() == "y" &&
+              pairs[1].field("value").field("guarded").as<int>() == 9 &&
+              pairs[1].field("value").unavailable().at("m") == reason,
+          "map values keep their keys and the member they lack");
+
+  // The delta of two samples reports a member neither could capture.
+  const auto changes = tracer_repl::compare_snapshots(partial, partial, {});
+  require(changes.size() == 1 && changes[0].gap && changes[0].path == "m" &&
+              changes[0].detail == "not captured: " + reason,
+          "a comparison says which member it could not compare");
+}
 } // namespace
 
 // Values captured in a form of their own (issue #181): 128-bit integers as two halves, a
@@ -784,6 +956,7 @@ void abi_values() {
 
 int main() {
   try {
+    partial_values();
     native_values();
     callback_error_events();
     context_values();

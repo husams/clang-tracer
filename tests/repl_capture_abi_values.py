@@ -22,8 +22,8 @@ and through the record conversions `%cpp import` generates (argument_as<abi::Int
   * A wide enumeration keeps its exact value: above INT64_MAX, unnamed, INT64_MIN, UINT32_MAX.
   * A member pointer is the parts its ABI gives it: null state, offset, function address or
     vtable offset, adjustment of `this`.
-  * A volatile scalar is captured; volatile class storage and std::mutex are reported as
-    unsupported with the reason, and their probes still install.
+  * A volatile scalar is captured; a member that is volatile class storage or a std::mutex is
+    left out with the reason, the other members are captured, and the probes still install.
 
 The fixture is built by the compiler given with --compiler. With a GCC it is the toolchain the
 issue was reported on; the test is skipped (exit 77) when --require-gcc is given and it is not one.
@@ -195,7 +195,7 @@ auto need = [](bool ok, const char* what) { if (!ok) throw std::runtime_error(wh
 auto le = [](const std::string& bytes, std::size_t offset, std::size_t count) { unsigned long long value = 0; for (std::size_t i = 0; i < count; ++i) value |= static_cast<unsigned long long>(static_cast<unsigned char>(bytes.at(offset + i))) << (8 * i); return value; };
 auto text = [](const tracer_repl::EventValue& value) { return value.as<std::string>(); };
 auto is_union = [](const tracer_repl::EventValue& value, const char* type, std::size_t size) { need(value.cpp_type() == type, "union type"); need(value.field("size").as<unsigned long long>() == size, "union size"); need(value.field("bytes").as<std::string>().size() == size, "union bytes"); need(value.field("active_member").as<std::string>() == "unknown", "union active member"); };
-auto unavailable = [](const tracer_repl::Event& event, const char* reason) { try { (void)event.argument_snapshot(0); } catch (const std::exception& error) { if (std::string(error.what()).find(reason) != std::string::npos) return; throw std::runtime_error(std::string("unexpected reason: ") + error.what()); } throw std::runtime_error("the snapshot was expected to be unavailable"); };
+auto left_out = [](const tracer_repl::Event& event, const char* member, const char* reason) { const auto a = event.argument_snapshot(0); const auto found = a.unavailable().find(member); need(a.is_partial() && found != a.unavailable().end(), "the member was expected to be left out"); if (found->second.find(reason) == std::string::npos) throw std::runtime_error("unexpected reason: " + found->second); need(a.field("after").as<int>() == 9, "the member after the one left out"); };
 """
 
 BIG = "(((__int128)1 << 100) + 5)"
@@ -247,7 +247,7 @@ def checks(machine):
             'need(text(m.field("alternatives")).find("__data; ") != std::string::npos, '
             '"alternatives"); '
             'need(a.field("after").as<int>() == 9, "sibling");',
-        "std_mutex": 'unavailable(e, "unsupported standard type: std::mutex");',
+        "std_mutex": 'left_out(e, "lock", "unsupported standard type: std::mutex");',
         # The record's own tag says which member is active; nothing else may.
         "tagged":
             'const auto a = e.argument_snapshot(0); need(a.field("kind").as<int>() == 0, "tag"); '
@@ -350,7 +350,7 @@ def checks(machine):
             'const auto v = e.argument_as<abi::VolatileMember>(0); '
             'need(v.x == 5 && v.d == 2.5 && v.e == abi::two && v.wide == 1.5L && v.after == 9, '
             '"typed volatile");',
-        "volatile_class": 'unavailable(e, "volatile class storage cannot be captured");',
+        "volatile_class": 'left_out(e, "p", "volatile class storage cannot be captured");',
         "containers":
             'const auto a = e.argument_snapshot(0); const auto numbers = a.field("numbers"); '
             'need(numbers.size() == 2 && le(text(numbers.at(1).field("bytes")), 0, 4) == 6 && '

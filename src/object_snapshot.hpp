@@ -13,7 +13,8 @@ EventValue decode_owned_value(
     const std::string &descriptors, const std::string &payload,
     const google::protobuf::RepeatedPtrField<std::string> &roles,
     const google::protobuf::RepeatedPtrField<std::string> &types,
-    bool context_state, bool wrapped);
+    bool context_state, bool wrapped,
+    const google::protobuf::RepeatedPtrField<clangtracer::context::v1::SnapshotUnavailableMember> *unavailable = nullptr);
 EventValue decode_snapshot(const Snapshot &snapshot, bool include_members = true);
 
 struct SnapshotChange {

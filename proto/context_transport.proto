@@ -129,7 +129,10 @@ message TypedTraceValue {
 // Owned capture-time data; never a target-memory image or a borrowed address.
 // Payload is a field-1 wrapper described by descriptor_set/root_type.
 message ValueSnapshot {
-  enum Status { UNSPECIFIED = 0; COMPLETE = 1; UNSUPPORTED = 2; LIMIT_EXCEEDED = 3; FAILED = 4; }
+  enum Status { UNSPECIFIED = 0; COMPLETE = 1; UNSUPPORTED = 2; LIMIT_EXCEEDED = 3; FAILED = 4;
+                // The payload is valid; the members in `unavailable` were left out
+                // when the capture code was generated.
+                PARTIAL = 5; }
   string cpp_type = 1;
   string root_type = 2;
   bytes descriptor_set = 3;
@@ -139,6 +142,16 @@ message ValueSnapshot {
   repeated string container_roles = 7;
   repeated string record_types = 8; // protobuf message name=C++ canonical name
   repeated SnapshotMember members = 9; // Independently captured record members.
+  // Members of the records in this snapshot that automatic capture leaves out.
+  // Static: they are missing from every sample, unlike a limit's note in `detail`.
+  repeated SnapshotUnavailableMember unavailable = 10;
+}
+message SnapshotUnavailableMember {
+  string record_type = 1; // Protobuf message name, as on the left of record_types.
+  string name = 2;
+  string cpp_type = 3;
+  string reason = 4;
+  uint32 number = 5; // The field number the member keeps reserved.
 }
 message SnapshotMember {
   string name = 1;

@@ -52,6 +52,25 @@ void copy_field(char (&target)[N], const std::string &value,
   std::memcpy(target, value.c_str(), value.size() + 1);
 }
 
+// The agent leaves the members automatic capture omits beside the callback source.
+std::vector<std::string> read_capture_notes(const std::string &source_file) {
+  std::vector<std::string> notes;
+  if (source_file.empty())
+    return notes;
+  std::ifstream input(source_file + ".notes");
+  for (std::string line; std::getline(input, line);)
+    if (!line.empty())
+      notes.push_back(std::move(line));
+  return notes;
+}
+
+void unlink_source_file(const std::string &source_file) {
+  if (source_file.empty())
+    return;
+  ::unlink(source_file.c_str());
+  ::unlink((source_file + ".notes").c_str());
+}
+
 void write_file_0600(const std::string &path, const std::string &content) {
   const int fd =
       ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -1021,7 +1040,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       // the return value. Keep the request and registry entry for recovery.
       it->second.value.set_active(true);
       prepared = true;
-      ::unlink(it->second.source_file.c_str());
+      unlink_source_file(it->second.source_file);
       it->second.source_file.clear();
       process.mark_unsafe();
       unsafe_target_ = true;
@@ -1032,7 +1051,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     } catch (...) {
       it->second.value.set_active(true);
       prepared = true;
-      ::unlink(it->second.source_file.c_str());
+      unlink_source_file(it->second.source_file);
       it->second.source_file.clear();
       process.mark_unsafe();
       unsafe_target_ = true;
@@ -1058,7 +1077,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       process.remote_free(remote_request, sizeof(Request));
       remote_request = 0;
       probes_.erase(it);
-      ::unlink(source_file.c_str());
+      unlink_source_file(source_file);
       throw std::runtime_error(std::string("agent rejected probe: ") +
                                response.error);
     }
@@ -1066,7 +1085,9 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     // Preparation publishes the immutable probe, but leaves entry text alone.
     it->second.value.set_active(true);
     prepared = true;
-    ::unlink(it->second.source_file.c_str());
+    for (auto &note : read_capture_notes(it->second.source_file))
+      it->second.value.add_capture_notes(std::move(note));
+    unlink_source_file(it->second.source_file);
     it->second.source_file.clear();
     Request response{};
     process.remote_read(remote_request, &response, sizeof(response));
@@ -1382,7 +1403,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       probes_.erase(found);
     }
     if (!prepared)
-      ::unlink(source_file.c_str());
+      unlink_source_file(source_file);
     else if (found != probes_.end() && !unsafe_target_ &&
              state_ != clangtracer::v1::Session::EXITED &&
              !found->second.patch_committed) {
@@ -1391,7 +1412,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       set_failed_locked("prepared probe could not be committed safely");
     }
     if (unsafe_target_ && found != probes_.end()) {
-      ::unlink(found->second.source_file.c_str());
+      unlink_source_file(found->second.source_file);
       found->second.source_file.clear();
     }
     if (!unsafe_target_ && process.attached()) {
@@ -1718,7 +1739,7 @@ bool Session::stop_probe_locked(
           error.what());
       throw std::runtime_error(error_);
     }
-    ::unlink(probe.source_file.c_str());
+    unlink_source_file(probe.source_file);
     probe.source_file.clear();
     return true;
   }

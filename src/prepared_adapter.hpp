@@ -631,6 +631,10 @@ private:
     } else if (const auto *record = type->getAsCXXRecordDecl()) {
       if (include_toolchain_record(*record))
         return;
+      // Only the member that declares an unnamed record can name it, and
+      // emit_record declares that member in place.
+      if (!record->getIdentifier())
+        unnamed_definition(*record);
       if (complete && record->getDefinition())
         emit_record(*record->getDefinition());
       else
@@ -766,8 +770,19 @@ private:
     if (!emitted_.insert(identity).second)
       return;
     emitting_.insert(identity);
+    const auto source = record_definition(record);
+    emitting_.erase(identity);
+    place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
+  }
+
+  // The definition of a record up to its closing brace. The caller marks the record as
+  // emitted and being emitted, and writes what follows the brace.
+  std::string record_definition(const clang::CXXRecordDecl &record) {
+    const auto *identity = record.getCanonicalDecl();
+    const bool unnamed = !record.getIdentifier();
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
-    std::string source = specialization_prefix(record) + (unnamed ? "typedef " : "") +
+    std::string source = specialization_prefix(record) +
+                         (unnamed && record.getTypedefNameForAnonDecl() ? "typedef " : "") +
                          std::string(record.getKindName()) + " alignas(" +
                          std::to_string(alignment) + ") ";
     if (record.hasAttr<clang::PackedAttr>())
@@ -806,8 +821,33 @@ private:
           emit_constant(*constant);
       }
     }
-    for (auto &member : member_declarations(record, record.isUnion()))
-      members.push_back(std::move(member));
+    const std::vector<const clang::FieldDecl *> record_fields(record.field_begin(),
+                                                              record.field_end());
+    for (std::size_t index = 0; index < record_fields.size(); ++index) {
+      const auto *field = record_fields[index];
+      if (const auto *unnamed = declared_in_place(record, *field)) {
+        std::vector<const clang::FieldDecl *> group{field};
+        while (index + 1 < record_fields.size() &&
+               declared_in_place(record, *record_fields[index + 1]) == unnamed)
+          group.push_back(record_fields[++index]);
+        members.emplace_back(field->getAccess(), emit_in_place(*unnamed, group));
+        continue;
+      }
+      visit(field->getType());
+      std::string member;
+      if (field->hasAttr<clang::NoUniqueAddressAttr>())
+        member += "[[no_unique_address]] ";
+      if (field->hasAttr<clang::PackedAttr>())
+        member += "__attribute__((packed)) ";
+      if (const auto alignment = field->getMaxAlignment())
+        member += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
+      if (field->isMutable())
+        member += "mutable ";
+      member += spelling(field->getType(), field->getName());
+      if (field->isBitField())
+        member += " : " + std::to_string(field->getBitWidthValue());
+      members.emplace_back(field->getAccess(), member + ";\n");
+    }
     bool emitted_selected = false;
     bool emitted_default_constructor = false;
     for (const auto *method : record.methods()) {
@@ -887,94 +927,75 @@ private:
       add(clang::AS_public, nested);
     for (const auto &[wanted, member] : members)
       add(wanted, member);
-    emitting_.erase(identity);
-    place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
+    return source;
   }
 
-  // An unnamed union that no typedef names has no declaration apart from the member whose
-  // type it is, and neither has an unnamed record inside one.
-  const clang::CXXRecordDecl *inline_record(clang::QualType type, bool inside_union) {
-    const auto *record = array_element(type.getCanonicalType())->getAsCXXRecordDecl();
-    record = record ? record->getDefinition() : nullptr;
-    return record && !record->getIdentifier() && !record->getTypedefNameForAnonDecl() &&
-                   (record->isUnion() || inside_union)
-               ? record
-               : nullptr;
+  // The unnamed record a member declares, if nothing else can name it: no identifier and no
+  // typedef name for linkage. Only the declaration of such a member can define it.
+  const clang::CXXRecordDecl *declared_in_place(const clang::CXXRecordDecl &owner,
+                                                const clang::FieldDecl &field) {
+    auto type = field.getType();
+    while (const auto *array = ast_.getAsArrayType(type))
+      type = array->getElementType();
+    const auto *unnamed = type->getAsCXXRecordDecl();
+    unnamed = unnamed ? unnamed->getDefinition() : nullptr;
+    if (!unnamed || !linkage_name(*unnamed).empty())
+      return nullptr;
+    const auto *scope = llvm::dyn_cast<clang::CXXRecordDecl>(unnamed->getDeclContext());
+    return scope && scope->getCanonicalDecl() == owner.getCanonicalDecl() ? unnamed : nullptr;
   }
 
-  std::string inline_definition(const clang::CXXRecordDecl &record) {
-    const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
-    std::string source = std::string(record.getKindName()) + " alignas(" +
-                         std::to_string(alignment) + ") ";
-    if (record.hasAttr<clang::PackedAttr>())
-      source += "__attribute__((packed)) ";
-    source += record.isClass() ? "{\npublic:\n" : "{\n";
-    for (const auto &[access, member] : member_declarations(record, /*inside_union=*/true))
-      source += member;
-    return source + "}";
-  }
-
-  // What precedes the type of a data member.
-  std::string member_prefix(const clang::FieldDecl &field) {
-    std::string prefix;
-    if (field.hasAttr<clang::NoUniqueAddressAttr>())
-      prefix += "[[no_unique_address]] ";
-    if (field.hasAttr<clang::PackedAttr>())
-      prefix += "__attribute__((packed)) ";
-    if (const auto alignment = field.getMaxAlignment())
-      prefix += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
-    if (field.isMutable())
-      prefix += "mutable ";
-    return prefix;
-  }
-
-  // The data members of `record`, each with its access. Consecutive members declared with
-  // one unnamed type, as in `union { ... } a, b[2];`, share its single definition, so the
-  // type stays one type.
-  std::vector<std::pair<clang::AccessSpecifier, std::string>>
-  member_declarations(const clang::CXXRecordDecl &record, bool inside_union) {
-    std::vector<std::pair<clang::AccessSpecifier, std::string>> members;
-    const std::vector<const clang::FieldDecl *> fields(record.field_begin(), record.field_end());
-    // The qualifiers of an unnamed member type, and the name and array extents after it.
+  // `struct { ... } a, b[2];` for the consecutive members that share one unnamed record.
+  // Its size, alignment and offsets stay those of the original, and so do the members after it.
+  std::string emit_in_place(const clang::CXXRecordDecl &unnamed,
+                            const std::vector<const clang::FieldDecl *> &group) {
+    const auto *identity = unnamed.getCanonicalDecl();
+    if (!emitted_.insert(identity).second)
+      unsupported(unnamed, ("an unnamed " + std::string(unnamed.getKindName()) +
+                            " shared by members that are not consecutive is unsupported").c_str());
+    const auto &first = *group.front();
+    const auto attributes = [&](const clang::FieldDecl &field) {
+      if (field.hasAttr<clang::PackedAttr>())
+        unsupported(field, "a packed member of an unnamed record type is unsupported");
+      std::string result;
+      if (field.hasAttr<clang::NoUniqueAddressAttr>())
+        result += "[[no_unique_address]] ";
+      if (const auto alignment = field.getMaxAlignment())
+        result += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
+      if (field.isMutable())
+        result += "mutable ";
+      return result;
+    };
     const auto qualifiers = [&](const clang::FieldDecl &field) {
-      const auto text =
-          array_element(field.getType().getCanonicalType()).getLocalQualifiers().getAsString();
-      return text.empty() ? text : text + " ";
+      auto type = field.getType();
+      while (const auto *array = ast_.getAsArrayType(type))
+        type = array->getElementType();
+      return std::string(type.isConstQualified() ? "const " : "") +
+             (type.isVolatileQualified() ? "volatile " : "");
     };
-    const auto declarator = [&](const clang::FieldDecl &field) {
-      auto declared = field.getNameAsString();
-      auto type = field.getType().getCanonicalType();
-      for (; const auto *array = ast_.getAsConstantArrayType(type); type = array->getElementType())
-        declared += "[" + std::to_string(array->getSize().getZExtValue()) + "]";
-      if (ast_.getAsArrayType(type))
-        unsupported(field, "an array of unknown bound of an unnamed type is unsupported");
-      return declared;
-    };
-    for (std::size_t index = 0; index < fields.size(); ++index) {
-      const auto &field = *fields[index];
-      const auto *unnamed = inline_record(field.getType(), inside_union);
-      if (!unnamed) {
-        visit(field.getType());
-        auto member = member_prefix(field) + spelling(field.getType(), field.getName());
-        if (field.isBitField())
-          member += " : " + std::to_string(field.getBitWidthValue());
-        members.emplace_back(field.getAccess(), member + ";\n");
-        continue;
+    std::string declarators;
+    for (const auto *field : group) {
+      if (attributes(*field) != attributes(first) || qualifiers(*field) != qualifiers(first) ||
+          field->getAccess() != first.getAccess())
+        unsupported(*field, "members that share an unnamed record type must be declared alike");
+      std::string extents;
+      for (auto type = field->getType(); const auto *array = ast_.getAsArrayType(type);
+           type = array->getElementType()) {
+        if (const auto *constant = llvm::dyn_cast<clang::ConstantArrayType>(array))
+          extents += "[" + std::to_string(constant->getSize().getZExtValue()) + "]";
+        else if (llvm::isa<clang::IncompleteArrayType>(array))
+          extents += "[]";
+        else
+          unsupported(*field, "variable-length members are unsupported");
       }
-      auto declarators = declarator(field);
-      while (index + 1 < fields.size() &&
-             inline_record(fields[index + 1]->getType(), inside_union) == unnamed) {
-        const auto &next = *fields[++index];
-        if (member_prefix(next) != member_prefix(field) || qualifiers(next) != qualifiers(field) ||
-            next.getAccess() != field.getAccess())
-          unsupported(next, "members that share an unnamed type must be declared alike");
-        declarators += ", " + declarator(next);
-      }
-      members.emplace_back(field.getAccess(),
-                           member_prefix(field) + qualifiers(field) + inline_definition(*unnamed) +
-                               (declarators.empty() ? "" : " " + declarators) + ";\n");
+      if (!declarators.empty())
+        declarators += ", ";
+      declarators += field->getNameAsString() + extents;
     }
-    return members;
+    emitting_.insert(identity);
+    auto source = attributes(first) + qualifiers(first) + record_definition(unnamed) + "}";
+    emitting_.erase(identity);
+    return source + (declarators.empty() ? "" : " " + declarators) + ";\n";
   }
 
   // The declarations queued for `owner`, each one a public member.

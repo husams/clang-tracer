@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <unordered_map>
@@ -126,6 +127,20 @@ clang::QualType arg(const clang::ClassTemplateSpecializationDecl *s,
              : clang::QualType{};
 }
 
+// Generated code has to spell the record's name.  A record, or one of the
+// records enclosing it, that has neither an identifier nor a typedef name for
+// linkage has no such spelling.
+bool unnamable_record(const clang::CXXRecordDecl *record) {
+  for (const clang::DeclContext *context = record;
+       context && llvm::isa<clang::RecordDecl>(context);
+       context = context->getParent()) {
+    const auto *tag = llvm::cast<clang::RecordDecl>(context);
+    if (!tag->getIdentifier() && !tag->getTypedefNameForAnonDecl())
+      return true;
+  }
+  return false;
+}
+
 bool owning_snapshot_pointer(const std::string &name) {
   return name == "std::unique_ptr" || name == "std::shared_ptr";
 }
@@ -222,12 +237,134 @@ struct Builder {
       cache;
   std::size_t fields = 0, messages = 0;
   std::string error;
+  // Set next to the errors a capture plan can never recover from: limits and
+  // structural errors fail the whole value.
+  bool hard_error = false;
   bool snapshot = false;
   // A payload is copied out once, so it may hold values that a retained state may not:
   // unions, member pointers, std::nullptr_t and long double.
   bool payload = false;
   bool recursion = false;
   const SnapshotFieldSelection *selection = nullptr;
+  // Plan mode only: a standard record is walked as it always was, so that its
+  // reason is the one the all-or-nothing capture reports.
+  bool strict = false;
+  // Plan mode only: an error the codec generator would report for the record
+  // being built. It is raised when nothing else failed first.
+  std::string deferred;
+
+  CapturePlan *plan() const {
+    return selection && !strict ? selection->plan : nullptr;
+  }
+
+  // No capture plan at all, and not inside the walk that a plan makes for a standard record.
+  bool all_or_nothing() const { return !strict && !(selection && selection->plan); }
+
+  // Why capture leaves a member out before it is described, or empty.
+  std::string omission(CapturePlan &capture, const clang::CXXRecordDecl &owner,
+                       const clang::FieldDecl &field) {
+    if (const auto *known = capture.reason(field))
+      return *known;
+    const auto name = field.getNameAsString();
+    if (!snapshot) {
+      if (field.isBitField())
+        return "bit-field state member unsupported";
+      auto access = field.getAccess();
+      if (access == clang::AS_none)
+        access = owner.isStruct() ? clang::AS_public : clang::AS_private;
+      if (access != clang::AS_public)
+        return "non-public member cannot be automatically serialized: " + name;
+    } else if (field.isBitField()) {
+      const auto width = std::min<std::uint64_t>(field.getBitWidthValue(),
+                                                 ast.getTypeSize(field.getType()));
+      if (!width || width > 64)
+        return "unsupported snapshot bit-field width: " + name;
+    }
+    return capture.reject ? capture.reject(field.getType()) : std::string{};
+  }
+
+  void leave_out(CapturePlan &capture, const clang::CXXRecordDecl &owner,
+                 const clang::FieldDecl &field, SchemaMessage &out,
+                 std::uint32_t number, std::string reason) {
+    SchemaUnavailable item;
+    item.name = field.getNameAsString();
+    if (item.name.empty()) {
+      const auto *record = field.getType()->getAsCXXRecordDecl();
+      item.name = field.isBitField() ? "(unnamed bit-field)"
+                  : !record          ? "(unnamed member)"
+                  : record->isUnion() ? "(anonymous union)"
+                                      : "(anonymous struct)";
+    }
+    item.owner = record_spelling(&owner);
+    item.cpp_type = canonical(field.getType());
+    item.number = number;
+    item.reason = reason;
+    capture.omit(field, std::move(reason));
+    out.unavailable.push_back(std::move(item));
+  }
+
+  // Gives each member left out of a finished message its final name: unique among
+  // the fields and the members left out. Done once the whole message is known,
+  // because a member that comes later can take the name of an earlier one.
+  static void name_unavailable(SchemaMessage &message) {
+    if (message.unavailable.empty())
+      return;
+    const auto unnamed = [](const std::string &name) { return !name.empty() && name[0] == '('; };
+    const auto plain = [](const std::string &name) {
+      const auto at = name.rfind("::");
+      return at == std::string::npos ? name : name.substr(at + 2);
+    };
+    // A member left out that shares its name with another member is told apart by
+    // its owner; a captured member keeps the name it already has.
+    std::map<std::string, std::size_t> uses;
+    for (const auto &field : message.fields)
+      ++uses[plain(field.name)];
+    for (const auto &item : message.unavailable)
+      ++uses[item.name];
+    for (auto &item : message.unavailable)
+      if (!unnamed(item.name) && uses[item.name] > 1)
+        item.name = item.owner + "::" + item.name;
+    // Unnamed members have nothing but a description to tell them apart: add the number.
+    std::map<std::string, std::size_t> names;
+    for (const auto &field : message.fields)
+      ++names[field.name];
+    for (const auto &item : message.unavailable)
+      ++names[item.name];
+    for (auto &item : message.unavailable)
+      if (names[item.name] > 1)
+        item.name = unnamed(item.name)
+                        ? item.name.substr(0, item.name.size() - 1) + " #" +
+                              std::to_string(item.number) + ")"
+                        : item.name + " #" + std::to_string(item.number);
+  }
+
+  // Names a captured member, leaving the prior ones as they were; false after an error.
+  bool append_field(const clang::CXXRecordDecl *r, SchemaMessage &out, SchemaField sf,
+                    std::unordered_map<std::string, std::pair<std::size_t, std::string>> &owners) {
+    if (snapshot) {
+      const auto owner = record_spelling(r);
+      const auto [it, inserted] = owners.try_emplace(sf.name, out.fields.size(), owner);
+      if (!inserted) {
+        auto &first = out.fields[it->second.first];
+        if (first.name == sf.name)
+          first.name = it->second.second + "::" + first.name;
+        sf.name = owner + "::" + sf.name;
+      }
+    } else if (std::any_of(
+            out.fields.begin(), out.fields.end(),
+            [&](const auto &prior) { return prior.name == sf.name; })) {
+      error = "ambiguous inherited state member: " + sf.name;
+      hard_error = true;
+      return false;
+    }
+    out.fields.push_back(std::move(sf));
+    if (++fields > limits.fields) {
+      error = "schema field limit exceeded";
+      hard_error = true;
+      return false;
+    }
+    return true;
+  }
 
   // A value the wire format has no scalar for, as a record of named parts.
   std::shared_ptr<SchemaMessage> parts(std::string cpp_type) {
@@ -304,6 +441,13 @@ struct Builder {
         }
       }
       auto *br = bt->getAsCXXRecordDecl();
+      if (plan() && deferred.empty()) {
+        if (!br || !br->hasDefinition())
+          deferred = "unsupported state base class";
+        else if (!snapshot && base.getAccessSpecifier() != clang::AS_public &&
+                 !(base.getAccessSpecifier() == clang::AS_none && r->isStruct()))
+          deferred = "non-public state base is unsupported by automatic codec generation";
+      }
       if (br && br->hasDefinition()) {
         collect_fields(br, out, depth, id, seen, owners, root);
       }
@@ -314,38 +458,39 @@ struct Builder {
         continue;
       if (snapshot && f->isUnnamedBitField())
         continue;
-      if (f->isBitField() && !snapshot) {
+      auto *capture = plan();
+      if (!capture && f->isBitField() && !snapshot) {
         error = "bit-field state member unsupported";
         return;
       }
+      // A member left out keeps its number, so the codec can skip the same one.
+      const auto number = id++;
       auto field_name = f->getNameAsString();
       // The members of an anonymous union are not fields of the record: the union is.
       if (field_name.empty() && f->isAnonymousStructOrUnion() && f->getType()->isUnionType())
         field_name = "__anonymous_union_" + std::to_string(anonymous_unions++);
-      auto sf = describe(f->getType(), field_name, id++, depth);
-      if (!error.empty()) {
-        return;
-      }
-      if (snapshot) {
-        const auto owner = record_spelling(r);
-        const auto [it, inserted] = owners.try_emplace(sf.name, out.fields.size(), owner);
-        if (!inserted) {
-          auto &first = out.fields[it->second.first];
-          if (first.name == sf.name)
-            first.name = it->second.second + "::" + first.name;
-          sf.name = owner + "::" + sf.name;
+      auto reason = capture ? omission(*capture, *r, *f) : std::string{};
+      SchemaField sf;
+      if (reason.empty()) {
+        const auto saved_fields = fields, saved_messages = messages;
+        sf = describe(f->getType(), field_name, number, depth);
+        if (!error.empty()) {
+          if (!capture || hard_error)
+            return;
+          reason = std::move(error);
+          error.clear();
+          fields = saved_fields;
+          messages = saved_messages;
         }
-      } else if (std::any_of(
-              out.fields.begin(), out.fields.end(),
-              [&](const auto &prior) { return prior.name == sf.name; })) {
-        error = "ambiguous inherited state member: " + sf.name;
-        return;
       }
-      out.fields.push_back(std::move(sf));
-      if (++fields > limits.fields) {
-        error = "schema field limit exceeded";
-        return;
+      if (!reason.empty()) {
+        leave_out(*capture, *r, *f, out, number, std::move(reason));
+        continue;
       }
+      if (capture)
+        capture->described.insert(f);
+      if (!append_field(r, out, std::move(sf), owners))
+        return;
     }
   }
 
@@ -364,6 +509,7 @@ struct Builder {
     out.number = number;
     if (depth > limits.depth) {
       error = "schema nesting limit exceeded";
+      hard_error = true;
       return out;
     }
     if (t->isBooleanType()) {
@@ -796,15 +942,39 @@ struct Builder {
     }
     auto *r = t->getAsCXXRecordDecl();
     if (!r || !r->hasDefinition()) {
+      // An unnamed type is named without the file and line that declare it.
+      clang::PrintingPolicy policy(ast.getLangOpts());
+      policy.AnonymousTagLocations = false;
       error = std::string(r ? "incomplete type '" : "unsupported field type '") +
-              canonical(t) + "': " + name;
+              (r ? canonical(t) : t.getCanonicalType().getAsString(policy)) + "': " + name;
       return out;
     }
-    // No field codec is generated for a class of the standard library (see gather_type in
-    // render_state_codec_sources), so one without a rule above has no encoding.
-    if (const auto standard = without_std_inline_namespace(r->getQualifiedNameAsString());
-        standard.rfind("std::", 0) == 0 && standard != "std::monostate") {
-      error = "unsupported standard type: " + standard;
+    const auto record_name = r->getQualifiedNameAsString();
+    if (plan() && record_name.rfind("std::", 0) == 0) {
+      // The codec generator emits nothing for a standard record, so the value
+      // could not be encoded. Walk it as the all-or-nothing capture does first:
+      // that reports what is really wrong with it, such as a union.
+      // The walk only looks for a reason: a limit it meets is not the value's.
+      const bool outer = strict, outer_hard = hard_error;
+      const auto saved_fields = fields, saved_messages = messages;
+      strict = true;
+      (void)message(r->getDefinition(), depth + 1);
+      strict = outer;
+      const bool limit = hard_error;
+      fields = saved_fields;
+      messages = saved_messages;
+      hard_error = outer_hard;
+      if (limit || error.empty())
+        error = "unsupported standard type: " + without_std_inline_namespace(record_name);
+      return out;
+    }
+    if (all_or_nothing() && record_name.rfind("std::", 0) == 0 &&
+        (snapshot || (record_name != "std::monostate" && record_name != "std::any"))) {
+      // The same holds without a plan: a standard record that nothing is wrong with
+      // would pass here and then fail to compile as a generated codec.
+      (void)message(r->getDefinition(), depth + 1);
+      if (error.empty())
+        error = "unsupported standard type: " + without_std_inline_namespace(record_name);
       return out;
     }
     out.kind = SchemaKind::message;
@@ -845,15 +1015,34 @@ struct Builder {
     }
     if (++messages > limits.messages) {
       error = "schema message limit exceeded";
+      hard_error = true;
       return result;
     }
     active.emplace(r, result);
+    auto outer_deferred = std::move(deferred);
+    deferred.clear();
+    if (plan() || all_or_nothing()) {
+      // What the codec generator would reject for this record; reported only
+      // when the walk finds nothing wrong first.
+      if (r->getDeclName().isEmpty() && !r->getTypedefNameForAnonDecl())
+        deferred = "unnamed record type cannot be captured automatically";
+      else if (plan() && r->getDescribedClassTemplate())
+        deferred = "anonymous or primary-template state class cannot receive an "
+                   "automatic codec";
+    }
     std::uint32_t id = 1;
     std::unordered_set<const clang::CXXRecordDecl *> seen;
     std::unordered_map<std::string, std::pair<std::size_t, std::string>> owners;
     collect_fields(r, *result, depth, id, seen, owners, r);
+    if (error.empty() && !deferred.empty())
+      error = std::move(deferred);
+    deferred = std::move(outer_deferred);
+    if (error.empty())
+      name_unavailable(*result);
     active.erase(r);
-    cache.emplace(r, result);
+    // A record that failed is not cached: a later member of its type must fail too.
+    if (error.empty())
+      cache.emplace(r, result);
     return result;
   }
 };
@@ -1156,6 +1345,10 @@ schema_tree_bytes(const std::shared_ptr<const SchemaMessage> &root) {
     for (const auto &f : m->fields) {
       visit_field(&f);
     }
+    for (const auto &item : m->unavailable) {
+      total += sizeof(SchemaUnavailable) + item.name.size() +
+               item.cpp_type.size() + item.reason.size() + item.owner.size();
+    }
   };
   visit_message(root.get());
   return total;
@@ -1378,8 +1571,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
         result.error = "recursive codec type is unsupported";
       return;
     }
-    if (r->getQualifiedNameAsString().empty() ||
-        r->getDescribedClassTemplate()) {
+    if (unnamable_record(r) || r->getDescribedClassTemplate()) {
       result.error = "anonymous or primary-template state class cannot receive "
                      "an automatic codec";
       return;
@@ -1406,7 +1598,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
     }
     const auto gather_members = [&](const auto &self, const clang::CXXRecordDecl *owner) -> void {
       for (const auto *f : owner->fields())
-        if (selection.includes(r, *f))
+        if (selection.includes(r, *f) && !(selection.plan && selection.plan->reason(*f)))
           gather_type(f->getType());
       if (snapshot && selection.record)
         for (const auto &base : owner->bases()) {
@@ -1505,6 +1697,11 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
           continue;
         if (snapshot && field->isUnnamedBitField())
           continue;
+        if (selection.plan && selection.plan->reason(*field)) {
+          // Left out of the descriptor, but its number stays reserved.
+          fields << "  ++field_number;\n";
+          continue;
+        }
         auto access = field->getAccess();
         if (access == clang::AS_none)
           access = r->isStruct() ? clang::AS_public : clang::AS_private;
@@ -2088,6 +2285,17 @@ SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   SchemaRecursion recursion) {
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
                                    access_policy, selection, recursion);
+}
+
+const std::string *CapturePlan::reason(const clang::FieldDecl &field) const {
+  const auto found = omitted.find(&field);
+  return found == omitted.end() ? nullptr : &found->second;
+}
+
+void CapturePlan::omit(const clang::FieldDecl &field, std::string reason) {
+  if (described.count(&field))
+    conflict = true;
+  omitted.try_emplace(&field, std::move(reason));
 }
 
 bool SnapshotFieldSelection::includes(const clang::CXXRecordDecl *root,
