@@ -88,8 +88,16 @@ struct SchemaField {
   unsigned bit_width = 0;
   bool repeated = false, optional = false;
   std::shared_ptr<const struct SchemaMessage> message;
+  // Set instead of `message` where a record contains itself, directly or
+  // through other records: the record is still being described higher up and
+  // already owns this field, so the field refers back to it without owning it.
+  std::weak_ptr<const struct SchemaMessage> recursive;
   std::shared_ptr<const SchemaField> key, value;
   std::size_t fixed_count = 0;
+  // The record this field holds, whichever way it is referenced.
+  std::shared_ptr<const struct SchemaMessage> record() const {
+    return message ? message : recursive.lock();
+  }
 };
 
 // A member that capture leaves out of a record. It keeps its field number.
@@ -164,6 +172,10 @@ SchemaResult build_state_schema(clang::ASTContext &,
                                 const clang::CXXRecordDecl &, StateFamilyKey,
                                 SchemaLimits = {});
 enum class CodecAccess { public_members, snapshot_members };
+// Whether a record may contain itself (a tree or list node). The schema of such
+// a record is a finite graph: the inner occurrence refers back to the outer one
+// (SchemaField::recursive) and names the same descriptor message.
+enum class SchemaRecursion { reject, allow };
 
 // The members one generated capture unit leaves out, with the reason. The schema
 // builder fills it; the codec generator and the type check read it, so the
@@ -192,14 +204,16 @@ struct SnapshotFieldSelection {
 SchemaResult build_payload_schema(clang::ASTContext &, clang::QualType payload,
                                   StateFamilyKey, SchemaLimits = {},
                                   CodecAccess = CodecAccess::public_members,
-                                  const SnapshotFieldSelection & = {});
+                                  const SnapshotFieldSelection & = {},
+                                  SchemaRecursion = SchemaRecursion::reject);
 // Emits owner-side Codec<T> specializations from declarations. The caller
 // appends this source to the checked owner compilation unit; no user mappings.
 CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &);
 CodecSourceResult
 render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots,
                            CodecAccess = CodecAccess::public_members,
-                           const SnapshotFieldSelection & = {});
+                           const SnapshotFieldSelection & = {},
+                           SchemaRecursion = SchemaRecursion::reject);
 // Combines marked State<T> record roots and generic payload QualTypes into one
 // deduplicated recursive codec emission pass.
 CodecSourceResult
@@ -207,7 +221,8 @@ render_context_codec_sources(clang::ASTContext&,
                              ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
                              ::tracer::compat::span<const clang::QualType> payload_roots,
                              CodecAccess = CodecAccess::public_members,
-                             const SnapshotFieldSelection & = {});
+                             const SnapshotFieldSelection & = {},
+                             SchemaRecursion = SchemaRecursion::reject);
 struct SnapshotMemberAccessor {
   const clang::CXXRecordDecl *root_type = nullptr;
   std::string member_name;
@@ -218,13 +233,15 @@ CodecSourceResult render_snapshot_member_accessors(
     ::tracer::compat::span<const clang::QualType> payload_roots,
     ::tracer::compat::span<const SnapshotMemberAccessor> members,
     CodecAccess = CodecAccess::snapshot_members,
-    const SnapshotFieldSelection & = {});
+    const SnapshotFieldSelection & = {},
+    SchemaRecursion = SchemaRecursion::reject);
 // Emits any required user-record codecs plus a root call that encodes payload
 // as field 1; builtin/string/container roots use encode_value directly.
 CodecSourceResult render_payload_codec_source(clang::ASTContext &,
                                               clang::QualType payload,
                                               CodecAccess = CodecAccess::public_members,
-                                              const SnapshotFieldSelection & = {});
+                                              const SnapshotFieldSelection & = {},
+                                              SchemaRecursion = SchemaRecursion::reject);
 // Resolves a dotted logical field path independently against each immutable
 // revision. Missing paths remain explicit; renamed fields are never inferred.
 std::vector<RevisionField>

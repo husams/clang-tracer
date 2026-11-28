@@ -43,6 +43,8 @@ struct Text { int id = 1; std::string text; std::mutex m; };
 // Several members left out under one name: three anonymous unions (the prepared route
 // refuses to prepare those, so this one is read directly).
 struct Anons { union { int a; float b; }; union { int c; float d; }; union { int e; float f; }; int g = 9; };
+// A record that contains itself and has a member left out: partial at every level.
+struct Tree { int v = 1; std::mutex m; std::vector<Tree> kids; };
 // A member left out and a captured one with the same name, in either order.
 struct Base { std::mutex m; };
 struct Derived : Base { int m = 6; };
@@ -75,6 +77,7 @@ int f_by_name(const ByName &value);
 int f_both(const Both &value);
 int f_blocked(const Blocked &value);
 int f_text(const Text &value);
+int f_tree(const Tree &value);
 int f_anons(const Anons &value);
 int f_derived(const Derived &value);
 int f_late(const Late &value);
@@ -101,6 +104,7 @@ PC_FUNCTION(f_by_name, ByName, static_cast<int>(value.by_name.size()))
 PC_FUNCTION(f_both, Both, value.own)
 PC_FUNCTION(f_blocked, Blocked, 1)
 PC_FUNCTION(f_text, Text, static_cast<int>(value.text.size()))
+PC_FUNCTION(f_tree, Tree, value.v)
 PC_FUNCTION(f_anons, Anons, value.g)
 PC_FUNCTION(f_derived, Derived, value.m)
 PC_FUNCTION(f_late, Late, value.Early::m)
@@ -133,6 +137,13 @@ int main() {
     by_name.by_name["x"].guarded = 8;
     by_name.by_name["y"].guarded = 9;
     pc::Anons anons; pc::Derived derived; pc::Late late; pc::Access access;
+    pc::Tree tree;
+    tree.v = 1;
+    tree.kids = std::vector<pc::Tree>(2);
+    tree.kids[0].v = 2;
+    tree.kids[1].v = 3;
+    tree.kids[0].kids = std::vector<pc::Tree>(1);
+    tree.kids[0].kids[0].v = 4;
     pc::Text short_text, long_text;
     short_text.text = "short";
     long_text.text = std::string(6000, 'z');
@@ -140,6 +151,7 @@ int main() {
     pc::f_middle(middle); pc::f_last(last); pc::f_nested(nested); pc::f_items(items);
     pc::f_by_name(by_name); pc::f_both(both); pc::f_blocked(blocked);
     pc::f_text(short_text); pc::f_text(long_text);
+    pc::f_tree(tree);
     pc::f_anons(anons); pc::f_derived(derived); pc::f_late(late); pc::f_access(access);
     pc::echo(mutex);
     counter.add(2);
@@ -274,6 +286,17 @@ CASES = {
                 'pc_require(pc_status(t) == "UNSUPPORTED" && pc_has(t, "' + MUTEX_WHY + '"), "status " + pc_status(t)); '
                 'pc_require(!pc_has(t, "unavailable {"), "nothing is listed as left out"); ',
                 [], "pc::f_blocked(const pc::Blocked &)"),
+    # A record that contains itself: every level is partial, and the numbers hold.
+    "tree": ("f_tree(", 'const auto s = e.argument_snapshot(0); const auto &kids = s.field("kids"); '
+             'pc_require(s.field("v").as<int>() == 1 && kids.elements().size() == 2, "root"); '
+             'pc_require(kids.at(0).field("v").as<int>() == 2 && kids.at(1).field("v").as<int>() == 3, "level one"); '
+             'const auto &deeper = kids.at(0).field("kids"); '
+             'pc_require(deeper.elements().size() == 1 && deeper.at(0).field("v").as<int>() == 4, "level two"); '
+             'pc_require(kids.at(1).field("kids").elements().empty(), "a leaf"); '
+             f'pc_left_out(s, "m", "{MUTEX_WHY}"); pc_left_out(kids.at(0), "m", "{MUTEX_WHY}"); '
+             f'pc_left_out(kids.at(1), "m", "{MUTEX_WHY}"); pc_left_out(deeper.at(0), "m", "{MUTEX_WHY}"); ' +
+             PARTIAL + entry_checks("m", MUTEX_WHY, 2),
+             ["pc::Tree::m of type std::mutex"], "pc::f_tree(const pc::Tree &)"),
     # A member left out and one that is captured share a name: the captured one keeps it,
     # the other names the record that declares it.
     "derived": ("f_derived(", 'const auto s = e.argument_snapshot(0); '

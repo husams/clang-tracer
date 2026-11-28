@@ -58,53 +58,180 @@ struct EncodeBudget {
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
   const char *failure = nullptr;
+  // The owned pointees one capture has already taken, by address. It starts in
+  // inline storage and grows on the heap up to `limit` addresses, so a capture
+  // that meets a few smart pointers allocates nothing.
   struct PointerGraph {
+    enum class Admission { added, seen, full };
     explicit PointerGraph(std::size_t limit) noexcept : limit(std::min(limit, max_capture_items)) {}
 
-    bool admit(std::uintptr_t address) noexcept {
-      if (!address || size >= limit)
-        return false;
-      if (!seen && !allocate())
-        return false;
+    // True when the address is new; false when it was seen or does not fit.
+    bool admit(std::uintptr_t address) noexcept { return note(address) == Admission::added; }
+
+    Admission note(std::uintptr_t address) noexcept {
+      if (!address)
+        return Admission::full;
+      auto index = slot(address);
+      while (slots[index]) {
+        if (slots[index] == address)
+          return Admission::seen;
+        index = (index + 1) & mask;
+      }
+      if (count >= limit)
+        return Admission::full;
+      if (count == capacity) {
+        if (!grow())
+          return Admission::full;
+        index = slot(address);
+        while (slots[index])
+          index = (index + 1) & mask;
+      }
+      slots[index] = address;
+      order[count++] = address;
+      return Admission::added;
+    }
+
+    std::size_t size() const noexcept { return count; }
+
+    // Forgets the addresses admitted after the capture had `size` of them, in
+    // reverse order: the newest entry is always the last of its probe run.
+    void rewind(std::size_t size) noexcept {
+      while (count > size) {
+        const auto address = order[--count];
+        auto index = slot(address);
+        while (slots[index] != address)
+          index = (index + 1) & mask;
+        slots[index] = 0;
+      }
+    }
+
+  private:
+    static constexpr std::size_t inline_capacity = 8;
+
+    std::size_t slot(std::uintptr_t address) const noexcept {
       // Mix aligned addresses before indexing a table kept at most half full.
       std::uint64_t hash = address;
       hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
       hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
-      auto index = static_cast<std::size_t>(hash ^ (hash >> 31)) & mask;
-      while (seen[index]) {
-        if (seen[index] == address)
-          return false;
-        index = (index + 1) & mask;
+      return static_cast<std::size_t>(hash ^ (hash >> 31)) & mask;
+    }
+
+    // One block holds the addresses in order of admission, then the table.
+    bool grow() noexcept {
+      const auto wider = std::min(limit, capacity * 4);
+      if (wider <= capacity)
+        return false;
+      std::size_t table = 2 * inline_capacity;
+      while (table < 2 * wider)
+        table *= 2;
+      std::unique_ptr<std::uintptr_t[]> block(new (std::nothrow) std::uintptr_t[wider + table]{});
+      if (!block)
+        return false;
+      for (std::size_t i = 0; i < count; ++i)
+        block[i] = order[i];
+      heap = std::move(block);
+      order = heap.get();
+      slots = heap.get() + wider;
+      capacity = wider;
+      mask = table - 1;
+      for (std::size_t i = 0; i < count; ++i) {
+        auto index = slot(order[i]);
+        while (slots[index])
+          index = (index + 1) & mask;
+        slots[index] = order[i];
       }
-      seen[index] = address;
-      ++size;
       return true;
     }
 
-  private:
-    bool allocate() noexcept {
-      if (mask)
-        return false;
-      std::size_t slots = 2;
-      while (slots / 2 < limit)
-        slots *= 2;
-      mask = slots - 1;
-      seen.reset(new (std::nothrow) std::uintptr_t[slots]{});
-      return bool(seen);
-    }
-
-    std::unique_ptr<std::uintptr_t[]> seen;
+    std::uintptr_t inline_order[inline_capacity]{};
+    std::uintptr_t inline_slots[2 * inline_capacity]{};
+    std::unique_ptr<std::uintptr_t[]> heap;
+    std::uintptr_t *order = inline_order, *slots = inline_slots;
     const std::size_t limit;
-    std::size_t size = 0, mask = 0;
+    std::size_t count = 0, capacity = inline_capacity, mask = 2 * inline_capacity - 1;
   };
   PointerGraph *pointer_graph = nullptr;
+  // The objects being captured around the current value, innermost first: the
+  // root record and the pointees of the smart pointers followed from it. Each
+  // entry lives in the frame of the codec that follows the object, and names
+  // its type, because a member at offset 0 shares the address of its owner.
+  struct Active {
+    std::uintptr_t address = 0;
+    const void *type = nullptr;
+    const Active *outer = nullptr;
+  };
+  template <class T> struct TypeTag {
+    static constexpr char tag = 0;
+  };
+  template <class T> static const void *type_of() noexcept {
+    return &TypeTag<std::remove_cv_t<T>>::tag;
+  }
+  const Active *active = nullptr;
+  bool is_active(std::uintptr_t address, const void *type) const noexcept {
+    for (const auto *entry = active; entry; entry = entry->outer)
+      if (entry->address == address && entry->type == type)
+        return true;
+    return false;
+  }
+  // The limit behind `failure`, for a codec that can leave the failed part out.
+  enum class Limit : std::uint8_t { none, depth, elements, traversal };
+  Limit limit_hit = Limit::none;
+  // Why the first pointee was left out by a limit: one of the values of a
+  // smart pointer's `omitted` field ("depth", "bytes", "elements", "string").
+  const char *pointee_cut = nullptr;
+  // The limit that stopped the part of the capture a codec is about to leave
+  // out, as the `omitted` text, or null when the failure is not one a capture
+  // survives (traversal or work budget, a checked read, a codec error).
+  const char *limit_reached(CaptureStatus status) const noexcept {
+    switch (status) {
+    case CaptureStatus::bytes_exceeded:
+      return "bytes";
+    case CaptureStatus::string_exceeded:
+      return "string";
+    case CaptureStatus::depth_exceeded:
+      return "depth";
+    case CaptureStatus::items_exceeded:
+      return "elements";
+    case CaptureStatus::ok:
+      break;
+    default:
+      return nullptr;
+    }
+    return limit_hit == Limit::depth      ? "depth"
+           : limit_hit == Limit::elements ? "elements"
+                                          : nullptr;
+  }
+  struct Mark {
+    std::size_t items = 0, depth = 0, path_size = 0, graph = 0;
+    const char *cut = nullptr;
+    bool truncated = false;
+  };
+  Mark mark() const noexcept {
+    return {items, depth, path_size, pointer_graph ? pointer_graph->size() : 0, cut, truncated};
+  }
+  // Returns to a mark after the writer did: what was counted or noted for the
+  // dropped part is given back, except the visits and the checked reads, which
+  // bound the effort.
+  void rewind(const Mark &mark) noexcept {
+    items = mark.items;
+    depth = mark.depth;
+    path_size = mark.path_size;
+    if (pointer_graph)
+      pointer_graph->rewind(mark.graph);
+    cut = mark.cut;
+    truncated = mark.truncated;
+    failure = nullptr;
+    limit_hit = Limit::none;
+  }
   bool enter() noexcept {
     if (++visits > limits.visits) {
       failure = "snapshot exceeds traversal budget";
+      limit_hit = Limit::traversal;
       return false;
     }
     if (++depth > limits.depth) {
       failure = "snapshot exceeds depth budget";
+      limit_hit = Limit::depth;
       return false;
     }
     return true;
@@ -127,6 +254,7 @@ struct EncodeBudget {
     selected = std::min(n, max_items);
     if (selected > limits.items - std::min(items, limits.items)) {
       failure = "snapshot exceeds element budget";
+      limit_hit = Limit::elements;
       return false;
     }
     items += selected;
@@ -141,6 +269,7 @@ struct EncodeBudget {
         (!truncation || !truncation(truncation_context,
                                     {path.data(), path_size}, n, selected))) {
       failure = "snapshot exceeds element budget";
+      limit_hit = Limit::elements;
       pop(saved);
       return false;
     }
@@ -364,6 +493,17 @@ struct CanSnapshotPointee<T, std::void_t<decltype(sizeof(T))>>
     : std::bool_constant<std::is_object_v<T> && !std::is_array_v<T> &&
                          !std::is_volatile_v<T>> {};
 
+// A smart pointer is captured as its address and, when it owns an object that
+// can be read, a copy of the object. The copy is left out, and `omitted` says
+// why, when the object
+//   "cycle"    is being captured around this pointer (it is an owner of itself),
+//   "alias"    was captured earlier in the same snapshot, through another pointer,
+//   "depth", "bytes", "elements", "string"
+//              did not fit a limit of the capture: what was written for it is
+//              dropped, the rest of the snapshot is kept and the snapshot carries
+//              a note naming the limit.
+// The address identifies the object in all three cases. Field numbers match the
+// smart pointer descriptor in context_schema.cpp.
 template <class T, class Pointer>
 bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
                              Pointer *pointer, bool owned,
@@ -371,17 +511,61 @@ bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
   if (!w.begin_message(field))
     return false;
   const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-  const bool suppressed = owned && pointer && budget.pointer_graph &&
-                          !budget.pointer_graph->admit(address);
-  bool ok = w.u64(1, address) && w.boolean(3, suppressed);
-  if constexpr (CanSnapshotPointee<T>::value)
-    if (ok && owned && pointer && !suppressed) {
-      // A pointee that is not wholly readable is left out, not dereferenced.
-      if (!budget.readable ||
-          (budget.spend() && budget.readable(pointer, sizeof(T), alignof(T))))
-        ok = encode_present_value(w, 2, *pointer, budget);
+  const char *omitted = "";
+  bool ok = w.u64(1, address);
+  if (ok && owned && pointer) {
+    // The object is forgotten again if its copy turns out not to fit.
+    [[maybe_unused]] const auto budget_mark = budget.mark();
+    if (budget.is_active(address, EncodeBudget::type_of<T>())) {
+      omitted = "cycle";
+    } else if (budget.pointer_graph) {
+      const auto admission = budget.pointer_graph->note(address);
+      if (admission == EncodeBudget::PointerGraph::Admission::seen)
+        omitted = "alias";
+      else if (admission == EncodeBudget::PointerGraph::Admission::full)
+        omitted = "elements";
     }
+    if constexpr (CanSnapshotPointee<T>::value)
+      if (!*omitted) {
+        // A pointee that is not wholly readable is left out, not dereferenced.
+        if (!budget.readable ||
+            (budget.spend() && budget.readable(pointer, sizeof(T), alignof(T)))) {
+          const auto writer_mark = w.mark();
+          const EncodeBudget::Active here{address, EncodeBudget::type_of<T>(), budget.active};
+          budget.active = &here;
+          ok = encode_present_value(w, 2, *pointer, budget);
+          budget.active = here.outer;
+          if (!ok) {
+            const char *limit = budget.limit_reached(w.status());
+            if (limit && w.rewind(writer_mark)) {
+              budget.rewind(budget_mark);
+              omitted = limit;
+              ok = true;
+            }
+          }
+        }
+      }
+    if (*omitted && omitted[0] != 'c' && omitted[0] != 'a' && !budget.pointee_cut)
+      budget.pointee_cut = omitted;
+  }
+  ok = ok && w.boolean(3, *omitted != 0) && w.label(4, omitted);
   return w.end_message() && ok;
+}
+
+// Encodes the root of a capture as field 1. A record root is an object that a
+// smart pointer below it may own again; that pointer closes a cycle.
+template <class T>
+bool encode_root(BoundedProtoWriter &w, const T &value, EncodeBudget &budget) noexcept {
+  if constexpr (std::is_class_v<T>) {
+    const EncodeBudget::Active root{reinterpret_cast<std::uintptr_t>(std::addressof(value)),
+                                    EncodeBudget::type_of<T>(), budget.active};
+    budget.active = &root;
+    const bool ok = encode_value(w, 1, value, budget);
+    budget.active = root.outer;
+    return ok;
+  } else {
+    return encode_value(w, 1, value, budget);
+  }
 }
 
 template <class T> struct Codec<std::unique_ptr<T>> {

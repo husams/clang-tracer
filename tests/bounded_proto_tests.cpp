@@ -123,6 +123,54 @@ void exact_fit_and_multibyte_lengths() {
               bytes[5] == std::byte{1},
           "nested length prefix bytes differ");
 }
+// A codec that can leave a part out returns to a mark taken before it: what the
+// part wrote is dropped and a failure it ran into at a payload limit is cleared.
+void marks() {
+  std::array<std::byte, 32> storage{};
+  ce::CaptureLimits limits;
+  limits.depth = 3;
+  limits.string_bytes = 4;
+  limits.items = 4;
+  ce::BoundedProtoWriter out(storage, limits);
+  require(out.begin_message(1) && out.u64(1, 7), "marked message did not start");
+  const auto mark = out.mark();
+  // Depth: two more messages fit, the third does not.
+  require(out.begin_message(2) && out.begin_message(1) && !out.begin_message(1) &&
+              out.status() == ce::CaptureStatus::depth_exceeded,
+          "depth limit not reached");
+  require(out.rewind(mark) && out.status() == ce::CaptureStatus::ok, "depth failure not cleared");
+  // Bytes, string bytes and elements.
+  require(out.begin_message(2) && !out.label(1, "a text that cannot fit the storage at all") &&
+              out.status() == ce::CaptureStatus::bytes_exceeded && out.rewind(mark),
+          "byte failure not cleared");
+  require(!out.string(2, "12345") && out.status() == ce::CaptureStatus::string_exceeded &&
+              out.rewind(mark),
+          "string failure not cleared");
+  std::size_t selected = 0;
+  require(out.container_items(3, 4, selected) && selected == 3 &&
+              !out.container_items(2, 4, selected) &&
+              out.status() == ce::CaptureStatus::items_exceeded && out.rewind(mark) &&
+              out.container_items(4, 4, selected) && selected == 4 && out.rewind(mark),
+          "element failure not cleared or elements not given back");
+  // A label is not bound by the limit on captured strings.
+  require(out.label(3, "longer") && out.end_message(), "label or end after rewind failed");
+  const std::array<unsigned char, 12> expected{0x0a, 0x0a, 0x08, 0x07, 0x1a, 0x06,
+                                               'l',  'o',  'n',  'g',  'e',  'r'};
+  const auto bytes = out.finish();
+  require(bytes.size() == expected.size(), "rewound wire size differs");
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    require(std::to_integer<unsigned char>(bytes[i]) == expected[i], "rewound wire bytes differ");
+
+  // Effort is not given back, and a failure that is not a payload limit stays.
+  ce::CaptureLimits few;
+  few.visits = 3;
+  ce::BoundedProtoWriter spent(storage, few);
+  const auto start = spent.mark();
+  require(spent.u64(1, 1) && spent.u64(2, 2) && spent.rewind(start) && spent.u64(1, 1) &&
+              !spent.u64(2, 2) && spent.status() == ce::CaptureStatus::visits_exceeded &&
+              !spent.rewind(start) && spent.finish().empty(),
+          "a rewind gave visits back or cleared a traversal failure");
+}
 } // namespace
 int main() {
   try {
@@ -132,7 +180,8 @@ int main() {
     nesting_and_work();
     numeric_edges();
     exact_fit_and_multibyte_lengths();
-    std::cout << "6 bounded Protobuf writer checks passed\n";
+    marks();
+    std::cout << "7 bounded Protobuf writer checks passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

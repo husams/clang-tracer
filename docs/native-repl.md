@@ -2449,10 +2449,59 @@ What you see when a limit cuts something:
 | Member does not fit the slice | field `<field>_snapshot_cut` | `a followed member does not fit the snapshot payload: raise --snapshot-slice or --snapshot-arena` |
 | No storage left for a member | field `<field>_snapshot_cut` | `no snapshot storage was left for a followed member: raise --snapshot-arena or lower --snapshot-reserve` |
 | Member does not fit the event (shared-context events) | field `<field>_snapshot_cut` | `the followed member did not fit the event: raise --context-event-bytes of the server` |
+| An object a smart pointer owns is nested deeper than the snapshot depth limit | field `snapshot_cut` of the root (`<field>_snapshot_cut` in a followed member); `omitted` of the pointer is `depth` | `objects owned by smart pointers were left out at the snapshot depth limit (their pointers say omitted: depth)` |
+| An object a smart pointer owns does not fit the payload | same; `omitted` is `bytes` | `objects owned by smart pointers did not fit the snapshot payload and were left out (their pointers say omitted: bytes): raise --snapshot-slice or --snapshot-arena` |
+| An object a smart pointer owns holds more elements, or a longer string, than the snapshot allows | same; `omitted` is `elements` or `string` | `objects owned by smart pointers were left out at the snapshot element limit (their pointers say omitted: elements)`; in a followed member the text names `--vector-elements` or `--string-bytes` |
 
 `<field>_snapshot_cut` is a string field next to `<field>_snapshot`, so
 `event.result_snapshot().field("_chain_snapshot_cut")` reads it; a cut inside a
 nested member sits in that member's record.
+
+#### Records that contain themselves
+
+A record may contain itself: a tree node with a `std::vector` of its own type,
+a list node that owns the next one through `std::unique_ptr`, nodes that share
+each other through `std::shared_ptr`, or records that contain each other. The
+type does not bound such a value, so the capture is bounded by what it copies:
+the nesting depth (32 levels in an event snapshot), the element and byte budgets
+and the payload size. A record nested by value (`std::vector<Node> kids`, a
+`std::map` of the record) is captured on both routes; one that recurs through a
+smart pointer needs a prepared package, like every smart pointer member.
+
+A captured smart pointer is a record with four fields:
+
+| Field | Meaning |
+| --- | --- |
+| `address` | The address of the object in the target; `0` for an empty pointer. |
+| `value` | The copy of the object, or null when there is none. |
+| `suppressed` | True when the pointer owns an object whose copy was left out. |
+| `omitted` | Why it was left out; empty otherwise. |
+
+`omitted` is one of:
+
+| Value | Meaning | Snapshot |
+| --- | --- | --- |
+| `cycle` | The object is being captured around this pointer: it is the argument itself or an owner of this pointer. The pointer closes a cycle and the capture stops there. | complete; `address` names the object |
+| `alias` | The object was captured earlier in the same snapshot, through another pointer. It is copied once. | complete; `address` equals the `address` of the pointer that carries the copy |
+| `depth`, `bytes`, `elements`, `string` | The object did not fit that limit. What had been written for it is dropped, everything captured before and after it is kept, and the snapshot carries a `snapshot_cut` note. | cut at this pointer |
+
+For example, a chain of 40 list nodes arrives as the first 11 nodes; the `next`
+of the eleventh has `address` of the twelfth, no `value` and `omitted` `depth`,
+and the argument has `snapshot_cut`. Each list node takes three levels (the
+pointer, its optional value and the node), a tree node nested by value takes
+one. A value nested by value deeper than the depth limit has no pointer to cut
+at and is reported as `LIMIT_EXCEEDED` (`snapshot exceeds depth budget`), as
+before.
+
+`event.argument_as<T>(0)` rebuilds trees, lists and graphs whose snapshot is
+whole: a `std::shared_ptr` captured as an alias shares the object rebuilt for
+the first pointer again. A value that cannot be the captured graph is refused
+with `std::runtime_error` instead of being shortened: a pointer whose `omitted`
+is `cycle` (a typed value cannot own itself), a limit, or an alias a
+`std::unique_ptr` would have to share. The message names the object's address,
+the pointer type and the reason; read the fields (`argument_snapshot(0)`) in
+that case. `std::filesystem::path` members are still unsupported: a path is not
+captured through its private list of components.
 
 To choose the captured fields for one implementation, pass a C++ file with
 `--callback` to `%probe inject`. Define an overload of `tracer_snapshot::encode`
@@ -2561,7 +2610,9 @@ decode error. A `char` pointer points at a copy of the captured string and a
 pointer to a scalar at a copy of the value. A reference member needs its
 referent: decoding throws `std::runtime_error` naming the record and field when
 it was not captured. Smart pointer members point at the local copy of the
-pointee, or are empty when it was not captured. Other raw pointers are null. Do
+pointee, or are empty when it was not captured; a pointee the capture left out
+(`omitted` is set, see [records that contain themselves](#records-that-contain-themselves))
+raises instead. Other raw pointers are null. Do
 not move, copy, assign or destroy the reconstructed record itself; it owns the
 pointees, so do not move from, reset or assign its `std::unique_ptr` members
 either, because those only view the copies. Records with virtual bases cannot
