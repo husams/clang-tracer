@@ -147,14 +147,23 @@ struct Builder {
   SchemaLimits limits;
   FDS files;
   FP *file = nullptr;
-  std::unordered_set<const clang::CXXRecordDecl *> active;
+  // Records being described, with the message each one is filling in.
+  std::unordered_map<const clang::CXXRecordDecl *, std::shared_ptr<SchemaMessage>>
+      active;
   std::unordered_map<const clang::CXXRecordDecl *,
                      std::shared_ptr<const SchemaMessage>>
       cache;
   std::size_t fields = 0, messages = 0;
   std::string error;
   bool snapshot = false;
+  bool recursion = false;
   const SnapshotFieldSelection *selection = nullptr;
+
+  // A record that may refer back to itself. Standard-library records are not
+  // captured through their private layout (std::filesystem::path holds paths).
+  bool may_recur(const clang::CXXRecordDecl *record) const {
+    return recursion && record->getQualifiedNameAsString().rfind("std::", 0) != 0;
+  }
 
   bool system_default_specialization(
       const clang::ClassTemplateSpecializationDecl *s) const {
@@ -380,6 +389,9 @@ struct Builder {
         if (snapshot_pointee(arg(s, 0)))
           add_optional(arg(s, 0), "value");
         record->fields.push_back(snapshot_scalar("suppressed", 3, SchemaKind::boolean, 1));
+        // Why an owned object has no copy here: "alias", "cycle" or the limit
+        // that left it out (encode_snapshot_pointer in context_codec.hpp).
+        record->fields.push_back(snapshot_scalar("omitted", 4, SchemaKind::string, 0));
       }
       out.kind = SchemaKind::message;
       out.message = std::move(record);
@@ -616,7 +628,14 @@ struct Builder {
       return out;
     }
     out.kind = SchemaKind::message;
-    out.message = message(r->getDefinition(), depth + 1);
+    r = r->getDefinition();
+    if (const auto open = active.find(r); open != active.end() && may_recur(r)) {
+      // The record contains itself: refer back to the message being described
+      // instead of describing it again.
+      out.recursive = open->second;
+      return out;
+    }
+    out.message = message(r, depth + 1);
     return out;
   }
 
@@ -637,7 +656,7 @@ struct Builder {
       error = "schema message limit exceeded";
       return result;
     }
-    active.insert(r);
+    active.emplace(r, result);
     std::uint32_t id = 1;
     std::unordered_set<const clang::CXXRecordDecl *> seen;
     std::unordered_map<std::string, std::pair<std::size_t, std::string>> owners;
@@ -722,9 +741,13 @@ struct DescriptorEmitter {
     case SchemaKind::enumeration:
       enum_def(f);
       return "enum:" + full(ident(f.enum_name));
-    case SchemaKind::message:
-      emit(*f.message);
-      return full(message_name(f.message->cpp_type));
+    case SchemaKind::message: {
+      // A message is emitted once by name, so a record that contains itself
+      // names its own descriptor.
+      const auto record = f.record();
+      emit(*record);
+      return full(message_name(record->cpp_type));
+    }
     case SchemaKind::optional: {
       const auto n = ident(path + "_optional");
       if (emitted_messages.insert(n).second) {
@@ -941,6 +964,96 @@ void hash_length_prefixed(std::uint64_t &hash, std::string_view value) {
 }
 } // namespace
 
+namespace {
+// The receiver refuses more roles than this (context_receiver.cpp).
+constexpr std::size_t kMaxContainerRoles = 8192;
+
+// Container roles are keyed by the path of field numbers from the root. A
+// record that contains itself has no longest path, so its roles are listed
+// once, under the path of its outermost occurrence: the walk stops where it
+// meets a message that is already open on the path, and a reader that meets
+// the message again continues from the path of the open one.
+bool collect_container_roles(const SchemaMessage &root, std::vector<std::string> &roles,
+                             std::string &error) {
+  std::unordered_set<std::string> open;
+  std::function<void(const SchemaField &, const std::string &)> collect_roles;
+  std::function<void(const SchemaMessage &, const std::string &)>
+      collect_message;
+  collect_message = [&](const SchemaMessage &m, const std::string &prefix) {
+    if (!error.empty() || !open.insert(m.cpp_type).second)
+      return;
+    for (const auto &field : m.fields) {
+      const auto path = prefix.empty()
+                            ? std::to_string(field.number)
+                            : prefix + "." + std::to_string(field.number);
+      collect_roles(field, path);
+    }
+    open.erase(m.cpp_type);
+  };
+  collect_roles = [&](const SchemaField &field, const std::string &path) {
+    if (!error.empty())
+      return;
+    std::string role;
+    switch (field.kind) {
+    case SchemaKind::optional:
+      role = "optional";
+      break;
+    case SchemaKind::array:
+      role = "array:" + std::to_string(field.fixed_count);
+      break;
+    case SchemaKind::vector:
+      role = "vector";
+      break;
+    case SchemaKind::map:
+      role = "map";
+      break;
+    case SchemaKind::deque:
+      role = "deque";
+      break;
+    case SchemaKind::list:
+      role = "list";
+      break;
+    case SchemaKind::set:
+      role = "set";
+      break;
+    case SchemaKind::unordered_set:
+      role = "unordered_set";
+      break;
+    case SchemaKind::unordered_map:
+      role = "unordered_map";
+      break;
+    default:
+      break;
+    }
+    if (!role.empty()) {
+      roles.push_back(path + "=" + role);
+      if (roles.size() > kMaxContainerRoles) {
+        error = "container role count exceeds limit";
+        return;
+      }
+    }
+    if (const auto record = field.record()) {
+      collect_message(*record, path);
+    }
+    if (field.value) {
+      collect_roles(*field.value, path + "/value");
+    }
+    if (field.key) {
+      collect_roles(*field.key, path + "/key");
+    }
+  };
+  collect_message(root, "");
+  if (!error.empty())
+    return false;
+  std::sort(roles.begin(), roles.end());
+  if (std::adjacent_find(roles.begin(), roles.end()) != roles.end()) {
+    error = "duplicate generated container role";
+    return false;
+  }
+  return true;
+}
+} // namespace
+
 std::string compute_schema_revision_id(std::string_view descriptor_bytes,
                                        const StateFamilyKey& family, std::string_view root_type,
                                        ::tracer::compat::span<const std::string> container_roles) {
@@ -982,7 +1095,8 @@ SchemaRecord::SchemaRecord(StateFamilyKey f, std::string root, std::string rev,
 
 CodecSourceResult
 render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots,
-                           CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+                           CodecAccess access_policy, const SnapshotFieldSelection &selection,
+                           SchemaRecursion recursion) {
   const bool snapshot = access_policy == CodecAccess::snapshot_members;
   CodecSourceResult result;
   std::vector<const clang::CXXRecordDecl *> records;
@@ -1041,7 +1155,9 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
     }
     r = r->getDefinition();
     if (active.count(r)) {
-      result.error = "recursive codec type is unsupported";
+      // A record that contains itself is gathered once; its codec calls itself.
+      if (recursion != SchemaRecursion::allow)
+        result.error = "recursive codec type is unsupported";
       return;
     }
     if (r->getQualifiedNameAsString().empty() ||
@@ -1121,6 +1237,18 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
               "  return reinterpret_cast<const T*>(static_cast<std::uintptr_t>(reference_address(object, offset)));\n"
               "}\n}\n";
   }
+  // Every codec is declared before any is defined: the codec of a record that
+  // contains itself, or of records that contain each other, calls a codec whose
+  // definition comes later, and a template that names it must find the
+  // specialization, not instantiate the scalar primary.
+  for (const auto *record : records) {
+    const auto type_name = record_spelling(record);
+    source << "template <> struct Codec<::" << type_name << "> {\n"
+           << " static bool write_fields(BoundedProtoWriter& w, const ::" << type_name
+           << "& value, EncodeBudget& budget, std::uint32_t& field_number) noexcept;\n"
+           << " static bool write(BoundedProtoWriter& w, std::uint32_t field, const ::"
+           << type_name << "& value, EncodeBudget& budget) noexcept;\n};\n";
+  }
   for (const auto *record : records) {
     const auto type_name = record_spelling(record);
     std::ostringstream fields;
@@ -1198,19 +1326,18 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
     emit_fields(emit_fields, record, "value", false);
     if (!result.error.empty())
       return result;
-    source << "template <> struct Codec<::" << type_name << "> {\n"
-           << " static bool write_fields(BoundedProtoWriter& w, const ::"
-           << type_name
+    source << "inline bool Codec<::" << type_name
+           << ">::write_fields(BoundedProtoWriter& w, const ::" << type_name
            << "& value, EncodeBudget& budget, std::uint32_t& field_number) "
               "noexcept {\n" << fields.str();
-    source << "  return true;\n }\n"
-           << " static bool write(BoundedProtoWriter& w, std::uint32_t field, "
-              "const ::"
+    source << "  return true;\n}\n"
+           << "inline bool Codec<::" << type_name
+           << ">::write(BoundedProtoWriter& w, std::uint32_t field, const ::"
            << type_name << "& value, EncodeBudget& budget) noexcept {\n"
            << "  if (budget.max_items > budget.item_cap || !w.begin_message(field)) "
               "return false; std::uint32_t field_number=1; const bool "
               "ok=write_fields(w,value,budget,field_number); return "
-              "w.end_message() && ok;\n }\n};\n";
+              "w.end_message() && ok;\n}\n";
   }
   source << "}\n";
   result.source = source.str();
@@ -1226,7 +1353,8 @@ CodecSourceResult
 render_context_codec_sources(clang::ASTContext& ast,
                              ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
                              ::tracer::compat::span<const clang::QualType> payload_roots,
-                             CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+                             CodecAccess access_policy, const SnapshotFieldSelection &selection,
+                             SchemaRecursion recursion) {
   std::vector<const clang::CXXRecordDecl *> roots(state_roots.begin(),
                                                   state_roots.end());
   std::unordered_set<const clang::CXXRecordDecl *> seen(roots.begin(),
@@ -1282,20 +1410,22 @@ render_context_codec_sources(clang::ASTContext& ast,
   for (const auto payload : payload_roots) {
     visit(payload);
   }
-  return render_state_codec_sources(roots, access_policy, selection);
+  return render_state_codec_sources(roots, access_policy, selection, recursion);
 }
 
 CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &ast,
     ::tracer::compat::span<const clang::QualType> payload_roots,
     ::tracer::compat::span<const SnapshotMemberAccessor> members,
-    CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+    CodecAccess access_policy, const SnapshotFieldSelection &selection,
+    SchemaRecursion recursion) {
   CodecSourceResult result;
   if (access_policy != CodecAccess::snapshot_members || members.empty()) {
     result.error = "followed snapshot fields require snapshot member access";
     return result;
   }
-  result = render_context_codec_sources(ast, {}, payload_roots, access_policy, selection);
+  result = render_context_codec_sources(ast, {}, payload_roots, access_policy, selection,
+                                        recursion);
   if (!result)
     return result;
   result.source += "\nnamespace tracer::context_engine::snapshot_access {\n";
@@ -1375,7 +1505,8 @@ CodecSourceResult render_snapshot_member_accessors(
 
 CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
                                               clang::QualType payload,
-                                              CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+                                              CodecAccess access_policy, const SnapshotFieldSelection &selection,
+                                              SchemaRecursion recursion) {
   CodecSourceResult result;
   const auto type = payload.getCanonicalType().getAsString();
   if (type.empty()) {
@@ -1387,6 +1518,7 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     limits.depth = max_capture_depth;
   Builder validator{ast, limits};
   validator.snapshot = access_policy == CodecAccess::snapshot_members;
+  validator.recursion = recursion == SchemaRecursion::allow;
   validator.selection = &selection;
   (void)validator.describe(payload, "value", 1, 0);
   if (!validator.error.empty()) {
@@ -1394,7 +1526,8 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     return result;
   }
   const clang::QualType payload_roots[] = {payload};
-  const auto generated = render_context_codec_sources(ast, {}, payload_roots, access_policy, selection);
+  const auto generated =
+      render_context_codec_sources(ast, {}, payload_roots, access_policy, selection, recursion);
   if (!generated) {
     result.error = generated.error;
     return result;
@@ -1467,7 +1600,8 @@ query_field_path(::tracer::compat::span<const std::shared_ptr<const SchemaRecord
           valid = false;
           break;
         }
-        message = nested->message.get();
+        // The revision owns every message, including one referred back to.
+        message = nested->record().get();
       }
     }
     if (valid && field) {
@@ -1558,69 +1692,8 @@ SchemaResult build_state_schema(clang::ASTContext &ast,
     return result;
   }
   std::vector<std::string> roles;
-  std::function<void(const SchemaField &, const std::string &)> collect_roles;
-  std::function<void(const SchemaMessage &, const std::string &)>
-      collect_message;
-  collect_message = [&](const SchemaMessage &m, const std::string &prefix) {
-    for (const auto &field : m.fields) {
-      const auto path = prefix.empty()
-                            ? std::to_string(field.number)
-                            : prefix + "." + std::to_string(field.number);
-      collect_roles(field, path);
-    }
-  };
-  collect_roles = [&](const SchemaField &field, const std::string &path) {
-    std::string role;
-    switch (field.kind) {
-    case SchemaKind::optional:
-      role = "optional";
-      break;
-    case SchemaKind::array:
-      role = "array:" + std::to_string(field.fixed_count);
-      break;
-    case SchemaKind::vector:
-      role = "vector";
-      break;
-    case SchemaKind::map:
-      role = "map";
-      break;
-    case SchemaKind::deque:
-      role = "deque";
-      break;
-    case SchemaKind::list:
-      role = "list";
-      break;
-    case SchemaKind::set:
-      role = "set";
-      break;
-    case SchemaKind::unordered_set:
-      role = "unordered_set";
-      break;
-    case SchemaKind::unordered_map:
-      role = "unordered_map";
-      break;
-    default:
-      break;
-    }
-    if (!role.empty()) {
-      roles.push_back(path + "=" + role);
-    }
-    if (field.message) {
-      collect_message(*field.message, path);
-    }
-    if (field.value) {
-      collect_roles(*field.value, path + "/value");
-    }
-    if (field.key) {
-      collect_roles(*field.key, path + "/key");
-    }
-  };
-  collect_message(*root, "");
-  std::sort(roles.begin(), roles.end());
-  if (std::adjacent_find(roles.begin(), roles.end()) != roles.end()) {
-    result.error = "duplicate generated container role";
+  if (!collect_container_roles(*root, roles, result.error))
     return result;
-  }
   DescriptorEmitter emitter{*f};
   emitter.emit(*root);
   const auto root_name = emitter.message_name(root->cpp_type);
@@ -1673,7 +1746,8 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
                                        clang::QualType payload,
                                        StateFamilyKey family,
                                        SchemaLimits limits,
-                                       CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+                                       CodecAccess access_policy, const SnapshotFieldSelection &selection,
+                                       SchemaRecursion recursion) {
   SchemaResult result;
   const auto payload_type = canonical_with_template_arguments(payload);
   if (payload.isNull() || payload_type.empty()) {
@@ -1698,6 +1772,7 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
   }
   Builder b{ast, limits};
   b.snapshot = access_policy == CodecAccess::snapshot_members;
+  b.recursion = recursion == SchemaRecursion::allow;
   b.selection = &selection;
   auto *file = b.files.add_file();
   file->set_name("state_schema.proto");
@@ -1714,69 +1789,8 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
     return result;
   }
   std::vector<std::string> roles;
-  std::function<void(const SchemaField &, const std::string &)> collect_roles;
-  std::function<void(const SchemaMessage &, const std::string &)>
-      collect_message;
-  collect_message = [&](const SchemaMessage &m, const std::string &prefix) {
-    for (const auto &field : m.fields) {
-      const auto path = prefix.empty()
-                            ? std::to_string(field.number)
-                            : prefix + "." + std::to_string(field.number);
-      collect_roles(field, path);
-    }
-  };
-  collect_roles = [&](const SchemaField &field, const std::string &path) {
-    std::string role;
-    switch (field.kind) {
-    case SchemaKind::optional:
-      role = "optional";
-      break;
-    case SchemaKind::array:
-      role = "array:" + std::to_string(field.fixed_count);
-      break;
-    case SchemaKind::vector:
-      role = "vector";
-      break;
-    case SchemaKind::map:
-      role = "map";
-      break;
-    case SchemaKind::deque:
-      role = "deque";
-      break;
-    case SchemaKind::list:
-      role = "list";
-      break;
-    case SchemaKind::set:
-      role = "set";
-      break;
-    case SchemaKind::unordered_set:
-      role = "unordered_set";
-      break;
-    case SchemaKind::unordered_map:
-      role = "unordered_map";
-      break;
-    default:
-      break;
-    }
-    if (!role.empty()) {
-      roles.push_back(path + "=" + role);
-    }
-    if (field.message) {
-      collect_message(*field.message, path);
-    }
-    if (field.value) {
-      collect_roles(*field.value, path + "/value");
-    }
-    if (field.key) {
-      collect_roles(*field.key, path + "/key");
-    }
-  };
-  collect_message(*root, "");
-  std::sort(roles.begin(), roles.end());
-  if (std::adjacent_find(roles.begin(), roles.end()) != roles.end()) {
-    result.error = "duplicate generated container role";
+  if (!collect_container_roles(*root, roles, result.error))
     return result;
-  }
   DescriptorEmitter emitter{*file, b.snapshot};
   emitter.emit(*root);
   const auto root_name = emitter.message_name(root->cpp_type);
@@ -1827,9 +1841,10 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
 SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   clang::QualType payload,
                                   StateFamilyKey family, SchemaLimits limits,
-                                  CodecAccess access_policy, const SnapshotFieldSelection &selection) {
+                                  CodecAccess access_policy, const SnapshotFieldSelection &selection,
+                                  SchemaRecursion recursion) {
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy, selection);
+                                   access_policy, selection, recursion);
 }
 
 bool SnapshotFieldSelection::includes(const clang::CXXRecordDecl *root,

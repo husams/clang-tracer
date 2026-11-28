@@ -108,6 +108,10 @@ bool BoundedProtoWriter::string(std::uint32_t field,
                                 std::string_view value) noexcept {
   if (value.size() > limits_.string_bytes)
     return fail(CaptureStatus::string_exceeded);
+  return label(field, value);
+}
+bool BoundedProtoWriter::label(std::uint32_t field,
+                               std::string_view value) noexcept {
   if (!tag(field, 2) || !varint(value.size()) || !reserve(value.size()))
     return false;
   if (!value.empty())

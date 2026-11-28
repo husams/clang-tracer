@@ -41,7 +41,8 @@ struct CaptureLimits {
 
 // Native capture primitive for generated codecs. All memory is supplied before
 // payload locks; no method allocates, calls user code or performs output I/O.
-// A sticky failure invalidates the entire capture, including earlier fields.
+// A sticky failure invalidates the entire capture, including earlier fields,
+// unless the codec returns to a mark it took before the part that failed.
 class BoundedProtoWriter final {
 public:
   // Inline so generated JIT code needs no hidden constructor symbol.
@@ -69,10 +70,37 @@ public:
   bool f32(std::uint32_t field, float) noexcept;
   bool f64(std::uint32_t field, double) noexcept;
   bool string(std::uint32_t field, std::string_view) noexcept;
+  // A short text the codec itself supplies (not captured data): written like a
+  // string, without the limit on the bytes of a captured string.
+  bool label(std::uint32_t field, std::string_view) noexcept;
   bool begin_message(std::uint32_t field) noexcept;
   bool end_message() noexcept;
   bool container_items(std::uint64_t total, std::size_t cap,
                        std::size_t &selected) noexcept;
+
+  // A position the capture can return to. A codec takes one before a part it
+  // can leave out (the pointee of a smart pointer); rewind drops what was
+  // written after it and clears a failure that part ran into, when the failure
+  // is a limit of the payload: bytes, string bytes, nesting depth or elements.
+  // The visits and the byte work already spent stay spent, so the limits on
+  // effort still bound a capture that leaves parts out.
+  struct Mark {
+    std::size_t used = 0, depth = 0, items = 0;
+  };
+  Mark mark() const noexcept { return {used_, depth_, items_}; }
+  bool rewind(const Mark &mark) noexcept {
+    if (status_ != CaptureStatus::ok && status_ != CaptureStatus::bytes_exceeded &&
+        status_ != CaptureStatus::string_exceeded &&
+        status_ != CaptureStatus::depth_exceeded && status_ != CaptureStatus::items_exceeded)
+      return false;
+    if (mark.used > used_ || mark.depth > depth_)
+      return false;
+    used_ = mark.used;
+    depth_ = mark.depth;
+    items_ = mark.items;
+    status_ = CaptureStatus::ok;
+    return true;
+  }
 
 private:
   bool fail(CaptureStatus) noexcept;
