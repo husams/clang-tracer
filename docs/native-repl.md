@@ -2776,7 +2776,7 @@ from your constructor or factory. This custom conversion runs locally.
 
 Automatic target capture uses complete ABI-validated layouts and serializable
 fields, including nested records and supported STL members. Prepared layouts
-can include private and protected fields. Unions, bit-fields, volatile data,
+can include private and protected fields. Bit-fields, volatile class storage,
 arbitrary raw pointees, wide/custom-character strings and standard types
 without a codec (such as `std::mutex` or `std::ostringstream`) are unavailable
 for general automatic record capture.
@@ -2802,6 +2802,25 @@ stays `UNSUPPORTED` with the reason of its first member. If the generated code
 that captures partial records does not compile, the probe is built with the
 whole-record capture instead (the fallback above), and the validation report
 says so.
+
+Some member types have no scalar form in an event. Both capture routes store
+them as a small record of named parts, which `EventValue::field` reads like any
+other record:
+
+| Member type | Captured parts | Typed read |
+| --- | --- | --- |
+| A union: named, unnamed or anonymous | `bytes` (the object representation), `size`, `active_member` (always `unknown`: a union does not store which member is active, so none is read) and `alternatives` (the members, as `"int i; float f"`). An anonymous union is the field `__anonymous_union_0` of its owner (`_1` for the next one). | None. Decode `bytes` yourself where the record has a tag that says which member is active. |
+| `long double` | `format` (`x87-extended-80`, `ieee-binary128`, `ieee-binary64` or `ibm-double-double`) and `bytes`: the value in that format, least significant byte first, without the padding of its storage. | `as<long double>()` is exact when the local format is the same; `as<double>()` gives the nearest double. |
+| `__int128`, `unsigned __int128` | `low` (unsigned 64 bits) and `high` (signed for `__int128`); the value is `high * 2^64 + low`. | `as<__int128>()`, `as<unsigned __int128>()`, with a range check. |
+| An enumeration whose underlying type is wider than 32 bits, or with an enumerator outside the `int32` range | One integer of the underlying width and signedness. `cpp_type()` names the enumeration. The schema carries the type and each `name=value` enumerator as the field options 50181 and 50182. | `as<Enum>()` |
+| A pointer to a data member | `abi` (`itanium`), `null` and `offset` (-1 when null). | `as<M C::*>()` |
+| A pointer to a member function | `abi` (`itanium`, or `itanium-arm` on AArch64), `null`, `is_virtual`, `address` (a non-virtual function), `vtable_offset` (a virtual one) and `this_adjustment`. | Only a null pointer has a local value. |
+| `std::nullptr_t` | `null`, which is true. | `as<std::nullptr_t>()` |
+
+A volatile scalar member is loaded once, as its declared type, and captured as
+that type. A volatile member of class type is left out with that reason, like
+any other member that cannot be captured.
+
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
 or over-budget snapshots throw; a partial snapshot never pretends to hold the

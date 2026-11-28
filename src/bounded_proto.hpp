@@ -10,6 +10,11 @@
 
 namespace tracer::context_engine {
 
+// A wide enumeration is stored as a plain integer field. Its C++ type and its enumerators
+// ("name=value", one entry each) travel as these custom field options of the generated
+// schema; a descriptor pool keeps an option it has no definition for as an unknown field.
+inline constexpr int kEnumTypeOption = 50181, kEnumeratorOption = 50182;
+
 inline constexpr std::size_t max_capture_depth = 64;
 inline constexpr std::size_t max_capture_items = 65536;
 

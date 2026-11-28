@@ -18,10 +18,13 @@
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/Type.h>
 #include <clang/Basic/SourceManager.h>
+#include <clang/Basic/TargetInfo.h>
 #include <google/protobuf/descriptor.pb.h>
+#include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/raw_ostream.h>
 
 #include "tracer/compat.hpp"
 
@@ -157,6 +160,70 @@ SchemaField snapshot_scalar(std::string name, std::uint32_t number,
   return field;
 }
 
+// The spelling a union's snapshot message is keyed by, and of an unnamed record among a
+// union's members. An unnamed record has no name, and the source location Clang prints for
+// it differs between a header and a prepared adapter.
+std::string union_spelling(const clang::CXXRecordDecl *record) {
+  if (record->getIdentifier() || record->getTypedefNameForAnonDecl())
+    return record_spelling(record);
+  std::string scope;
+  if (const auto *owner = llvm::dyn_cast<clang::NamedDecl>(record->getDeclContext()))
+    scope = owner->getQualifiedNameAsString() + "::";
+  return scope + (record->isAnonymousStructOrUnion() ? "(anonymous " : "(unnamed ") +
+         record->getKindName().str() + ")";
+}
+
+// A union that generated code can name. Any other union is encoded where it is a member.
+bool nameable_union(const clang::CXXRecordDecl *record) {
+  return (record->getIdentifier() || record->getTypedefNameForAnonDecl()) &&
+         record_spelling(record).find('(') == std::string::npos;
+}
+
+// The members of a union in declaration order, as "type name; type name".
+std::string union_alternatives(const clang::CXXRecordDecl *record) {
+  clang::PrintingPolicy policy(record->getASTContext().getLangOpts());
+  policy.SuppressTagKeyword = true;
+  policy.AnonymousTagLocations = false;
+  std::string result;
+  for (const auto *field : record->fields()) {
+    if (field->isUnnamedBitField())
+      continue;
+    const auto *unnamed = field->getType()->getAsCXXRecordDecl();
+    auto text = unnamed && !unnamed->getIdentifier() && !unnamed->getTypedefNameForAnonDecl()
+                    ? union_spelling(unnamed)
+                    : field->getType().getCanonicalType().getAsString(policy);
+    if (!field->getName().empty())
+      text += " " + field->getNameAsString();
+    if (field->isBitField())
+      text += " : " + std::to_string(field->getBitWidthValue());
+    result += (result.empty() ? "" : "; ") + text;
+  }
+  return result;
+}
+
+std::string string_literal(const std::string &text) {
+  std::string result = "\"";
+  for (const char c : text) {
+    if (c == '\\' || c == '"')
+      result += '\\';
+    result += c;
+  }
+  return result + '"';
+}
+
+// `int shop::Order::*`, `int (shop::Order::*)(int) const`. Clang drops the namespace of the
+// class when it prints a canonical member pointer type.
+std::string member_pointer_spelling(clang::ASTContext &ast, clang::QualType type) {
+  const auto *pointer = type->castAs<clang::MemberPointerType>();
+  clang::PrintingPolicy policy(ast.getLangOpts());
+  policy.SuppressTagKeyword = true;
+  std::string result;
+  llvm::raw_string_ostream out(result);
+  pointer->getPointeeType().getCanonicalType().print(
+      out, policy, record_spelling(pointer->getMostRecentCXXRecordDecl()) + "::*");
+  return result;
+}
+
 struct Builder {
   clang::ASTContext &ast;
   SchemaLimits limits;
@@ -174,6 +241,9 @@ struct Builder {
   // structural errors fail the whole value.
   bool hard_error = false;
   bool snapshot = false;
+  // A payload is copied out once, so it may hold values that a retained state may not:
+  // unions, member pointers, std::nullptr_t and long double.
+  bool payload = false;
   bool recursion = false;
   const SnapshotFieldSelection *selection = nullptr;
   // Plan mode only: a standard record is walked as it always was, so that its
@@ -296,6 +366,14 @@ struct Builder {
     return true;
   }
 
+  // A value the wire format has no scalar for, as a record of named parts.
+  std::shared_ptr<SchemaMessage> parts(std::string cpp_type) {
+    auto record = std::make_shared<SchemaMessage>();
+    record->cpp_type = std::move(cpp_type);
+    record->full_name = record->cpp_type;
+    return record;
+  }
+
   // A record that may refer back to itself. Standard-library records are not
   // captured through their private layout (std::filesystem::path holds paths).
   bool may_recur(const clang::CXXRecordDecl *record) const {
@@ -374,6 +452,7 @@ struct Builder {
         collect_fields(br, out, depth, id, seen, owners, root);
       }
     }
+    unsigned anonymous_unions = 0;
     for (const auto *f : r->fields()) {
       if (selection && !selection->includes(root, *f))
         continue;
@@ -386,11 +465,15 @@ struct Builder {
       }
       // A member left out keeps its number, so the codec can skip the same one.
       const auto number = id++;
+      auto field_name = f->getNameAsString();
+      // The members of an anonymous union are not fields of the record: the union is.
+      if (field_name.empty() && f->isAnonymousStructOrUnion() && f->getType()->isUnionType())
+        field_name = "__anonymous_union_" + std::to_string(anonymous_unions++);
       auto reason = capture ? omission(*capture, *r, *f) : std::string{};
       SchemaField sf;
       if (reason.empty()) {
         const auto saved_fields = fields, saved_messages = messages;
-        sf = describe(f->getType(), f->getNameAsString(), number, depth);
+        sf = describe(f->getType(), field_name, number, depth);
         if (!error.empty()) {
           if (!capture || hard_error)
             return;
@@ -437,27 +520,63 @@ struct Builder {
     if (t->isEnumeralType()) {
       out.kind = SchemaKind::enumeration;
       out.enum_name = proto_name(t);
+      const auto width = ast.getTypeSize(t);
+      if (width > 64) {
+        error = "enumeration wider than 64 bits is unsupported: " + name;
+        return out;
+      }
+      out.enum_unsigned = t->isUnsignedIntegerOrEnumerationType();
+      // What decides the form is what the object can hold, not only what is named: an
+      // underlying type wider than 32 bits stores values no protobuf enum number can.
+      out.enum_wide = width > 32;
       if (const auto *e = t->getAs<clang::EnumType>()->getDecl()) {
         for (const auto *v : e->enumerators()) {
-          const auto value = v->getInitVal().getExtValue();
-          if (value < INT32_MIN || value > INT32_MAX) {
-            error = "enum value exceeds protobuf int32 range: " + name;
-            return out;
-          }
-          out.enum_values.emplace_back(v->getNameAsString(),
-                                       static_cast<std::int32_t>(value));
+          const auto &initial = v->getInitVal();
+          const auto value = initial.isUnsigned()
+                                 ? static_cast<std::int64_t>(initial.getZExtValue())
+                                 : initial.getSExtValue();
+          if (initial.isUnsigned() ? initial.getZExtValue() > INT32_MAX
+                                   : (value < INT32_MIN || value > INT32_MAX))
+            out.enum_wide = true;
+          out.enum_values.emplace_back(v->getNameAsString(), value);
+        }
+        // The name a reader sees; a narrow enumeration's only keys its protobuf enum.
+        if (out.enum_wide) {
+          const auto *alias = e->getIdentifier() ? nullptr : e->getTypedefNameForAnonDecl();
+          out.enum_name = alias ? alias->getQualifiedNameAsString()
+                                : e->getQualifiedNameAsString();
         }
       }
+      if (out.enum_wide)
+        out.bit_width = width;
       return out;
     }
     if (t->isIntegerType()) {
-      if (snapshot && (ast.getTypeSize(t) > 64 || t->isBitIntType())) {
-        error = "unsupported integer width in snapshot: " + name;
+      if (snapshot && t->isBitIntType()) {
+        error = "bit-precise integer is unsupported in a snapshot: " + name;
+        return out;
+      }
+      const auto width = ast.getTypeSize(t);
+      if (width > 64) {
+        const bool is_unsigned = t->isSpecificBuiltinType(clang::BuiltinType::UInt128);
+        if (!is_unsigned && !t->isSpecificBuiltinType(clang::BuiltinType::Int128)) {
+          error = "unsupported integer width (" + std::to_string(width) + " bits): " + name;
+          return out;
+        }
+        // Two 64-bit halves, value = high * 2^64 + low. The high half carries the sign.
+        // Matches Codec<__int128> and Codec<unsigned __int128>.
+        auto halves = parts(is_unsigned ? "unsigned __int128" : "__int128");
+        halves->fields.push_back(snapshot_scalar("low", 1, SchemaKind::unsigned_integer, 64));
+        halves->fields.push_back(snapshot_scalar(
+            "high", 2, is_unsigned ? SchemaKind::unsigned_integer : SchemaKind::signed_integer,
+            64));
+        out.kind = SchemaKind::message;
+        out.message = std::move(halves);
         return out;
       }
       out.kind = t->isUnsignedIntegerType() ? SchemaKind::unsigned_integer
                                             : SchemaKind::signed_integer;
-      out.bit_width = ast.getTypeSize(t);
+      out.bit_width = width;
       return out;
     }
     if (t->isSpecificBuiltinType(clang::BuiltinType::Float)) {
@@ -466,6 +585,56 @@ struct Builder {
     }
     if (t->isSpecificBuiltinType(clang::BuiltinType::Double)) {
       out.kind = SchemaKind::float64;
+      return out;
+    }
+    if (payload && t->isSpecificBuiltinType(clang::BuiltinType::LongDouble)) {
+      const auto &format = ast.getFloatTypeSemantics(t);
+      if (&format != &llvm::APFloat::x87DoubleExtended() &&
+          &format != &llvm::APFloat::IEEEquad() && &format != &llvm::APFloat::IEEEdouble() &&
+          &format != &llvm::APFloat::PPCDoubleDouble()) {
+        error = "unsupported long double format: " + name;
+        return out;
+      }
+      // The value's bytes in the named format, least significant first, without the
+      // padding of its storage. Matches Codec<long double>.
+      auto value = parts("long double");
+      value->fields.push_back(snapshot_scalar("format", 1, SchemaKind::string, 0));
+      value->fields.push_back(snapshot_scalar("bytes", 2, SchemaKind::bytes, 0));
+      out.kind = SchemaKind::message;
+      out.message = std::move(value);
+      return out;
+    }
+    if (payload && t->isNullPtrType()) {
+      // Matches Codec<std::nullptr_t>.
+      auto marker = parts("std::nullptr_t");
+      marker->fields.push_back(snapshot_scalar("null", 1, SchemaKind::boolean, 1));
+      out.kind = SchemaKind::message;
+      out.message = std::move(marker);
+      return out;
+    }
+    if (payload && t->isMemberPointerType()) {
+      if (!ast.getTargetInfo().getCXXABI().isItaniumFamily()) {
+        error = "member pointer capture requires the Itanium C++ ABI: " + name;
+        return out;
+      }
+      // The parts the ABI gives a member pointer, never an address to follow. Matches
+      // Codec<M C::*>.
+      auto pointer = parts(member_pointer_spelling(ast, t));
+      pointer->fields.push_back(snapshot_scalar("abi", 1, SchemaKind::string, 0));
+      pointer->fields.push_back(snapshot_scalar("null", 2, SchemaKind::boolean, 1));
+      if (t->isMemberFunctionPointerType()) {
+        pointer->fields.push_back(snapshot_scalar("is_virtual", 3, SchemaKind::boolean, 1));
+        pointer->fields.push_back(
+            snapshot_scalar("address", 4, SchemaKind::unsigned_integer, 64));
+        pointer->fields.push_back(
+            snapshot_scalar("vtable_offset", 5, SchemaKind::unsigned_integer, 64));
+        pointer->fields.push_back(
+            snapshot_scalar("this_adjustment", 6, SchemaKind::signed_integer, 64));
+      } else {
+        pointer->fields.push_back(snapshot_scalar("offset", 3, SchemaKind::signed_integer, 64));
+      }
+      out.kind = SchemaKind::message;
+      out.message = std::move(pointer);
       return out;
     }
     if (snapshot && (t->isPointerType() || t->isReferenceType())) {
@@ -484,8 +653,11 @@ struct Builder {
         return out;
       }
     }
-    if (t->isPointerType() || t->isReferenceType() ||
-        t->isMemberPointerType()) {
+    if (t->isMemberPointerType()) {
+      error = "unsupported member-pointer field: " + name;
+      return out;
+    }
+    if (t->isPointerType() || t->isReferenceType()) {
       error = "unsupported pointer/reference field: " + name;
       return out;
     }
@@ -770,7 +942,11 @@ struct Builder {
     }
     auto *r = t->getAsCXXRecordDecl();
     if (!r || !r->hasDefinition()) {
-      error = "incomplete or unsupported field type: " + name;
+      // An unnamed type is named without the file and line that declare it.
+      clang::PrintingPolicy policy(ast.getLangOpts());
+      policy.AnonymousTagLocations = false;
+      error = std::string(r ? "incomplete type '" : "unsupported field type '") +
+              (r ? canonical(t) : t.getCanonicalType().getAsString(policy)) + "': " + name;
       return out;
     }
     const auto record_name = r->getQualifiedNameAsString();
@@ -803,6 +979,17 @@ struct Builder {
     }
     out.kind = SchemaKind::message;
     r = r->getDefinition();
+    if (payload && r->isUnion()) {
+      // Which member is active is not stored in a union, so none is read: the object
+      // representation is kept whole. Matches encode_union.
+      auto opaque = parts(union_spelling(r));
+      opaque->fields.push_back(snapshot_scalar("bytes", 1, SchemaKind::bytes, 0));
+      opaque->fields.push_back(snapshot_scalar("size", 2, SchemaKind::unsigned_integer, 64));
+      opaque->fields.push_back(snapshot_scalar("active_member", 3, SchemaKind::string, 0));
+      opaque->fields.push_back(snapshot_scalar("alternatives", 4, SchemaKind::string, 0));
+      out.message = std::move(opaque);
+      return out;
+    }
     if (const auto open = active.find(r); open != active.end() && may_recur(r)) {
       // The record contains itself: refer back to the message being described
       // instead of describing it again.
@@ -913,8 +1100,19 @@ struct DescriptorEmitter {
         }
       }
       x->set_name(std::move(value_name));
-      x->set_number(v);
+      x->set_number(static_cast<std::int32_t>(v));
     }
+  }
+
+  // See kEnumTypeOption.
+  static void describe_wide_enum(const SchemaField &f, FD *out) {
+    auto *unknown = out->mutable_options()->mutable_unknown_fields();
+    unknown->AddLengthDelimited(kEnumTypeOption, f.enum_name);
+    for (const auto &[name, value] : f.enum_values)
+      unknown->AddLengthDelimited(
+          kEnumeratorOption,
+          name + "=" + (f.enum_unsigned ? std::to_string(static_cast<std::uint64_t>(value))
+                                        : std::to_string(value)));
   }
 
   std::string type(const SchemaField &f, const std::string &path) {
@@ -931,7 +1129,13 @@ struct DescriptorEmitter {
       return "double";
     case SchemaKind::string:
       return "string";
+    case SchemaKind::bytes:
+      return "bytes";
     case SchemaKind::enumeration:
+      // The codec writes an enumeration as the varint of its sign-extended value, which
+      // is the encoding of int64 and of the unsigned types, not sint64's ZigZag.
+      if (f.enum_wide)
+        return f.enum_unsigned ? (f.bit_width <= 32 ? "uint32" : "uint64") : "int64";
       enum_def(f);
       return "enum:" + full(ident(f.enum_name));
     case SchemaKind::message: {
@@ -1015,12 +1219,16 @@ struct DescriptorEmitter {
 
   void set_type(const SchemaField &f, const std::string &path, FD *out) {
     const auto t = type(f, path);
+    if (f.kind == SchemaKind::enumeration && f.enum_wide)
+      describe_wide_enum(f, out);
     if (t == "bool") {
       out->set_type(FD::TYPE_BOOL);
     } else if (t == "sint32") {
       out->set_type(FD::TYPE_SINT32);
     } else if (t == "sint64") {
       out->set_type(FD::TYPE_SINT64);
+    } else if (t == "int64") {
+      out->set_type(FD::TYPE_INT64);
     } else if (t == "uint32") {
       out->set_type(FD::TYPE_UINT32);
     } else if (t == "uint64") {
@@ -1121,7 +1329,7 @@ schema_tree_bytes(const std::shared_ptr<const SchemaMessage> &root) {
     total +=
         sizeof(SchemaField) + f->name.size() + f->cpp_type.size() +
         f->enum_name.size() +
-        f->enum_values.size() * sizeof(std::pair<std::string, std::int32_t>);
+        f->enum_values.size() * sizeof(std::pair<std::string, std::int64_t>);
     for (const auto &v : f->enum_values) {
       total += v.first.size();
     }
@@ -1296,7 +1504,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
                            SchemaRecursion recursion) {
   const bool snapshot = access_policy == CodecAccess::snapshot_members;
   CodecSourceResult result;
-  std::vector<const clang::CXXRecordDecl *> records;
+  std::vector<const clang::CXXRecordDecl *> records, unions;
   std::unordered_set<const clang::CXXRecordDecl *> done, active;
   std::function<void(clang::QualType)> gather_type;
   std::function<void(const clang::CXXRecordDecl *)> gather_record;
@@ -1351,6 +1559,12 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
       return;
     }
     r = r->getDefinition();
+    if (r->isUnion()) {
+      // A union is opaque: its members are not visited and it has no field codec.
+      if (nameable_union(r) && done.insert(r).second)
+        unions.push_back(r);
+      return;
+    }
     if (active.count(r)) {
       // A record that contains itself is gathered once; its codec calls itself.
       if (recursion != SchemaRecursion::allow)
@@ -1406,6 +1620,10 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
   }
   std::ostringstream source;
   source << "namespace tracer::context_engine {\n";
+  for (const auto *record : unions)
+    source << "template <> struct UnionAlternatives<::" << record_spelling(record) << "> {\n"
+           << " static constexpr const char *text = "
+           << string_literal(union_alternatives(record)) << ";\n};\n";
   std::size_t next_tag = 0;
   if (snapshot) {
     source << "namespace snapshot_access {\n"
@@ -1488,6 +1706,25 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
         if (access == clang::AS_none)
           access = r->isStruct() ? clang::AS_public : clang::AS_private;
         const auto name = field->getNameAsString();
+        if (field->isBitField() && field->getType().isVolatileQualified()) {
+          result.error = "volatile bit-field cannot be captured: " + name;
+          return;
+        }
+        const auto *member_union = field->getType()->getAsCXXRecordDecl();
+        member_union = member_union ? member_union->getDefinition() : nullptr;
+        if (member_union && member_union->isUnion() && !nameable_union(member_union)) {
+          // No expression names the type of an unnamed union, and an anonymous one has
+          // no member name either: its bytes are read at its offset in the owner.
+          auto &ast = r->getASTContext();
+          fields << "  if (!encode_union(w, field_number++, static_cast<const unsigned char*>("
+                    "static_cast<const void*>(__builtin_addressof(" << object << "))) + "
+                 << ast.getASTRecordLayout(r).getFieldOffset(field->getFieldIndex()) /
+                        ast.getCharWidth()
+                 << ", " << ast.getTypeSizeInChars(field->getType()).getQuantity() << ", "
+                 << string_literal(union_alternatives(member_union))
+                 << ", budget)) return false;\n";
+          continue;
+        }
         std::string expression = object + "." + name;
         if (snapshot && field->isBitField()) {
           auto &ast = r->getASTContext();
@@ -1719,6 +1956,7 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     limits.depth = max_capture_depth;
   Builder validator{ast, limits};
   validator.snapshot = access_policy == CodecAccess::snapshot_members;
+  validator.payload = true;
   validator.recursion = recursion == SchemaRecursion::allow;
   validator.selection = &selection;
   (void)validator.describe(payload, "value", 1, 0);
@@ -1973,6 +2211,7 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
   }
   Builder b{ast, limits};
   b.snapshot = access_policy == CodecAccess::snapshot_members;
+  b.payload = true;
   b.recursion = recursion == SchemaRecursion::allow;
   b.selection = &selection;
   auto *file = b.files.add_file();

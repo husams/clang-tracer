@@ -4,7 +4,10 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Frontend/ASTUnit.h>
@@ -29,6 +32,17 @@ struct SchemaRecordFinder final
     return true;
   }
 };
+// The name the schema emitter gives the message of a C++ type.
+std::string ident_for_test(std::string_view text) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream out;
+  out << "M_" << std::hex << hash;
+  return out.str();
+}
 struct SchemaAliasFinder final : clang::RecursiveASTVisitor<SchemaAliasFinder> {
   std::string name;
   const clang::TypeAliasDecl *alias = nullptr;
@@ -46,16 +60,17 @@ namespace tracer::context_engine {
 void verify_partial_schema(const std::vector<std::string> &arguments) {
   const std::string source = R"cpp(
 #include <cstdint>
+#include <mutex>
 #include <vector>
 namespace partial {
-union Raw { int a; float b; };
+using Raw = std::mutex;
 struct First  { Raw raw; int b = 22; int c = 33; };
 struct Middle { int a = 11; Raw raw; int c = 33; };
 struct Last   { int a = 11; int b = 22; Raw raw; };
 struct Two    { Raw one; int keep = 1; Raw two; };
 struct Nothing { Raw only; };
 struct Nested { int tag = 4; Middle inner; };
-struct Anons { union { int a; float b; }; union { int c; float d; }; union { int e; float f; }; int g = 9; };
+struct Anons { struct { int a; float b; }; struct { int c; float d; }; struct { int e; float f; }; int g = 9; };
 struct Bits { int : 3; int : 4; int : 5; int x = 1; };
 struct Base { Raw m; };
 struct Derived : Base { int m = 6; };
@@ -93,7 +108,7 @@ struct Tree { int v = 1; Raw m; std::vector<Tree> kids; };
     const bool direct = access == CodecAccess::public_members;
     const std::vector<Naming> naming{
         {"Anons", {"g"},
-         {"(anonymous union #1)", "(anonymous union #2)", "(anonymous union #3)"}},
+         {"(anonymous struct #1)", "(anonymous struct #2)", "(anonymous struct #3)"}},
         // An unnamed bit-field is only left out when members are read publicly.
         {"Bits", {"x"},
          direct ? std::vector<std::string>{"(unnamed bit-field #1)", "(unnamed bit-field #2)",
@@ -208,7 +223,8 @@ struct Tree { int v = 1; Raw m; std::vector<Tree> kids; };
       family.cpp_scope_type = "partial::Scope";
       // Without a plan the whole value fails, with the old text.
       const auto whole = build_payload_schema(ast->getASTContext(), type, family, {}, access);
-      assert(!whole && whole.error.find("union state layout is unsupported") != std::string::npos);
+      assert(!whole &&
+             whole.error.find("unsupported standard type: std::mutex") != std::string::npos);
       CapturePlan plan;
       SnapshotFieldSelection selection;
       selection.plan = &plan;
@@ -228,8 +244,8 @@ struct Tree { int v = 1; Raw m; std::vector<Tree> kids; };
         assert(message.unavailable.size() == expected.left_out.size());
         for (std::size_t i = 0; i < expected.left_out.size(); ++i) {
           assert(message.unavailable[i].number == expected.left_out[i]);
-          assert(message.unavailable[i].cpp_type == "partial::Raw");
-          assert(message.unavailable[i].reason.find("union state layout is unsupported") !=
+          assert(message.unavailable[i].cpp_type == "std::mutex");
+          assert(message.unavailable[i].reason.find("unsupported standard type: std::mutex") !=
                  std::string::npos);
         }
         if (std::string(expected.name) == "Two")
@@ -791,6 +807,223 @@ struct EqualState : shared_state<Scope> { std::unordered_map<EqualRecord,int> va
           "custom standard-library specialization was accepted: " +
           std::string(name));
   }
+
+  // Values the wire format has no scalar for (issue #181): a payload keeps them in a
+  // defined form on both codec access policies, and a retained state still refuses the
+  // ones it must not hold.
+  const std::string abi_source = R"cpp(
+#include "tracer/context.hpp"
+#include <cstddef>
+#include <mutex>
+#include <vector>
+namespace abi_schema {
+struct Scope {};
+struct Key { int a; int b; int f(int); };
+union Number { int i; float f; };
+enum class Big : unsigned long long { small = 1, also_small = 1, large = 1ull << 40, top = ~0ull };
+enum class Low : long long { low = -9223372036854775807LL - 1 };
+enum class Top32 : unsigned { top = 0xffffffffu };
+enum class Wide : long { a = 1 };
+enum Small { one = 1 };
+struct All {
+  int tag;
+  Number named;
+  union { int i; float f; };
+  union { long l; char c[8]; } unnamed;
+  long double extended;
+  __int128 wide;
+  unsigned __int128 uwide;
+  Big big;
+  Low low;
+  Top32 top;
+  Wide w;
+  Small small;
+  int Key::*data;
+  int (Key::*function)(int);
+  std::nullptr_t null;
+  volatile int counter;
+  std::vector<Number> numbers;
+};
+struct Locked { std::mutex lock; };
+struct UnionState : tracer::shared_state<Scope> { Number number; };
+struct MemberPointerState : tracer::shared_state<Scope> { int Key::*data; };
+struct LongDoubleState : tracer::shared_state<Scope> { long double value; };
+struct WideState : tracer::shared_state<Scope> { __int128 wide; Big big; };
+}
+)cpp";
+  auto abi_ast = clang::tooling::buildASTFromCodeWithArgs(abi_source, arguments,
+                                                          "abi-schema-fixture.cc");
+  if (!abi_ast || abi_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("ABI value fixture failed to parse");
+  auto &abi_context = abi_ast->getASTContext();
+  const auto abi_record = [&](const char *name) {
+    SchemaRecordFinder finder;
+    finder.name = name;
+    finder.TraverseDecl(abi_context.getTranslationUnitDecl());
+    if (!finder.record)
+      throw std::runtime_error(std::string("ABI value fixture record missing: ") + name);
+    return finder.record;
+  };
+  const auto abi_check = [](bool ok, const std::string &what) {
+    if (!ok)
+      throw std::runtime_error("ABI value schema: " + what);
+  };
+  const auto abi_family = [](const char *type) {
+    StateFamilyKey key;
+    key.source_lineage_id[0] = 0x18;
+    key.cpp_state_type = type;
+    key.cpp_scope_type = "abi_schema::Scope";
+    return key;
+  };
+  const auto *all = abi_record("abi_schema::All");
+  const auto all_type = clang::QualType(all->getTypeForDecl(), 0);
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    const auto built = build_payload_schema(abi_context, all_type,
+                                            abi_family("abi_schema::All"), {}, access);
+    abi_check(bool(built), "payload rejected: " + built.error);
+    const auto &members = built.record->root->fields[0].message->fields;
+    const auto member = [&](const char *name) -> const SchemaField & {
+      const auto found = std::find_if(members.begin(), members.end(),
+                                      [&](const auto &f) { return f.name == name; });
+      abi_check(found != members.end(), std::string("field missing: ") + name);
+      return *found;
+    };
+    const auto parts = [&](const char *name, const char *type,
+                           std::initializer_list<std::pair<const char *, SchemaKind>> expected) {
+      const auto &field = member(name);
+      abi_check(field.kind == SchemaKind::message && field.message &&
+                    field.message->cpp_type == type &&
+                    field.message->fields.size() == expected.size(),
+                std::string("wrong form of ") + name + ": " +
+                    (field.message ? field.message->cpp_type : "not a message"));
+      std::size_t index = 0;
+      for (const auto &[part, kind] : expected) {
+        const auto &actual = field.message->fields[index++];
+        abi_check(actual.name == part && actual.kind == kind && actual.number == index,
+                  std::string("wrong part of ") + name + ": " + part);
+      }
+    };
+    const std::initializer_list<std::pair<const char *, SchemaKind>> opaque = {
+        {"bytes", SchemaKind::bytes},
+        {"size", SchemaKind::unsigned_integer},
+        {"active_member", SchemaKind::string},
+        {"alternatives", SchemaKind::string}};
+    parts("named", "abi_schema::Number", opaque);
+    parts("__anonymous_union_0", "abi_schema::All::(anonymous union)", opaque);
+    parts("unnamed", "abi_schema::All::(unnamed union)", opaque);
+    parts("extended", "long double",
+          {{"format", SchemaKind::string}, {"bytes", SchemaKind::bytes}});
+    parts("wide", "__int128",
+          {{"low", SchemaKind::unsigned_integer}, {"high", SchemaKind::signed_integer}});
+    parts("uwide", "unsigned __int128",
+          {{"low", SchemaKind::unsigned_integer}, {"high", SchemaKind::unsigned_integer}});
+    parts("data", "int abi_schema::Key::*",
+          {{"abi", SchemaKind::string},
+           {"null", SchemaKind::boolean},
+           {"offset", SchemaKind::signed_integer}});
+    parts("function", "int (abi_schema::Key::*)(int)",
+          {{"abi", SchemaKind::string},
+           {"null", SchemaKind::boolean},
+           {"is_virtual", SchemaKind::boolean},
+           {"address", SchemaKind::unsigned_integer},
+           {"vtable_offset", SchemaKind::unsigned_integer},
+           {"this_adjustment", SchemaKind::signed_integer}});
+    parts("null", "std::nullptr_t", {{"null", SchemaKind::boolean}});
+    abi_check(member("counter").kind == SchemaKind::signed_integer &&
+                  member("counter").bit_width == 32,
+              "volatile int is not a 32-bit integer");
+    const auto wide_enum = [&](const char *name, const char *type, bool is_unsigned,
+                               unsigned width) {
+      const auto &field = member(name);
+      abi_check(field.kind == SchemaKind::enumeration && field.enum_wide &&
+                    field.enum_unsigned == is_unsigned && field.bit_width == width &&
+                    field.enum_name == type,
+                std::string("wrong wide enumeration: ") + name);
+    };
+    wide_enum("big", "abi_schema::Big", true, 64);
+    wide_enum("low", "abi_schema::Low", false, 64);
+    wide_enum("top", "abi_schema::Top32", true, 32);
+    wide_enum("w", "abi_schema::Wide", false, 64);
+    abi_check(!member("small").enum_wide, "a narrow enumeration became wide");
+    google::protobuf::FileDescriptorSet abi_set;
+    abi_check(abi_set.ParseFromString(built.record->descriptor_set), "descriptor malformed");
+    google::protobuf::DescriptorPool abi_pool;
+    for (const auto &f : abi_set.file())
+      abi_check(abi_pool.BuildFile(f) != nullptr, "descriptor rejected by a pool");
+    const auto *all_message = abi_pool.FindMessageTypeByName(
+        "tracer.generated.state." + ident_for_test("abi_schema::All"));
+    abi_check(all_message != nullptr, "record message missing from the descriptor");
+    const auto wire = [&](const char *name) {
+      for (int i = 0; i < all_message->field_count(); ++i) {
+        const auto *f = all_message->field(i);
+        if (f->name() == name || (f->has_json_name() && f->json_name() == name))
+          return f;
+      }
+      throw std::runtime_error(std::string("ABI value schema: wire field missing: ") + name);
+    };
+    using Wire = google::protobuf::FieldDescriptor;
+    abi_check(wire("big")->type() == Wire::TYPE_UINT64 &&
+                  wire("low")->type() == Wire::TYPE_INT64 &&
+                  wire("top")->type() == Wire::TYPE_UINT32 &&
+                  wire("w")->type() == Wire::TYPE_INT64 &&
+                  wire("small")->type() == Wire::TYPE_ENUM,
+              "enumeration wire types");
+    abi_check(wire("named")->message_type()->FindFieldByNumber(1)->type() == Wire::TYPE_BYTES,
+              "union bytes are not a bytes field");
+    std::vector<std::string> enumerators;
+    std::string enum_type;
+    const auto &options = wire("big")->options().unknown_fields();
+    for (int i = 0; i < options.field_count(); ++i) {
+      if (options.field(i).number() == kEnumTypeOption)
+        enum_type = options.field(i).length_delimited();
+      if (options.field(i).number() == kEnumeratorOption)
+        enumerators.push_back(options.field(i).length_delimited());
+    }
+    abi_check(enum_type == "abi_schema::Big" &&
+                  enumerators == std::vector<std::string>{"small=1", "also_small=1",
+                                                          "large=1099511627776",
+                                                          "top=18446744073709551615"},
+              "wide enumeration metadata");
+    abi_check(wire("small")->options().unknown_fields().empty(),
+              "a narrow enumeration carries wide metadata");
+    const auto codec = render_payload_codec_source(abi_context, all_type, access);
+    abi_check(bool(codec), "codec generation failed: " + codec.error);
+    abi_check(codec.source.find("UnionAlternatives<::abi_schema::Number>") != std::string::npos &&
+                  codec.source.find("text = \"int i; float f\";") != std::string::npos &&
+                  codec.source.find(", 8, \"long l; char[8] c\", budget)") != std::string::npos &&
+                  codec.source.find("encode_union(") != std::string::npos,
+              "codec does not encode the unions as their bytes");
+    auto abi_codec_ast = clang::tooling::buildASTFromCodeWithArgs(
+        "#include \"context_codec.hpp\"\n" + abi_source + codec.source, arguments,
+        "abi-codec-fixture.cc");
+    abi_check(abi_codec_ast && !abi_codec_ast->getDiagnostics().hasErrorOccurred(),
+              "generated codec did not compile");
+    // A class of the standard library without a codec is refused where the schema is
+    // built, not when the generated code is compiled.
+    const auto locked = build_payload_schema(
+        abi_context, clang::QualType(abi_record("abi_schema::Locked")->getTypeForDecl(), 0),
+        abi_family("abi_schema::Locked"), {}, access);
+    abi_check(!locked &&
+                  locked.error.find("unsupported standard type: std::mutex") != std::string::npos,
+              "std::mutex member: " + locked.error);
+  }
+  const std::pair<const char *, const char *> refused_states[] = {
+      {"abi_schema::UnionState", "union state layout is unsupported"},
+      {"abi_schema::MemberPointerState", "unsupported member-pointer field: data"},
+      {"abi_schema::LongDoubleState", "unsupported field type 'long double': value"}};
+  for (const auto &[name, reason] : refused_states) {
+    const auto rejected = build_state_schema(abi_context, *abi_record(name), abi_family(name));
+    abi_check(!rejected && rejected.error.find(reason) != std::string::npos,
+              std::string("state expected '") + reason + "', got '" + rejected.error + "'");
+  }
+  // A state keeps a 128-bit integer and a wide enumeration whole too.
+  const auto wide_state = build_state_schema(abi_context, *abi_record("abi_schema::WideState"),
+                                             abi_family("abi_schema::WideState"));
+  abi_check(bool(wide_state), "wide state rejected: " + wide_state.error);
+  abi_check(wide_state.record->root->fields[0].message &&
+                wide_state.record->root->fields[0].message->cpp_type == "__int128" &&
+                wide_state.record->root->fields[1].enum_wide,
+            "wide state lost its exact forms");
 
   std::array<std::byte, 1024> storage{};
   BoundedProtoWriter writer(storage);

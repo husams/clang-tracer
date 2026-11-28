@@ -81,6 +81,17 @@ private:
                          bool pointer_layouts,
                          const std::vector<const clang::CXXRecordDecl *> &snapshot_types) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
+    // A union is declared where it is a member or a referent. One that the callable takes or
+    // returns by value, or whose method is selected, is part of the call itself.
+    const auto reject_union = [](const clang::CXXRecordDecl *record) {
+      if (record && record->isUnion())
+        unsupported(*record, "union layout requires an explicit adapter");
+    };
+    reject_union(function.getReturnType().getCanonicalType()->getAsCXXRecordDecl());
+    for (const auto *parameter : function.parameters())
+      reject_union(parameter->getType().getCanonicalType()->getAsCXXRecordDecl());
+    if (selected_method_)
+      reject_union(selected_method_->getParent());
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
       register_nested(*selected_method_->getParent());
@@ -151,10 +162,38 @@ private:
     return source;
   }
 
+  // The type of a declarator after its array extents.
+  clang::QualType array_element(clang::QualType type) {
+    while (const auto *array = ast_.getAsArrayType(type))
+      type = array->getElementType();
+    return type;
+  }
+
   std::string spelling(clang::QualType type, llvm::StringRef name = {}) {
+    type = type.getCanonicalType();
+    std::string declarator = name.str();
+    // Clang prints the class of a canonical member pointer type without its scope, so a
+    // declarator that reaches one is spelled here: `int ::shop::Order::*name`.
+    while (array_element(type)->isMemberPointerType()) {
+      if (const auto *array = ast_.getAsConstantArrayType(type)) {
+        declarator += "[" + std::to_string(array->getSize().getZExtValue()) + "]";
+        type = array->getElementType();
+        continue;
+      }
+      const auto *member = type->getAs<clang::MemberPointerType>();
+      if (!member)
+        break;
+      const auto qualifiers = type.getLocalQualifiers().getAsString();
+      declarator = "::" + spelling(record_type(ast_, member->getMostRecentCXXRecordDecl())) +
+                   "::*" + (qualifiers.empty() ? "" : " " + qualifiers) +
+                   (declarator.empty() ? "" : " " + declarator);
+      type = member->getPointeeType().getCanonicalType();
+      if (type->isArrayType())
+        declarator = "(" + declarator + ")";
+    }
     std::string result;
     llvm::raw_string_ostream out(result);
-    type.getCanonicalType().print(out, policy_, name);
+    type.print(out, policy_, declarator);
     return result;
   }
 
@@ -413,8 +452,20 @@ private:
       source += name + " ";
     source += ": " + spelling(decl->getIntegerType()) + " {\n";
     for (const auto *value : decl->enumerators()) {
+      const auto &initial = value->getInitVal();
       llvm::SmallString<32> number;
-      value->getInitVal().toString(number, 10);
+      if (initial.isSigned() && initial.isMinSignedValue() && initial.getBitWidth() >= 64) {
+        // No literal has the most negative value: `-9223372036854775808` negates a number
+        // that does not fit.
+        auto next = initial;
+        ++next;
+        next.toString(number, 10);
+        number += " - 1";
+      } else {
+        initial.toString(number, 10);
+        if (initial.isUnsigned() && initial.getActiveBits() > 63)
+          number += "ULL";
+      }
       source += value->getNameAsString() + " = " + number.str().str() + ",\n";
     }
     place_declaration(*decl, source + (by_typedef ? "} " + name + ";\n" : "};\n"));
@@ -567,6 +618,12 @@ private:
       visit(type->getPointeeType(), false);
     } else if (type->isReferenceType()) {
       visit(type.getNonReferenceType(), complete);
+    } else if (const auto *member = type->getAs<clang::MemberPointerType>()) {
+      // A member pointer has the same layout whether or not its class is complete.
+      visit(record_type(ast_, member->getMostRecentCXXRecordDecl()), false);
+      visit(member->getPointeeType(), false);
+    } else if (type->isNullPtrType()) {
+      standard_headers_.insert("cstddef");
     } else if (const auto *function = type->getAs<clang::FunctionProtoType>()) {
       visit(function->getReturnType(), false);
       for (auto parameter : function->param_types())
@@ -713,8 +770,6 @@ private:
     if (!emitted_.insert(identity).second)
       return;
     emitting_.insert(identity);
-    if (record.isUnion())
-      unsupported(record, "union layout requires an explicit adapter");
     const auto source = record_definition(record);
     emitting_.erase(identity);
     place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
@@ -884,7 +939,7 @@ private:
       type = array->getElementType();
     const auto *unnamed = type->getAsCXXRecordDecl();
     unnamed = unnamed ? unnamed->getDefinition() : nullptr;
-    if (!unnamed || unnamed->isUnion() || !linkage_name(*unnamed).empty())
+    if (!unnamed || !linkage_name(*unnamed).empty())
       return nullptr;
     const auto *scope = llvm::dyn_cast<clang::CXXRecordDecl>(unnamed->getDeclContext());
     return scope && scope->getCanonicalDecl() == owner.getCanonicalDecl() ? unnamed : nullptr;

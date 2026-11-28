@@ -973,6 +973,22 @@ function(tracer_add_native_repl)
           "${_unnamed_receiver_gcc}")
       set_tests_properties(native_repl_dwarf_enum_gcc PROPERTIES TIMEOUT 600
         SKIP_RETURN_CODE 77)
+      # Unions, long double, __int128, wide enumerations, member pointers, std::nullptr_t and
+      # volatile scalars in automatic capture (issue #181), on the direct and the prepared route.
+      # The test builds its fixture with the project compiler and, in the second test, with a GCC
+      # (skipped, exit 77, without one).
+      add_test(NAME native_repl_capture_abi_values
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_capture_abi_values.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_capture_abi_values PROPERTIES TIMEOUT 900)
+      add_test(NAME native_repl_capture_abi_values_gcc
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_capture_abi_values.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --compiler "${_unnamed_receiver_gcc}"
+          --require-gcc)
+      set_tests_properties(native_repl_capture_abi_values_gcc PROPERTIES TIMEOUT 900
+        SKIP_RETURN_CODE 77)
       # Narrow and unsigned 32-bit integers in DWARF-resolved signatures (issue #145), built by the
       # project compiler and, in the second test, rebuilt by the test with a GCC (skipped, exit 77,
       # without one).

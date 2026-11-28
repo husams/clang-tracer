@@ -96,28 +96,29 @@ std::string itanium_rtti_type_name(clang::ASTContext &ast,
     return rtti_name.str();
   return {};
 }
+// Why the codecs cannot read a value of `type`; empty when they can.
 // With `shallow` the members and bases of a record that is not in std are not
 // walked: capture plans check each member as the schema builder reaches it.
-// `why` names a volatile type, the one cause that is not a string character type.
-bool codec_types_supported(clang::QualType type,
-                           std::set<const clang::CXXRecordDecl *> &seen,
-                           const context_engine::SnapshotFieldSelection &selection,
-                           const clang::CXXRecordDecl *root = nullptr,
-                           bool shallow = false, std::string *why = nullptr) {
-  if (type.getNonReferenceType().isVolatileQualified()) {
-    if (why)
-      *why = "volatile member cannot be snapshotted automatically";
-    return false;
-  }
+std::string codec_type_problem(clang::QualType type,
+                               std::set<const clang::CXXRecordDecl *> &seen,
+                               const context_engine::SnapshotFieldSelection &selection,
+                               const clang::CXXRecordDecl *root = nullptr,
+                               bool shallow = false) {
   if (const auto *array = type->getAsArrayTypeUnsafe())
-    return codec_types_supported(array->getElementType(), seen, selection, nullptr,
-                                 shallow, why);
-  const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
+    return codec_type_problem(array->getElementType(), seen, selection, nullptr, shallow);
+  const auto object = type.getNonReferenceType();
+  // A volatile scalar is loaded once, as its declared type. Class storage has no such load.
+  if (object.isVolatileQualified() && !object->isScalarType())
+    return "volatile class storage cannot be captured: " + object.getAsString();
+  const auto *record = object->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
-    return true;
+    return {};
+  // A union is captured as its bytes; no member of it is read.
+  if (record->isUnion())
+    return {};
   // The any codec reads the active payload through the public interface.
   if (record->isInStdNamespace() && record->getName() == "any")
-    return true;
+    return {};
   if (const auto *special =
           llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
     const auto name =
@@ -125,29 +126,30 @@ bool codec_types_supported(clang::QualType type,
     const auto &args = special->getTemplateArgs();
     if (special->getSpecializedTemplate()->getName() == "basic_string" &&
         name.rfind("std::", 0) == 0) {
+      const std::string unsupported = "unsupported string character type: " + type.getAsString();
       if (args.size() == 0 ||
           args[0].getKind() != clang::TemplateArgument::Type)
-        return false;
+        return unsupported;
       const auto *character = args[0].getAsType()->getAs<clang::BuiltinType>();
       if (!character || (character->getKind() != clang::BuiltinType::Char_S &&
                          character->getKind() != clang::BuiltinType::Char_U))
-        return false;
+        return unsupported;
       if (args.size() < 3)
-        return false;
+        return unsupported;
       for (unsigned i = 1; i < 3; ++i) {
         if (args[i].getKind() != clang::TemplateArgument::Type)
-          return false;
+          return unsupported;
         const auto *parameter =
             llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
                 args[i].getAsType()->getAsCXXRecordDecl());
         if (!parameter)
-          return false;
+          return unsupported;
         const auto primary =
             parameter->getSpecializedTemplate()->getQualifiedNameAsString();
         if (primary.rfind("std::", 0) != 0 ||
             primary.find(i == 1 ? "char_traits" : "allocator") ==
                 std::string::npos)
-          return false;
+          return unsupported;
       }
     }
     const auto primary = special->getSpecializedTemplate()->getName();
@@ -156,40 +158,43 @@ bool codec_types_supported(clang::QualType type,
       const auto pointee = args[0].getAsType();
       if (primary == "weak_ptr" || !pointee->isObjectType() || pointee->isArrayType() ||
           pointee->isIncompleteType() || pointee.isVolatileQualified())
-        return true;
-      return codec_types_supported(pointee, seen, selection, nullptr, shallow, why);
+        return {};
+      return codec_type_problem(pointee, seen, selection, nullptr, shallow);
     }
     if (name.rfind("std::", 0) == 0) {
-      const auto supported = [&](auto &&check, const clang::TemplateArgument &argument) -> bool {
-        if (argument.getKind() == clang::TemplateArgument::Pack)
-          return std::all_of(argument.pack_begin(), argument.pack_end(),
-                             [&](const auto &item) { return check(check, item); });
-        return argument.getKind() != clang::TemplateArgument::Type ||
-               codec_types_supported(argument.getAsType(), seen, selection, nullptr,
-                                     shallow, why);
+      const auto problem = [&](auto &&check, const clang::TemplateArgument &argument) -> std::string {
+        if (argument.getKind() == clang::TemplateArgument::Pack) {
+          for (const auto &item : argument.pack_elements())
+            if (auto reason = check(check, item); !reason.empty())
+              return reason;
+          return {};
+        }
+        return argument.getKind() != clang::TemplateArgument::Type
+                   ? std::string()
+                   : codec_type_problem(argument.getAsType(), seen, selection, nullptr, shallow);
       };
       for (const auto &argument : args.asArray())
-        if (!supported(supported, argument))
-          return false;
-      return true;
+        if (auto reason = problem(problem, argument); !reason.empty())
+          return reason;
+      return {};
     }
   }
   record = record->getDefinition();
   if (!record)
-    return shallow;
+    return shallow ? std::string() : "incomplete type: " + type.getAsString();
   if (shallow)
-    return true;
+    return {};
   if (!root)
     root = record;
   const auto *plan = selection.plan;
   for (const auto *member : record->fields())
-    if (selection.includes(root, *member) && !(plan && plan->reason(*member)) &&
-        !codec_types_supported(member->getType(), seen, selection))
-      return false;
+    if (selection.includes(root, *member) && !(plan && plan->reason(*member)))
+      if (auto reason = codec_type_problem(member->getType(), seen, selection); !reason.empty())
+        return reason;
   for (const auto &base : record->bases())
-    if (!codec_types_supported(base.getType(), seen, selection, root))
-      return false;
-  return true;
+    if (auto reason = codec_type_problem(base.getType(), seen, selection, root); !reason.empty())
+      return reason;
+  return {};
 }
 // A member some record of a schema leaves out, with the record's message name.
 struct UnavailableRow {
@@ -339,10 +344,8 @@ ValueSnapshotCode make_code(clang::ASTContext &ast,
     // Members a record is captured without, by what the codecs cannot encode.
     plan->reject = [](clang::QualType type) -> std::string {
       std::set<const clang::CXXRecordDecl *> seen;
-      std::string why;
-      if (codec_types_supported(type, seen, {}, nullptr, true, &why))
-        return {};
-      return why.empty() ? "unsupported string character type in snapshot" : why;
+      const auto problem = codec_type_problem(type, seen, {}, nullptr, true);
+      return problem.empty() ? problem : problem + " in snapshot";
     };
   }
   if (report_unavailable && !spec.snapshot_receiver_fields().empty()) {
@@ -395,9 +398,8 @@ ValueSnapshotCode make_code(clang::ASTContext &ast,
     if (plan && entry.schema && !captures_something(*entry.schema.record->root))
       entry.error = first_unavailable_reason(*entry.schema.record->root);
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(type, seen, selection))
-      entry.error = "unsupported string character type in " +
-                    error_subject.str();
+    if (const auto problem = codec_type_problem(type, seen, selection); !problem.empty())
+      entry.error = problem + " in " + error_subject.str();
     if (is_volatile)
       entry.error = "volatile values cannot be snapshotted automatically";
     if (entry.schema) {
@@ -521,8 +523,9 @@ ValueSnapshotCode make_code(clang::ASTContext &ast,
       }
     }
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(projection.payload_type, seen, selection)) {
-      projection.error = "unsupported type in prepared snapshot payload";
+    if (const auto problem = codec_type_problem(projection.payload_type, seen, selection);
+        !problem.empty()) {
+      projection.error = problem + " in prepared snapshot payload";
       return projection;
     }
     Entry schema_entry{};

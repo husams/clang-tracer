@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <any>
 #include <array>
+#include <cstddef>
 #include <deque>
 #include <list>
 #include <map>
@@ -324,24 +325,180 @@ bool encode_value(BoundedProtoWriter &w, std::uint32_t field, const T &v,
   return ok;
 }
 
+// The members of a union as "type name; type name". Generated code supplies them for a
+// union it can name; a union's bytes are captured with or without them.
+template <class T> struct UnionAlternatives {
+  static constexpr const char *text = "";
+};
+// A union does not record which member is active, so none of them is read. The capture is
+// the object representation, its size and the members the union could hold; the active
+// member is reported as unknown. Field numbers match the union message in
+// context_schema.cpp.
+inline bool write_union(BoundedProtoWriter &w, std::uint32_t field, const void *storage,
+                        std::size_t size, const char *alternatives) noexcept {
+  if (!w.begin_message(field))
+    return false;
+  const bool ok = w.string(1, std::string_view(static_cast<const char *>(storage), size)) &&
+                  w.u64(2, size) && w.string(3, std::string_view("unknown")) &&
+                  w.string(4, std::string_view(alternatives));
+  return w.end_message() && ok;
+}
+// For a union whose type has no name: generated code passes the address of its storage.
+inline bool encode_union(BoundedProtoWriter &w, std::uint32_t field, const void *storage,
+                         std::size_t size, const char *alternatives,
+                         EncodeBudget &b) noexcept {
+  if (!b.enter())
+    return false;
+  const bool ok = write_union(w, field, storage, size, alternatives);
+  b.leave();
+  return ok;
+}
+
 template <class T> struct Codec {
-  static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T>,
+  static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T> || std::is_union_v<T>,
                 "unsupported scalar codec");
-  static bool write(BoundedProtoWriter &w, std::uint32_t f, T v,
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const T &v,
                     EncodeBudget &) noexcept {
-    if constexpr (std::is_same_v<T, bool>)
+    if constexpr (std::is_union_v<T>)
+      return write_union(w, f, __builtin_addressof(v), sizeof(T), UnionAlternatives<T>::text);
+    else if constexpr (std::is_same_v<T, bool>)
       return w.boolean(f, v);
     else if constexpr (std::is_floating_point_v<T> && sizeof(T) == 4)
       return w.f32(f, v);
     else if constexpr (std::is_floating_point_v<T>)
       return w.f64(f, v);
-    // Protobuf enums use int32 varints, not ZigZag's sint32 encoding.
+    // The varint of the sign-extended value: the encoding of a protobuf enum and, for an
+    // enumeration too wide to be one, of int64, uint32 and uint64. Not sint64's ZigZag.
     else if constexpr (std::is_enum_v<T>)
       return w.u64(f, static_cast<std::uint64_t>(static_cast<std::int64_t>(v)));
     else if constexpr (std::is_signed_v<T>)
       return w.s64(f, static_cast<std::int64_t>(v));
     else
       return w.u64(f, static_cast<std::uint64_t>(v));
+  }
+};
+// A volatile scalar is loaded once, as its declared type, and the copy is encoded.
+// Volatile does not make the load atomic or the whole object a consistent snapshot.
+template <class T> struct Codec<volatile T> {
+  static_assert(std::is_scalar_v<T>, "volatile class storage has no codec");
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const volatile T &v,
+                    EncodeBudget &b) noexcept {
+    const T loaded = v;
+    return Codec<T>::write(w, f, loaded, b);
+  }
+};
+#if defined(__SIZEOF_INT128__)
+// Two 64-bit halves, value = high * 2^64 + low; the high half of the signed type carries
+// the sign. Field numbers match the __int128 messages in context_schema.cpp.
+template <> struct Codec<__int128> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const __int128 &v,
+                    EncodeBudget &) noexcept {
+    if (!w.begin_message(f))
+      return false;
+    const bool ok = w.u64(1, static_cast<std::uint64_t>(v)) &&
+                    w.s64(2, static_cast<std::int64_t>(v >> 64));
+    return w.end_message() && ok;
+  }
+};
+template <> struct Codec<unsigned __int128> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const unsigned __int128 &v,
+                    EncodeBudget &) noexcept {
+    if (!w.begin_message(f))
+      return false;
+    const bool ok = w.u64(1, static_cast<std::uint64_t>(v)) &&
+                    w.u64(2, static_cast<std::uint64_t>(v >> 64));
+    return w.end_message() && ok;
+  }
+};
+#endif
+// The bytes of the value in the target's long double format, least significant first,
+// without the padding of its storage: a conversion to double would lose precision. Field
+// numbers and format names match the long double message in context_schema.cpp.
+template <> struct Codec<long double> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const long double &v,
+                    EncodeBudget &) noexcept {
+#if __LDBL_MANT_DIG__ == 64
+    constexpr std::size_t size = 10;
+    constexpr std::string_view format = "x87-extended-80";
+#elif __LDBL_MANT_DIG__ == 113
+    constexpr std::size_t size = 16;
+    constexpr std::string_view format = "ieee-binary128";
+#elif __LDBL_MANT_DIG__ == 53
+    constexpr std::size_t size = 8;
+    constexpr std::string_view format = "ieee-binary64";
+#elif __LDBL_MANT_DIG__ == 106
+    constexpr std::size_t size = 16;
+    constexpr std::string_view format = "ibm-double-double";
+#else
+    constexpr std::size_t size = sizeof(long double);
+    constexpr std::string_view format = "unknown";
+#endif
+    char bytes[sizeof(long double)];
+    __builtin_memcpy(bytes, __builtin_addressof(v), sizeof(bytes));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    for (std::size_t i = 0; i < sizeof(bytes) / 2; ++i) {
+      const char byte = bytes[i];
+      bytes[i] = bytes[sizeof(bytes) - 1 - i];
+      bytes[sizeof(bytes) - 1 - i] = byte;
+    }
+#endif
+    if (!w.begin_message(f))
+      return false;
+    const bool ok = w.string(1, format) && w.string(2, std::string_view(bytes, size));
+    return w.end_message() && ok;
+  }
+};
+// An explicit null marker. The object is not read: every std::nullptr_t is null.
+template <> struct Codec<std::nullptr_t> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, const std::nullptr_t &,
+                    EncodeBudget &) noexcept {
+    if (!w.begin_message(f))
+      return false;
+    const bool ok = w.boolean(1, true);
+    return w.end_message() && ok;
+  }
+};
+// A pointer to member is the parts the Itanium C++ ABI gives it, never an address to
+// follow. A data member pointer is the offset of the member (-1 when null). A member
+// function pointer is a function address, or a vtable offset when the function is virtual,
+// and the adjustment of `this`; the generic ABI marks a virtual function in the low bit of
+// the pointer and the ARM variant in the low bit of the adjustment. Field numbers match
+// the member pointer messages in context_schema.cpp.
+template <class C, class M> struct Codec<M C::*> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, M C::*const &v,
+                    EncodeBudget &) noexcept {
+    if (!w.begin_message(f))
+      return false;
+    const bool null = v == nullptr;
+    bool ok = false;
+    if constexpr (std::is_member_function_pointer_v<M C::*>) {
+      static_assert(sizeof(M C::*) == 2 * sizeof(std::ptrdiff_t),
+                    "an Itanium member function pointer is two words");
+      std::ptrdiff_t raw[2];
+      __builtin_memcpy(raw, __builtin_addressof(v), sizeof(raw));
+#if defined(__aarch64__) || defined(__arm__)
+      constexpr std::string_view abi = "itanium-arm";
+      const bool is_virtual = !null && (raw[1] & 1) != 0;
+      const std::ptrdiff_t adjustment = raw[1] >> 1;
+      const std::ptrdiff_t slot = raw[0];
+#else
+      constexpr std::string_view abi = "itanium";
+      const bool is_virtual = !null && (raw[0] & 1) != 0;
+      const std::ptrdiff_t adjustment = raw[1];
+      const std::ptrdiff_t slot = raw[0] - 1;
+#endif
+      ok = w.string(1, abi) && w.boolean(2, null) && w.boolean(3, is_virtual) &&
+           w.u64(4, null || is_virtual ? 0 : static_cast<std::uint64_t>(raw[0])) &&
+           w.u64(5, is_virtual ? static_cast<std::uint64_t>(slot) : 0) &&
+           w.s64(6, adjustment);
+    } else {
+      static_assert(sizeof(M C::*) == sizeof(std::ptrdiff_t),
+                    "an Itanium data member pointer is one word");
+      std::ptrdiff_t offset;
+      __builtin_memcpy(&offset, __builtin_addressof(v), sizeof(offset));
+      ok = w.string(1, std::string_view("itanium")) && w.boolean(2, null) && w.s64(3, offset);
+    }
+    return w.end_message() && ok;
   }
 };
 // The bytes of a string in checked mode: copied out with a checked read.
@@ -630,6 +787,19 @@ template <class T, std::size_t N> struct Codec<T[N]> {
       using value_type = T;
       const T *data;
       const T *begin() const { return data; }
+      std::size_t size() const { return N; }
+    };
+    return encode_sequence(w, f, View{v}, b);
+  }
+};
+// An array of volatile elements is both a volatile type and an array type.
+template <class T, std::size_t N> struct Codec<volatile T[N]> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f,
+                    const volatile T (&v)[N], EncodeBudget &b) noexcept {
+    struct View {
+      using value_type = volatile T;
+      const volatile T *data;
+      const volatile T *begin() const { return data; }
       std::size_t size() const { return N; }
     };
     return encode_sequence(w, f, View{v}, b);

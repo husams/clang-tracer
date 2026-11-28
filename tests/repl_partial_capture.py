@@ -40,9 +40,8 @@ struct R { int w = 2; std::mutex lock; };
 struct Both : L, R { int own = 3; };
 struct Blocked { std::mutex only; };
 struct Text { int id = 1; std::string text; std::mutex m; };
-// Several members left out under one name: three anonymous unions (the prepared route
-// refuses to prepare those, so this one is read directly).
-struct Anons { union { int a; float b; }; union { int c; float d; }; union { int e; float f; }; int g = 9; };
+// Several members left out under one name: three anonymous structs (read directly).
+struct Anons { struct { int a; float b; }; struct { int c; float d; }; struct { int e; float f; }; int g = 9; };
 // A record that contains itself and has a member left out: partial at every level.
 struct Tree { int v = 1; std::mutex m; std::vector<Tree> kids; };
 // A member left out and a captured one with the same name, in either order.
@@ -214,7 +213,7 @@ template <class V> void pc_left_out(const V &value, const char *name, const std:
 }
 """
 
-MUTEX_WHY = "pthread_mutex_t"
+MUTEX_WHY = "unsupported standard type: std::mutex"
 STREAM_WHY = "basic_ostringstream"
 PARTIAL = 'pc_require(pc_status(t) == "PARTIAL", "status " + pc_status(t)); '
 
@@ -327,9 +326,9 @@ ANONYMOUS = ("f_anons(", 'const auto s = e.argument_snapshot(0); '
              'pc_require(s.field("g").as<int>() == 9, "g"); '
              'pc_require(s.is_partial() && s.unavailable().size() == 3, "three members left out"); '
              'for (const auto &item : s.unavailable()) { '
-             'pc_require(item.first.rfind("(anonymous union #", 0) == 0, item.first); '
-             'pc_left_out(s, item.first.c_str(), "union state layout"); } ' + PARTIAL,
-             ["(anonymous union #1)", "(anonymous union #2)", "(anonymous union #3)"],
+             'pc_require(item.first.rfind("(anonymous struct #", 0) == 0, item.first); '
+             'pc_left_out(s, item.first.c_str(), "unnamed record type"); } ' + PARTIAL,
+             ["(anonymous struct #1)", "(anonymous struct #2)", "(anonymous struct #3)"],
              "pc::f_anons(const pc::Anons &)")
 # The private member is a note and a listed member on the direct route, plain data on the other.
 ACCESS_DIRECT = ("f_access(", 'const auto s = e.argument_snapshot(0); '

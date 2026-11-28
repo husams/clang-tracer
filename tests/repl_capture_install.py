@@ -65,7 +65,8 @@ EXPECTED = {
         ANON_STRUCT,
         ("AnonGroup", "PARTIAL",
          [("a", UNNAMED_REASON, 1, "capi::AnonGroup"),
-          ("b", "incomplete or unsupported field type: b", 2, "capi::AnonGroup")], {3: 9}),
+          ("b", "unsupported field type 'capi::AnonGroup::(unnamed)[2]': b", 2, "capi::AnonGroup")],
+         {3: 9}),
     ),
     "prepared": (
         THREAD_ID,

@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -309,6 +311,141 @@ void verify_context_schema_roundtrip() {
                       ->GetString(object_message,
                                   field(object_message, "label")) == "payload",
           "generic recursive object payload did not roundtrip");
+
+  // Unions, long double, 128-bit integers, wide enumerations, member pointers,
+  // std::nullptr_t and a volatile scalar: the generated codec and the generated schema
+  // agree, and the receiver admits the result (issue #181).
+  register_schema<generic_payload::Scalars>(
+      receiver, 10, context_schema_generated::generic_scalars_descriptor,
+      context_schema_generated::generic_scalars_root,
+      context_schema_generated::generic_scalars_state,
+      context_schema_generated::generic_scalars_scope,
+      context_schema_generated::generic_scalars_lineage,
+      context_schema_generated::generic_scalars_roles,
+      context_schema_generated::generic_scalars_role_count);
+  generic_payload::Scalars scalars;
+  std::array<std::byte, 2048> scalar_storage{};
+  BoundedProtoWriter scalar_writer(scalar_storage);
+  EncodeBudget scalar_budget;
+  require(encode_generic_payload_root(scalar_writer, scalars, scalar_budget),
+          "scalar record payload encode failed");
+  auto scalar_bytes = scalar_writer.finish();
+  StateAttachmentView scalar_attachment{10, scalar_bytes};
+  auto scalar_event = receiver.decode_event(
+      ::tracer::compat::span<const StateAttachmentView>(&scalar_attachment, 1));
+  require(bool(scalar_event), "scalar record payload decode failed");
+  const auto &scalar_root = *scalar_event->states[0].message();
+  const auto &scalar_message =
+      reflection(scalar_root)->GetMessage(scalar_root, field(scalar_root, "value"));
+  const auto part = [&](const char *name) -> const google::protobuf::Message & {
+    const auto *member = field(scalar_message, name);
+    require(member && member->cpp_type() ==
+                          google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE,
+            name);
+    return reflection(scalar_message)->GetMessage(scalar_message, member);
+  };
+  const auto text = [&](const google::protobuf::Message &m, const char *name) {
+    return reflection(m)->GetString(m, field(m, name));
+  };
+  const auto raw = [](const auto &object, std::size_t size) {
+    return std::string(reinterpret_cast<const char *>(&object), size);
+  };
+  const std::pair<const char *, int> unions[] = {{"number", 5}, {"__anonymous_union_0", 6}};
+  for (const auto &[name, value] : unions) {
+    const auto &opaque = part(name);
+    require(field(opaque, "bytes")->type() ==
+                    google::protobuf::FieldDescriptor::TYPE_BYTES &&
+                text(opaque, "bytes") == raw(value, sizeof(value)) &&
+                reflection(opaque)->GetUInt64(opaque, field(opaque, "size")) == sizeof(int) &&
+                text(opaque, "active_member") == "unknown" &&
+                text(opaque, "alternatives") == "int i; float f",
+            "union is not its bytes, size, unknown active member and alternatives");
+  }
+  const auto &extended = part("extended");
+#if __LDBL_MANT_DIG__ == 64
+  require(text(extended, "format") == "x87-extended-80" &&
+              text(extended, "bytes") == raw(scalars.extended, 10),
+          "long double lost its extended-precision bytes");
+#elif __LDBL_MANT_DIG__ == 113
+  require(text(extended, "format") == "ieee-binary128" &&
+              text(extended, "bytes") == raw(scalars.extended, 16),
+          "long double lost its quadruple-precision bytes");
+#endif
+  const auto &wide = part("wide");
+  require(reflection(wide)->GetUInt64(wide, field(wide, "low")) ==
+                  static_cast<std::uint64_t>(scalars.wide) &&
+              reflection(wide)->GetInt64(wide, field(wide, "high")) ==
+                  static_cast<std::int64_t>(scalars.wide >> 64) &&
+              reflection(wide)->GetInt64(wide, field(wide, "high")) < 0,
+          "signed 128-bit integer was narrowed");
+  const auto &uwide = part("uwide");
+  require(reflection(uwide)->GetUInt64(uwide, field(uwide, "low")) == ~0ULL - 1 &&
+              reflection(uwide)->GetUInt64(uwide, field(uwide, "high")) == ~0ULL,
+          "unsigned 128-bit integer was narrowed");
+  require(field(scalar_message, "big")->type() ==
+                  google::protobuf::FieldDescriptor::TYPE_UINT64 &&
+              reflection(scalar_message)->GetUInt64(scalar_message,
+                                                    field(scalar_message, "big")) == ~0ULL &&
+              field(scalar_message, "low")->type() ==
+                  google::protobuf::FieldDescriptor::TYPE_INT64 &&
+              reflection(scalar_message)->GetInt64(scalar_message,
+                                                   field(scalar_message, "low")) ==
+                  std::numeric_limits<std::int64_t>::min(),
+          "wide enumeration lost its value, width or signedness");
+  const auto &big_options = field(scalar_message, "big")->options().unknown_fields();
+  bool named = false, listed = false;
+  for (int i = 0; i < big_options.field_count(); ++i) {
+    named |= big_options.field(i).number() == kEnumTypeOption &&
+             big_options.field(i).length_delimited() == "generic_payload::Big";
+    listed |= big_options.field(i).number() == kEnumeratorOption &&
+              big_options.field(i).length_delimited() == "top=18446744073709551615";
+  }
+  require(named && listed, "wide enumeration lost its type or enumerators");
+  std::ptrdiff_t member_words[2] = {};
+  std::memcpy(member_words, &scalars.data, sizeof(scalars.data));
+  const auto &data = part("data");
+  require(text(data, "abi") == "itanium" &&
+              !reflection(data)->GetBool(data, field(data, "null")) &&
+              reflection(data)->GetInt64(data, field(data, "offset")) == member_words[0] &&
+              member_words[0] > 0,
+          "data member pointer is not its offset");
+  const auto &no_data = part("no_data");
+  require(reflection(no_data)->GetBool(no_data, field(no_data, "null")) &&
+              reflection(no_data)->GetInt64(no_data, field(no_data, "offset")) == -1,
+          "null data member pointer is not marked");
+  std::memcpy(member_words, &scalars.function, sizeof(scalars.function));
+  const auto &function = part("function");
+  require(!reflection(function)->GetBool(function, field(function, "null")) &&
+              !reflection(function)->GetBool(function, field(function, "is_virtual")) &&
+              reflection(function)->GetUInt64(function, field(function, "address")) ==
+                  static_cast<std::uint64_t>(member_words[0]) &&
+              reflection(function)->GetUInt64(function, field(function, "address")) != 0 &&
+              reflection(function)->GetInt64(function,
+                                             field(function, "this_adjustment")) == 0,
+          "member function pointer is not its address and adjustment");
+  const auto &virtual_function = part("virtual_function");
+  require(reflection(virtual_function)
+                  ->GetBool(virtual_function, field(virtual_function, "is_virtual")) &&
+              reflection(virtual_function)
+                      ->GetUInt64(virtual_function, field(virtual_function, "address")) == 0 &&
+              reflection(virtual_function)
+                      ->GetUInt64(virtual_function,
+                                  field(virtual_function, "vtable_offset")) % sizeof(void *) == 0,
+          "virtual member function pointer is not a vtable offset");
+  const auto &null = part("null");
+  require(reflection(null)->GetBool(null, field(null, "null")),
+          "std::nullptr_t is not an explicit null marker");
+  require(reflection(scalar_message)->GetInt32(scalar_message,
+                                               field(scalar_message, "counter")) == 7,
+          "volatile scalar was not loaded");
+  const auto *numbers = field(scalar_message, "numbers");
+  require(reflection(scalar_message)->FieldSize(scalar_message, numbers) == 1,
+          "container of unions lost an element");
+  const auto &element =
+      reflection(scalar_message)->GetRepeatedMessage(scalar_message, numbers, 0);
+  require(text(element, "bytes") == raw(8, sizeof(int)) &&
+              text(element, "alternatives") == "int i; float f",
+          "union in a container lost its bytes or alternatives");
 
   demo::RequestState request;
   request.request_id = "request-42";

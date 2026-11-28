@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include "events.hpp"
+#include "../src/bounded_proto.hpp"
 #include "../src/object_snapshot.hpp"
 #include "fixtures/repl_complex_types.hpp"
 #include <google/protobuf/descriptor.pb.h>
@@ -757,6 +758,202 @@ void partial_values() {
 }
 } // namespace
 
+// Values captured in a form of their own (issue #181): 128-bit integers as two halves, a
+// long double as the bytes of its format, std::nullptr_t as a marker, a member pointer as
+// the parts its ABI gives it, and a wide enumeration as an integer that names its type.
+void abi_values() {
+  const auto record = [](EventValue::Object fields, std::string type = {}) {
+    return EventValue{std::move(fields), std::move(type)};
+  };
+  const auto halves = [&](std::uint64_t low, EventValue high) {
+    return record({{"low", EventValue{low}}, {"high", std::move(high)}});
+  };
+  const __int128 big = (static_cast<__int128>(1) << 100) + 5;
+  const auto signed_value = [&](__int128 value) {
+    return halves(static_cast<std::uint64_t>(value),
+                  EventValue{static_cast<std::int64_t>(value >> 64)});
+  };
+  using Unsigned = unsigned __int128;
+  const Unsigned top = ~static_cast<Unsigned>(0) - 1;
+  const auto unsigned_top = halves(~0ULL - 1, EventValue{~std::uint64_t(0)});
+  require(signed_value(big).as<__int128>() == big && signed_value(-big).as<__int128>() == -big &&
+              signed_value(5).as<__int128>() == 5 && signed_value(-1).as<__int128>() == -1,
+          "a signed 128-bit integer keeps every bit");
+  require(unsigned_top.as<Unsigned>() == top && signed_value(big).as<Unsigned>() == big,
+          "an unsigned 128-bit integer keeps its top bit");
+  rejects<std::out_of_range>([&] { (void)unsigned_top.as<__int128>(); },
+                             "an unsigned value above the signed range is refused");
+  rejects<std::out_of_range>([&] { (void)signed_value(-big).as<Unsigned>(); },
+                             "a negative value is refused as unsigned");
+  require(EventValue{std::int64_t(-3)}.as<__int128>() == -3 &&
+              EventValue{std::uint64_t(7)}.as<Unsigned>() == 7,
+          "a 64-bit event integer widens");
+  rejects<std::out_of_range>([] { (void)EventValue{std::int64_t(-3)}.as<Unsigned>(); },
+                             "a negative 64-bit value is refused as unsigned");
+  rejects<std::invalid_argument>([&] { (void)record({}).as<__int128>(); },
+                                 "a record without halves is not an integer");
+
+  const auto extended = [&](const char *format, std::string bytes) {
+    return record({{"format", EventValue{std::string(format)}},
+                   {"bytes", EventValue{std::move(bytes)}}},
+                  "long double");
+  };
+  const auto x87 = [&](std::string bytes) { return extended("x87-extended-80", std::move(bytes)); };
+  const std::string zeros7(7, '\0');
+  // 1.5, 1 + 2^-60, -0, +infinity and a quiet NaN in the x87 extended format.
+  require(x87(zeros7 + std::string("\xc0\xff\x3f", 3)).as<long double>() == 1.5L &&
+              x87(zeros7 + std::string("\xc0\xff\x3f", 3)).as<double>() == 1.5,
+          "an x87 long double decodes");
+  const auto precise = x87(std::string("\x08", 1) + std::string(6, '\0') +
+                           std::string("\x80\xff\x3f", 3));
+  if (std::numeric_limits<long double>::digits >= 64)
+    require(precise.as<long double>() == 1.0L + 0x1p-60L && precise.as<long double>() != 1.0L,
+            "an x87 long double keeps the bits a double has no room for");
+  require(precise.as<double>() == 1.0, "a double is the nearest value on request");
+  const auto negative_zero = x87(zeros7 + std::string("\x00\x00\x80", 3)).as<long double>();
+  require(negative_zero == 0 && std::signbit(negative_zero), "a negative zero keeps its sign");
+  require(std::isinf(x87(zeros7 + std::string("\x80\xff\x7f", 3)).as<long double>()) &&
+              std::isnan(x87(zeros7 + std::string("\xc0\xff\x7f", 3)).as<long double>()),
+          "infinity and NaN decode");
+  // The same values in IEEE binary128 and binary64.
+  const auto quad = [&](std::uint64_t low, std::uint64_t high) {
+    std::string bytes(16, '\0');
+    for (int i = 0; i < 8; ++i) {
+      bytes[i] = static_cast<char>(low >> (8 * i));
+      bytes[8 + i] = static_cast<char>(high >> (8 * i));
+    }
+    return extended("ieee-binary128", std::move(bytes));
+  };
+  require(quad(0, 0x3fff800000000000ULL).as<long double>() == 1.5L &&
+              quad(0, 0xbfff800000000000ULL).as<long double>() == -1.5L,
+          "a binary128 long double decodes");
+  if (std::numeric_limits<long double>::digits >= 64)
+    require(quad(1ULL << 52, 0x3fff000000000000ULL).as<long double>() == 1.0L + 0x1p-60L,
+            "a binary128 long double keeps its low bits");
+  require(std::isinf(quad(0, 0x7fff000000000000ULL).as<long double>()) &&
+              std::isnan(quad(1, 0x7fff000000000000ULL).as<long double>()),
+          "binary128 infinity and NaN decode");
+  require(extended("ieee-binary64", std::string("\0\0\0\0\0\0\xf8\x3f", 8)).as<long double>() ==
+              1.5L,
+          "a binary64 long double decodes");
+  rejects<std::invalid_argument>(
+      [&] { (void)extended("ibm-double-double", std::string(16, '\0')).as<long double>(); },
+      "an unknown long double format is refused");
+  rejects<std::invalid_argument>([&] { (void)record({}).as<double>(); },
+                                 "a record is not a floating-point value");
+
+  const auto marker = [&](bool null) {
+    return record({{"null", EventValue{null}}}, "std::nullptr_t");
+  };
+  require(marker(true).as<std::nullptr_t>() == nullptr, "a null marker decodes");
+  rejects<std::invalid_argument>([&] { (void)marker(false).as<std::nullptr_t>(); },
+                                 "a cleared null marker is refused");
+
+  struct Pair {
+    int a, b;
+    int sum(int n) { return a + b + n; }
+  };
+  const auto data_member = [&](const char *abi, bool null, std::int64_t offset) {
+    return record({{"abi", EventValue{std::string(abi)}},
+                   {"null", EventValue{null}},
+                   {"offset", EventValue{offset}}});
+  };
+  require(data_member("itanium", false, sizeof(int)).as<int Pair::*>() == &Pair::b &&
+              data_member("itanium", false, 0).as<int Pair::*>() == &Pair::a &&
+              data_member("itanium", true, -1).as<int Pair::*>() == nullptr,
+          "a data member pointer is rebuilt from its offset");
+  rejects<std::invalid_argument>(
+      [&] { (void)data_member("microsoft", false, 4).as<int Pair::*>(); },
+      "a data member pointer of another ABI is refused");
+  const auto function_member = [&](bool null) {
+    return record({{"abi", EventValue{std::string("itanium")}},
+                   {"null", EventValue{null}},
+                   {"is_virtual", EventValue{false}},
+                   {"address", EventValue{std::uint64_t(null ? 0 : 0x401000)}},
+                   {"vtable_offset", EventValue{std::uint64_t(0)}},
+                   {"this_adjustment", EventValue{std::int64_t(0)}}});
+  };
+  require(function_member(true).as<int (Pair::*)(int)>() == nullptr,
+          "a null member function pointer decodes");
+  rejects<std::invalid_argument>([&] { (void)function_member(false).as<int (Pair::*)(int)>(); },
+                                 "a member function pointer of the target has no local value");
+
+  // A wide enumeration is an integer field whose options name the enumeration.
+  using FD = google::protobuf::FieldDescriptorProto;
+  google::protobuf::FileDescriptorSet files;
+  auto *file = files.add_file();
+  file->set_name("wide_enum.proto");
+  file->set_package("repl.test");
+  file->set_syntax("proto3");
+  auto *holder = file->add_message_type();
+  holder->set_name("Holder");
+  const auto wide = [&](const char *name, int number, FD::Type type, const char *enum_type) {
+    auto *field = holder->add_field();
+    field->set_name(name);
+    field->set_number(number);
+    field->set_type(type);
+    field->set_label(FD::LABEL_OPTIONAL);
+    if (*enum_type) {
+      auto *options = field->mutable_options()->mutable_unknown_fields();
+      options->AddLengthDelimited(tracer::context_engine::kEnumTypeOption, enum_type);
+      options->AddLengthDelimited(tracer::context_engine::kEnumeratorOption,
+                                  "top=18446744073709551615");
+    }
+  };
+  wide("big", 1, FD::TYPE_UINT64, "wide::Big");
+  wide("low", 2, FD::TYPE_INT64, "wide::Low");
+  wide("top", 3, FD::TYPE_UINT32, "wide::Top32");
+  wide("plain", 4, FD::TYPE_UINT64, "");
+  auto *root = file->add_message_type();
+  root->set_name("HolderRoot");
+  auto *value_field = root->add_field();
+  value_field->set_name("value");
+  value_field->set_number(1);
+  value_field->set_type(FD::TYPE_MESSAGE);
+  value_field->set_label(FD::LABEL_OPTIONAL);
+  value_field->set_type_name(".repl.test.Holder");
+  google::protobuf::DescriptorPool pool;
+  require(pool.BuildFile(*file), "a pool keeps the options it has no definition for");
+  google::protobuf::DynamicMessageFactory factory(&pool);
+  std::unique_ptr<google::protobuf::Message> body(
+      factory.GetPrototype(pool.FindMessageTypeByName("repl.test.HolderRoot"))->New());
+  auto *held = body->GetReflection()->MutableMessage(body.get(), body->GetDescriptor()->field(0));
+  const auto *r = held->GetReflection();
+  const auto *d = held->GetDescriptor();
+  r->SetUInt64(held, d->FindFieldByName("big"), ~0ULL);
+  r->SetInt64(held, d->FindFieldByName("low"), std::numeric_limits<std::int64_t>::min());
+  r->SetUInt32(held, d->FindFieldByName("top"), 0xffffffffu);
+  r->SetUInt64(held, d->FindFieldByName("plain"), 9);
+  api::TraceEvent message;
+  auto *argument = message.add_arguments();
+  argument->set_type(api::OBJECT);
+  argument->set_unsigned_value(1);
+  auto *captured = argument->mutable_snapshot();
+  captured->set_cpp_type("wide::Holder");
+  captured->set_root_type("repl.test.HolderRoot");
+  captured->set_descriptor_set(files.SerializeAsString());
+  captured->set_payload(body->SerializeAsString());
+  captured->set_status(clangtracer::context::v1::ValueSnapshot::COMPLETE);
+  captured->add_record_types("repl.test.Holder=wide::Holder");
+  const auto event = snapshot(message);
+  const auto decoded = event.argument_snapshot(0);
+  enum class Big : unsigned long long { top = ~0ULL };
+  enum class Low : long long { low = std::numeric_limits<long long>::min() };
+  require(decoded.field("big").cpp_type() == "wide::Big" &&
+              decoded.field("big").as<unsigned long long>() == ~0ULL &&
+              decoded.field("big").as<Big>() == Big::top,
+          "a wide unsigned enumeration keeps a value above INT64_MAX and names its type");
+  require(decoded.field("low").cpp_type() == "wide::Low" &&
+              decoded.field("low").as<Low>() == Low::low,
+          "a wide signed enumeration keeps INT64_MIN");
+  require(decoded.field("top").cpp_type() == "wide::Top32" &&
+              decoded.field("top").as<unsigned>() == 0xffffffffu,
+          "a 32-bit unsigned enumeration keeps UINT32_MAX");
+  require(decoded.field("plain").cpp_type().empty() &&
+              decoded.field("plain").as<unsigned long long>() == 9,
+          "an integer without the options is not an enumeration");
+}
+
 int main() {
   try {
     partial_values();
@@ -764,6 +961,7 @@ int main() {
     callback_error_events();
     context_values();
     complex_values();
+    abi_values();
     std::cout << "typed event value checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
