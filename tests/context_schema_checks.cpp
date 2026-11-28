@@ -185,7 +185,7 @@ struct RecursiveState : tracer::shared_state<Scope> { std::vector<TreeNode> node
   // shared context state stays a tree.
   const auto path = build_payload_schema(context, type("WithPath"), family("WithPath"), {},
                                          CodecAccess::snapshot_members, {}, SchemaRecursion::allow);
-  if (path || path.error != rejected_text + "std::filesystem::path::_Cmpt")
+  if (path || path.error != "unsupported standard type: std::filesystem::path")
     throw std::runtime_error("std::filesystem::path was captured through its components: " +
                              path.error);
   StateFamilyKey state_family;
