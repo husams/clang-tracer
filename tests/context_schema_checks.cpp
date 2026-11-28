@@ -593,6 +593,54 @@ struct ViewList : tracer::shared_state<ViewScope> { std::vector<std::string_view
         "admitted or rejected without a hash-specialization diagnostic: " +
         user_hash_schema.error);
   }
+  // Without a capture plan a member that the generated codec cannot spell fails the value,
+  // so that code generation never produces a codec that does not compile (#182). A standard
+  // record is walked first, so that what is wrong with it is what is reported.
+  auto capture_ast = clang::tooling::buildASTFromCodeWithArgs(R"cpp(
+#include <system_error>
+#include <thread>
+struct WithThreadId { std::thread::id id; };
+struct WithErrorCode { int head; std::error_code code; };
+struct Outer { int head; WithThreadId inner; };
+struct WithUnnamed { struct { int x; } inner; };
+struct WithUnnamedArray { struct { int x; } items[2]; };
+typedef struct { int y; } Named;
+struct WithNamed { Named named; };
+)cpp", arguments, "capture-install-fixture.cc");
+  if (!capture_ast || capture_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("capture install fixture failed to parse");
+  auto &capture_context = capture_ast->getASTContext();
+  const auto capture_codec = [&](const char *name, CodecAccess access) {
+    SchemaRecordFinder finder;
+    finder.name = name;
+    finder.TraverseDecl(capture_context.getTranslationUnitDecl());
+    if (!finder.record)
+      throw std::runtime_error(std::string("capture fixture record is absent: ") + name);
+    return render_payload_codec_source(
+        capture_context, clang::QualType(finder.record->getTypeForDecl(), 0), access);
+  };
+  const auto expect_codec_error = [&](const char *name, CodecAccess access, const char *message) {
+    const auto result = capture_codec(name, access);
+    if (result || result.error != message)
+      throw std::runtime_error(std::string("expected '") + message + "' for " + name +
+                               ", got '" + result.error + "'");
+  };
+  const char *unnamed_record = "unnamed record type cannot be captured automatically";
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    expect_codec_error("WithThreadId", access, "unsupported standard type: std::thread::id");
+    expect_codec_error("Outer", access, "unsupported standard type: std::thread::id");
+    expect_codec_error("WithUnnamed", access, unnamed_record);
+    // A record that a typedef names for linkage has a spelling, so it is still captured.
+    const auto named = capture_codec("WithNamed", access);
+    if (!named)
+      throw std::runtime_error("typedef-named unnamed struct member was rejected: " + named.error);
+  }
+  // std::error_code keeps a pointer: the public-member walk says so, the snapshot one cannot.
+  expect_codec_error("WithErrorCode", CodecAccess::public_members,
+                     "unsupported pointer/reference field: _M_cat");
+  expect_codec_error("WithErrorCode", CodecAccess::snapshot_members,
+                     "unsupported standard type: std::error_code");
+  expect_codec_error("WithUnnamedArray", CodecAccess::snapshot_members, unnamed_record);
   google::protobuf::DescriptorPool pool;
   google::protobuf::FileDescriptorSet definitions;
   if (!definitions.ParseFromString(schema.record->descriptor_set))

@@ -653,6 +653,26 @@ void append_diagnostics(clangtracer::v1::ValidationReport &report,
   }
 }
 
+// Why a value is reported unsupported when its generated capture code does not compile.
+constexpr const char *kCaptureUnavailable = "the generated capture code did not compile";
+
+std::string capture_unavailable_detail(const DiagnosticCapture &failed) {
+  for (const auto &diagnostic : failed.diagnostics())
+    if (diagnostic.severity == "error" && !diagnostic.message.empty())
+      return std::string(kCaptureUnavailable) + ": " + diagnostic.message;
+  return kCaptureUnavailable;
+}
+
+void add_capture_disabled_note(clangtracer::v1::ValidationReport *report) {
+  if (!report)
+    return;
+  auto *note = report->add_diagnostics();
+  note->set_stage("snapshot");
+  note->set_severity("note");
+  note->set_message("automatic value capture was disabled because the generated capture code "
+                    "did not compile");
+}
+
 void append_source_errors(
     clangtracer::v1::ValidationReport &report,
     const std::vector<tracer::ContextSourceError> &errors) {
@@ -6250,6 +6270,8 @@ struct ReceiverCallbackShape {
   tracer::ValueSnapshotCode snapshots;
   // The same capture without followed members, for when that code does not compile.
   tracer::ValueSnapshotCode snapshots_plain;
+  // The same capture reported as unavailable, for when the capture code does not compile.
+  tracer::ValueSnapshotCode snapshots_unavailable;
 };
 
 std::string make_class_bridge(const CallbackShape &shape);
@@ -6286,6 +6308,9 @@ public:
       return;
     if (result_.snapshots.has_followed_members || result_.snapshots.has_omitted_members)
       result_.snapshots_plain = tracer::make_value_snapshot_code(context, spec_, false);
+    if (result_.snapshots.has_automatic_capture && !result_.snapshots.has_custom_encoder)
+      result_.snapshots_unavailable =
+          tracer::make_value_snapshot_code(context, spec_, false, kCaptureUnavailable);
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -7290,6 +7315,18 @@ void report_capture_notes(Probe &p, clangtracer::v1::ValidationReport *report,
   }
 }
 
+// Takes back notes that report_capture_notes added to a validation report.
+void drop_capture_notes(clangtracer::v1::ValidationReport *report,
+                        const std::vector<std::string> &notes) {
+  if (!report)
+    return;
+  auto &diagnostics = *report->mutable_diagnostics();
+  for (int i = diagnostics.size() - 1; i >= 0; --i)
+    if (diagnostics[i].stage() == "snapshot" && diagnostics[i].severity() == "note" &&
+        std::find(notes.begin(), notes.end(), diagnostics[i].message()) != notes.end())
+      diagnostics.DeleteSubrange(i, 1);
+}
+
 bool compile_shared_probe(Probe &p,
                           const clangtracer::v1::ProbeSpec &specification,
                           const std::vector<std::string> &arguments,
@@ -7302,7 +7339,8 @@ bool compile_shared_probe(Probe &p,
                           bool result_sret, bool syntax_only,
                           const tracer::ValueSnapshotCode &snapshots,
                           const tracer::ValueSnapshotCode *plain_snapshots = nullptr,
-                          const std::string &enum_declarations = {}) {
+                          const std::string &enum_declarations = {},
+                          const tracer::ValueSnapshotCode *unavailable_snapshots = nullptr) {
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
@@ -7341,8 +7379,13 @@ bool compile_shared_probe(Probe &p,
   // Followed members and partial records must never turn a probe that worked into
   // one that does not compile: when the wrapper fails to compile with them, it is
   // built without.
-  const bool can_fall_back =
+  const bool can_follow_fall_back =
       (snapshots.has_followed_members || snapshots.has_omitted_members) && plain_snapshots;
+  // Capture code that does not compile even then must not reject the probe either: its
+  // values are reported unsupported.
+  const bool can_degrade = unavailable_snapshots && snapshots.has_automatic_capture &&
+                           !snapshots.has_custom_encoder;
+  const bool can_fall_back = can_follow_fall_back || can_degrade;
   const auto fall_back_note = [&] {
     if (!report)
       return;
@@ -7352,11 +7395,11 @@ bool compile_shared_probe(Probe &p,
     note->set_message("followed members and partial record capture were disabled because the "
                       "generated capture code did not compile");
   };
-  const auto plain_wrapper = [&] {
+  const auto wrapper_for = [&](const tracer::ValueSnapshotCode *code) {
     return wrapper_prelude + wrapper_types +
            make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline), true, true,
                         &specification, false, true, result_sret,
-                        plain_snapshots->arguments.empty() ? nullptr : plain_snapshots);
+                        code->arguments.empty() ? nullptr : code);
   };
   const auto syntax_ok = [&](const std::string &source, DiagnosticCapture &capture) {
     auto syntax_arguments = arguments;
@@ -7370,23 +7413,33 @@ bool compile_shared_probe(Probe &p,
   };
   // A failed parse leaves partial declarations in the interpreter, so a retry
   // there fails on conflicts. Installing therefore checks the wrapper on a
-  // throwaway AST first; only probes that follow members pay for it.
-  bool use_plain = false;
+  // throwaway AST first; only probes that capture values pay for it.
+  bool use_plain = false, use_unavailable = false;
   if (can_fall_back && !syntax_only) {
     DiagnosticCapture capture(nullptr);
-    if (!syntax_ok(wrapper_prelude + wrapper_types +
-                       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                                    true, true, &specification, false, true, result_sret,
-                                    wrapper_snapshots),
-                   capture)) {
-      use_plain = true;
-      fall_back_note();
+    if (!syntax_ok(wrapper_for(&snapshots), capture)) {
+      DiagnosticCapture plain_capture(nullptr), unavailable_capture(nullptr);
+      const bool plain_ok =
+          can_follow_fall_back && syntax_ok(wrapper_for(plain_snapshots), plain_capture);
+      const bool unavailable_ok =
+          !plain_ok && can_degrade &&
+          syntax_ok(wrapper_for(unavailable_snapshots), unavailable_capture);
+      if (unavailable_ok) {
+        use_unavailable = true;
+        add_capture_disabled_note(report);
+      } else if (can_follow_fall_back) {
+        use_plain = true;
+        fall_back_note();
+      }
     }
   }
   const auto *effective_snapshots =
-      use_plain ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
-                : wrapper_snapshots;
-  report_capture_notes(p, report, use_plain ? plain_snapshots->notes : snapshots.notes);
+      use_unavailable ? (unavailable_snapshots->arguments.empty() ? nullptr : unavailable_snapshots)
+      : use_plain     ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
+                      : wrapper_snapshots;
+  report_capture_notes(p, report, use_unavailable ? unavailable_snapshots->notes
+                                  : use_plain      ? plain_snapshots->notes
+                                                   : snapshots.notes);
   activation.compiler_arguments = arguments;
   activation.callback_log = &tracer::detail::tracer_enqueue_log;
   // Target functions that the hooks call are entered through generated code
@@ -7433,10 +7486,20 @@ bool compile_shared_probe(Probe &p,
     if (syntax_only) {
       DiagnosticCapture capture(nullptr);
       const bool ok = syntax_ok(complete_source, capture);
-      if (!ok && can_fall_back) {
+      if (!ok && can_follow_fall_back) {
         DiagnosticCapture retry(nullptr);
-        if (syntax_ok(plain_wrapper(), retry)) {
+        if (syntax_ok(wrapper_for(plain_snapshots), retry)) {
           fall_back_note();
+          return true;
+        }
+      }
+      if (!ok && can_degrade) {
+        DiagnosticCapture retry(nullptr);
+        if (syntax_ok(wrapper_for(unavailable_snapshots), retry)) {
+          // The members the partial capture leaves out are not captured at all now.
+          drop_capture_notes(report, snapshots.notes);
+          p.capture_notes.clear();
+          add_capture_disabled_note(report);
           return true;
         }
       }
@@ -8532,14 +8595,19 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       }
       const auto plain_snapshots =
           tracer::make_value_snapshot_code(user_ast->getASTContext(), specification, false);
+      const auto shared_snapshots =
+          tracer::make_value_snapshot_code(user_ast->getASTContext(), specification);
+      const auto unavailable_snapshots = tracer::make_value_snapshot_code(
+          user_ast->getASTContext(), specification, false,
+          shared_snapshots.has_automatic_capture ? kCaptureUnavailable : "");
       return compile_shared_probe(
           p, specification, compiler_arguments,
           forced_include_source + prelude + context_prelude +
               tracer::kEmbeddedCallbackHeader,
           forced_include_source, receiver_alias,
           signature_assert, error, run_initializers, report, result_sret,
-          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification),
-          &plain_snapshots, callback_type_declarations);
+          syntax_only, shared_snapshots,
+          &plain_snapshots, callback_type_declarations, &unavailable_snapshots);
     }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
@@ -8599,16 +8667,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     };
     baseline_preflight_succeeded = build_complete(snapshots, complete_capture);
     std::vector<std::string> capture_notes = snapshots.notes;
+    const DiagnosticCapture *last_failure = &complete_capture;
+    DiagnosticCapture follow_retry_capture(nullptr);
     if (!baseline_preflight_succeeded &&
         (snapshots.has_followed_members || snapshots.has_omitted_members)) {
       // Followed members and partial records must never turn a probe that
       // worked into one that does not compile: capture without them instead.
       const auto fallback = tracer::make_value_snapshot_code(
           user_ast->getASTContext(), specification, false);
-      DiagnosticCapture retry_capture(nullptr);
       std::string ignored;
       if (validate_snapshot_encoder(shape, fallback, ignored) &&
-          build_complete(fallback, retry_capture)) {
+          build_complete(fallback, follow_retry_capture)) {
         if (report) {
           // The failed attempt's errors are kept as notes: the probe was built.
           const int first = report->diagnostics_size();
@@ -8624,6 +8693,32 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         followed_members_disabled = true;
         baseline_preflight_succeeded = true;
         capture_notes = fallback.notes;
+      } else if (follow_retry_capture.had_error()) {
+        last_failure = &follow_retry_capture;
+      }
+    }
+    if (!baseline_preflight_succeeded && snapshots.has_automatic_capture &&
+        !snapshots.has_custom_encoder) {
+      // Capture code that does not compile must not reject the probe either.
+      // When the same callback and wrapper build with every captured value
+      // reported unsupported, the failure was in the generated capture code
+      // and nothing else: a broken callback or an invalid contract fails
+      // that build too.
+      const auto unavailable = tracer::make_value_snapshot_code(
+          user_ast->getASTContext(), specification, false,
+          capture_unavailable_detail(*last_failure));
+      DiagnosticCapture unavailable_capture(nullptr);
+      if (build_complete(unavailable, unavailable_capture)) {
+        if (report) {
+          const int first = report->diagnostics_size();
+          append_diagnostics(*report, *last_failure, "snapshot");
+          for (int i = first; i < report->diagnostics_size(); ++i)
+            report->mutable_diagnostics(i)->set_severity("note");
+          add_capture_disabled_note(report);
+        }
+        followed_members_disabled = true;
+        baseline_preflight_succeeded = true;
+        capture_notes = unavailable.notes;
       }
     }
     if (baseline_preflight_succeeded)
@@ -8872,7 +8967,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
           return final_shape.valid && import_error.empty();
         });
     const tracer::ValueSnapshotCode *used_snapshots = &receiver_shape.snapshots;
-    if ((!complete_syntax_ok || !final_shape.valid || !import_error.empty()) &&
+    const auto preflight_ok = [&] {
+      return complete_syntax_ok && final_shape.valid && import_error.empty();
+    };
+    if (!preflight_ok() &&
         (receiver_shape.snapshots.has_followed_members ||
          receiver_shape.snapshots.has_omitted_members)) {
       // Followed members and partial records must never turn a probe that worked
@@ -8882,7 +8980,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       complete_syntax_ok = run_callback_tool(make_final_action, complete_source, [&] {
         return final_shape.valid && import_error.empty();
       });
-      if (complete_syntax_ok && final_shape.valid && import_error.empty() && report) {
+      if (preflight_ok() && report) {
         auto *note = report->add_diagnostics();
         note->set_stage("snapshot");
         note->set_severity("note");
@@ -8890,7 +8988,19 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                           "generated capture code did not compile");
       }
     }
-    if (complete_syntax_ok && final_shape.valid && import_error.empty())
+    if (!preflight_ok() && receiver_shape.snapshots.has_automatic_capture &&
+        !receiver_shape.snapshots.has_custom_encoder) {
+      // Only a failure in the generated capture code is repaired this way: a
+      // broken callback fails the build that reports every value unsupported too.
+      used_snapshots = &receiver_shape.snapshots_unavailable;
+      assemble(receiver_shape.snapshots_unavailable);
+      complete_syntax_ok = run_callback_tool(make_final_action, complete_source, [&] {
+        return final_shape.valid && import_error.empty();
+      });
+      if (preflight_ok())
+        add_capture_disabled_note(report);
+    }
+    if (preflight_ok())
       report_capture_notes(p, report, used_snapshots->notes);
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;

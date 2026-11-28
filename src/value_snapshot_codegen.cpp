@@ -275,7 +275,8 @@ std::string first_unavailable_reason(const context_engine::SchemaMessage &messag
 
 ValueSnapshotCode make_code(clang::ASTContext &ast,
                             const clangtracer::v1::ProbeSpec &spec, bool follow_members,
-                            context_engine::CapturePlan *plan) {
+                            context_engine::CapturePlan *plan,
+                            const std::string &capture_unavailable) {
   ValueSnapshotCode code;
   const auto snapshot_encoders = tracer::find_snapshot_encoders(ast);
   code.has_custom_encoder = snapshot_encoders.requested;
@@ -805,6 +806,10 @@ ValueSnapshotCode make_code(clang::ASTContext &ast,
     if (!receiver.isNull())
       add(0, Role::receiver, receiver);
   }
+  if (!capture_unavailable.empty())
+    for (auto &entry : entries)
+      if (entry.error.empty())
+        entry.error = capture_unavailable;
   for (auto &entry : entries) {
     if (entry.error.empty()) {
       configure_record_policy(entry);
@@ -1006,6 +1011,9 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
     }
   }
   code.declarations = scope + code.declarations;
+  code.has_automatic_capture =
+      std::any_of(entries.begin(), entries.end(),
+                  [](const auto &entry) { return entry.error.empty(); });
   const bool has_dynamic_capture =
       std::any_of(entries.begin(), entries.end(), [](const auto &entry) {
         return entry.error.empty() && !entry.dynamic_projections.empty();
@@ -1067,6 +1075,10 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
   // so the fallback to the whole-record capture can be exercised.
   if (code.has_omitted_members && std::getenv("TRACER_TEST_BREAK_PARTIAL_CAPTURE"))
     code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_PARTIAL_CAPTURE\");\n";
+  // Test-only switch: makes any capture code fail to compile so the fallback that reports the
+  // captured values as unsupported can be exercised.
+  if (code.has_automatic_capture && std::getenv("TRACER_TEST_BREAK_CAPTURE"))
+    code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_CAPTURE\");\n";
   const bool has_automatic_capture =
       std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
         return node.member.polymorphic && !node.member.projections.empty();
@@ -1744,9 +1756,10 @@ inline bool verified_vtable(const void* address) noexcept {
 
 ValueSnapshotCode
 make_value_snapshot_code(clang::ASTContext &ast,
-                         const clangtracer::v1::ProbeSpec &spec, bool extended) {
-  if (!extended)
-    return make_code(ast, spec, false, nullptr);
+                         const clangtracer::v1::ProbeSpec &spec, bool extended,
+                         const std::string &capture_unavailable) {
+  if (!extended || !capture_unavailable.empty())
+    return make_code(ast, spec, false, nullptr, capture_unavailable);
   // One plan covers every schema and codec of the probe. A member left out
   // after an earlier schema kept it makes the run start over; the omitted
   // set only grows, so this ends.
@@ -1754,7 +1767,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
   for (;;) {
     plan.conflict = false;
     plan.described.clear();
-    auto code = make_code(ast, spec, true, &plan);
+    auto code = make_code(ast, spec, true, &plan, {});
     if (!plan.conflict)
       return code;
   }

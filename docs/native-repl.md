@@ -2341,6 +2341,19 @@ it. In a followed member a
 left out by the checks or the read budget looks the same as one with no
 pointee.
 
+A value that automatic capture cannot encode never keeps the probe from
+installing, and neither does a member of one (see partial snapshots below): a
+standard-library record without a codec (`std::thread::id`, `std::error_code`,
+`std::exception_ptr`) or a member of an unnamed struct type is left out with its
+reason, and the timing, the other arguments and the result are kept. If the
+generated capture code does not compile even after followed members and partial
+records are dropped, the probe is still installed: every captured value is
+reported `UNSUPPORTED` with the compiler's first error, and the validation
+report says that automatic value capture was disabled
+(`TRACER_TEST_BREAK_CAPTURE` forces this for testing). A callback that does not
+compile, a header whose layout differs from the target's and an invalid
+prepared package are still rejected.
+
 Prepared packages of probes that share application types each declare those
 types. One REPL session keeps the first declaration of a type and drops the
 repeats from later packages, reporting them as `reused imported types: ...`,

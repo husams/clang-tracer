@@ -27,8 +27,10 @@ typedef struct { int x, y; } Point;
 typedef enum { Red, Green = 5 } Color;
 typedef struct { struct Inner { int v; } inner; int k; } Holder;
 struct Frame { typedef struct { int a; } Slot; Slot slot; int tail; };
-// Unnamed types the adapter cannot declare.
+// An unnamed struct no typedef names: the adapter declares it in the member that has it, but
+// not where something else (a pointer to it) would have to name it. Unnamed unions are refused.
 struct Wrap { struct { int a; } inner; int b; };
+struct WrapPointer { struct { int a; } inner; decltype(inner) *again; int b; };
 typedef union { int i; float f; } Either;
 struct Mix16 { long id; double scale; };
 struct Duo { double scale; double bias; };
@@ -55,6 +57,7 @@ int take_holder(Holder value);
 int take_inner(Holder::Inner value);
 int take_slot(Frame::Slot value);
 int take_wrap(Wrap value);
+int take_wrap_pointer(WrapPointer value);
 int take_either(Either value);
 Plain make_for(Session* session);
 int mixed(const std::string& text, const Outer::Inner* inner, const Box<Plain>& box, Plain value);
@@ -138,6 +141,7 @@ __attribute__((noinline)) int take_holder(Holder value) { return value.inner.v +
 __attribute__((noinline)) int take_inner(Holder::Inner value) { return value.v; }
 __attribute__((noinline)) int take_slot(Frame::Slot value) { return value.a; }
 __attribute__((noinline)) int take_wrap(Wrap value) { return value.inner.a + value.b; }
+__attribute__((noinline)) int take_wrap_pointer(WrapPointer value) { return value.inner.a + value.b; }
 __attribute__((noinline)) int take_either(Either value) { return value.i; }
 __attribute__((noinline)) Plain make_for(Session* session) { return {session->id}; }
 __attribute__((noinline)) int mixed(const std::string& text, const Outer::Inner* inner,
@@ -387,14 +391,19 @@ def main():
              "--module ./libclassprep.so --output pkg/long\n",
              expected_error="at most 511 bytes")
         assert not (root / "pkg/long").exists()
-        # Unnamed types that no declaration outside their own can name are reported as such.
+        # An unnamed struct that only its member declares is declared in that member.
         repl('%probe prepare "extra::take_wrap(extra::Wrap)" --signature "int(extra::Wrap)" '
-             f"--module ./libclassprep.so {context} --output pkg/unnamed_member\n",
+             f"--module ./libclassprep.so {context} --output pkg/unnamed_member\n")
+        assert (root / "pkg/unnamed_member/prepared.pb").is_file()
+        # Types that no declaration outside their own can name are reported as such.
+        repl('%probe prepare "extra::take_wrap_pointer(extra::WrapPointer)" '
+             '--signature "int(extra::WrapPointer)" '
+             f"--module ./libclassprep.so {context} --output pkg/unnamed_pointer\n",
              expected_error="an unnamed struct without a typedef name for linkage is unsupported")
         repl('%probe prepare "extra::take_either(extra::Either)" --signature "int(extra::Either)" '
              f"--module ./libclassprep.so {context} --output pkg/unnamed_union\n",
              expected_error="cannot prepare standalone type 'extra::Either': union layout")
-        assert not (root / "pkg/unnamed_member").exists()
+        assert not (root / "pkg/unnamed_pointer").exists()
         assert not (root / "pkg/unnamed_union").exists()
         # A mismatched parameter list is still caught against the ELF symbol.
         repl('%probe prepare "extra::take_plain(extra::Plain)" --signature "int(extra::Plain, int)" '

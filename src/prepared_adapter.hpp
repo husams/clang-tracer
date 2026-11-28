@@ -574,6 +574,10 @@ private:
     } else if (const auto *record = type->getAsCXXRecordDecl()) {
       if (include_toolchain_record(*record))
         return;
+      // Only the member that declares an unnamed record can name it, and
+      // emit_record declares that member in place.
+      if (!record->getIdentifier())
+        unnamed_definition(*record);
       if (complete && record->getDefinition())
         emit_record(*record->getDefinition());
       else
@@ -711,8 +715,19 @@ private:
     emitting_.insert(identity);
     if (record.isUnion())
       unsupported(record, "union layout requires an explicit adapter");
+    const auto source = record_definition(record);
+    emitting_.erase(identity);
+    place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
+  }
+
+  // The definition of a record up to its closing brace. The caller marks the record as
+  // emitted and being emitted, and writes what follows the brace.
+  std::string record_definition(const clang::CXXRecordDecl &record) {
+    const auto *identity = record.getCanonicalDecl();
+    const bool unnamed = !record.getIdentifier();
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
-    std::string source = specialization_prefix(record) + (unnamed ? "typedef " : "") +
+    std::string source = specialization_prefix(record) +
+                         (unnamed && record.getTypedefNameForAnonDecl() ? "typedef " : "") +
                          std::string(record.getKindName()) + " alignas(" +
                          std::to_string(alignment) + ") ";
     if (record.hasAttr<clang::PackedAttr>())
@@ -751,7 +766,18 @@ private:
           emit_constant(*constant);
       }
     }
-    for (const auto *field : record.fields()) {
+    const std::vector<const clang::FieldDecl *> record_fields(record.field_begin(),
+                                                              record.field_end());
+    for (std::size_t index = 0; index < record_fields.size(); ++index) {
+      const auto *field = record_fields[index];
+      if (const auto *unnamed = declared_in_place(record, *field)) {
+        std::vector<const clang::FieldDecl *> group{field};
+        while (index + 1 < record_fields.size() &&
+               declared_in_place(record, *record_fields[index + 1]) == unnamed)
+          group.push_back(record_fields[++index]);
+        members.emplace_back(field->getAccess(), emit_in_place(*unnamed, group));
+        continue;
+      }
       visit(field->getType());
       std::string member;
       if (field->hasAttr<clang::NoUniqueAddressAttr>())
@@ -846,8 +872,75 @@ private:
       add(clang::AS_public, nested);
     for (const auto &[wanted, member] : members)
       add(wanted, member);
+    return source;
+  }
+
+  // The unnamed record a member declares, if nothing else can name it: no identifier and no
+  // typedef name for linkage. Only the declaration of such a member can define it.
+  const clang::CXXRecordDecl *declared_in_place(const clang::CXXRecordDecl &owner,
+                                                const clang::FieldDecl &field) {
+    auto type = field.getType();
+    while (const auto *array = ast_.getAsArrayType(type))
+      type = array->getElementType();
+    const auto *unnamed = type->getAsCXXRecordDecl();
+    unnamed = unnamed ? unnamed->getDefinition() : nullptr;
+    if (!unnamed || unnamed->isUnion() || !linkage_name(*unnamed).empty())
+      return nullptr;
+    const auto *scope = llvm::dyn_cast<clang::CXXRecordDecl>(unnamed->getDeclContext());
+    return scope && scope->getCanonicalDecl() == owner.getCanonicalDecl() ? unnamed : nullptr;
+  }
+
+  // `struct { ... } a, b[2];` for the consecutive members that share one unnamed record.
+  // Its size, alignment and offsets stay those of the original, and so do the members after it.
+  std::string emit_in_place(const clang::CXXRecordDecl &unnamed,
+                            const std::vector<const clang::FieldDecl *> &group) {
+    const auto *identity = unnamed.getCanonicalDecl();
+    if (!emitted_.insert(identity).second)
+      unsupported(unnamed, ("an unnamed " + std::string(unnamed.getKindName()) +
+                            " shared by members that are not consecutive is unsupported").c_str());
+    const auto &first = *group.front();
+    const auto attributes = [&](const clang::FieldDecl &field) {
+      if (field.hasAttr<clang::PackedAttr>())
+        unsupported(field, "a packed member of an unnamed record type is unsupported");
+      std::string result;
+      if (field.hasAttr<clang::NoUniqueAddressAttr>())
+        result += "[[no_unique_address]] ";
+      if (const auto alignment = field.getMaxAlignment())
+        result += "alignas(" + std::to_string(alignment / ast_.getCharWidth()) + ") ";
+      if (field.isMutable())
+        result += "mutable ";
+      return result;
+    };
+    const auto qualifiers = [&](const clang::FieldDecl &field) {
+      auto type = field.getType();
+      while (const auto *array = ast_.getAsArrayType(type))
+        type = array->getElementType();
+      return std::string(type.isConstQualified() ? "const " : "") +
+             (type.isVolatileQualified() ? "volatile " : "");
+    };
+    std::string declarators;
+    for (const auto *field : group) {
+      if (attributes(*field) != attributes(first) || qualifiers(*field) != qualifiers(first) ||
+          field->getAccess() != first.getAccess())
+        unsupported(*field, "members that share an unnamed record type must be declared alike");
+      std::string extents;
+      for (auto type = field->getType(); const auto *array = ast_.getAsArrayType(type);
+           type = array->getElementType()) {
+        if (const auto *constant = llvm::dyn_cast<clang::ConstantArrayType>(array))
+          extents += "[" + std::to_string(constant->getSize().getZExtValue()) + "]";
+        else if (llvm::isa<clang::IncompleteArrayType>(array))
+          extents += "[]";
+        else
+          unsupported(*field, "variable-length members are unsupported");
+      }
+      if (!declarators.empty())
+        declarators += ", ";
+      declarators += field->getNameAsString() + extents;
+    }
+    emitting_.insert(identity);
+    auto source = attributes(first) + qualifiers(first) + record_definition(unnamed) + "}";
     emitting_.erase(identity);
-    place_declaration(record, source + (unnamed ? "} " + linkage_name(record) + ";\n" : "};\n"));
+    return source + (declarators.empty() ? "" : " " + declarators) + ";\n";
   }
 
   // The declarations queued for `owner`, each one a public member.

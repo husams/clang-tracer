@@ -124,6 +124,20 @@ clang::QualType arg(const clang::ClassTemplateSpecializationDecl *s,
              : clang::QualType{};
 }
 
+// Generated code has to spell the record's name.  A record, or one of the
+// records enclosing it, that has neither an identifier nor a typedef name for
+// linkage has no such spelling.
+bool unnamable_record(const clang::CXXRecordDecl *record) {
+  for (const clang::DeclContext *context = record;
+       context && llvm::isa<clang::RecordDecl>(context);
+       context = context->getParent()) {
+    const auto *tag = llvm::cast<clang::RecordDecl>(context);
+    if (!tag->getIdentifier() && !tag->getTypedefNameForAnonDecl())
+      return true;
+  }
+  return false;
+}
+
 bool owning_snapshot_pointer(const std::string &name) {
   return name == "std::unique_ptr" || name == "std::shared_ptr";
 }
@@ -172,6 +186,9 @@ struct Builder {
   CapturePlan *plan() const {
     return selection && !strict ? selection->plan : nullptr;
   }
+
+  // No capture plan at all, and not inside the walk that a plan makes for a standard record.
+  bool all_or_nothing() const { return !strict && !(selection && selection->plan); }
 
   // Why capture leaves a member out before it is described, or empty.
   std::string omission(CapturePlan &capture, const clang::CXXRecordDecl &owner,
@@ -775,6 +792,15 @@ struct Builder {
         error = "unsupported standard type: " + without_std_inline_namespace(record_name);
       return out;
     }
+    if (all_or_nothing() && record_name.rfind("std::", 0) == 0 &&
+        (snapshot || (record_name != "std::monostate" && record_name != "std::any"))) {
+      // The same holds without a plan: a standard record that nothing is wrong with
+      // would pass here and then fail to compile as a generated codec.
+      (void)message(r->getDefinition(), depth + 1);
+      if (error.empty())
+        error = "unsupported standard type: " + without_std_inline_namespace(record_name);
+      return out;
+    }
     out.kind = SchemaKind::message;
     r = r->getDefinition();
     if (const auto open = active.find(r); open != active.end() && may_recur(r)) {
@@ -808,12 +834,12 @@ struct Builder {
     active.emplace(r, result);
     auto outer_deferred = std::move(deferred);
     deferred.clear();
-    if (plan()) {
+    if (plan() || all_or_nothing()) {
       // What the codec generator would reject for this record; reported only
       // when the walk finds nothing wrong first.
       if (r->getDeclName().isEmpty() && !r->getTypedefNameForAnonDecl())
         deferred = "unnamed record type cannot be captured automatically";
-      else if (r->getDescribedClassTemplate())
+      else if (plan() && r->getDescribedClassTemplate())
         deferred = "anonymous or primary-template state class cannot receive an "
                    "automatic codec";
     }
@@ -1331,8 +1357,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
         result.error = "recursive codec type is unsupported";
       return;
     }
-    if (r->getQualifiedNameAsString().empty() ||
-        r->getDescribedClassTemplate()) {
+    if (unnamable_record(r) || r->getDescribedClassTemplate()) {
       result.error = "anonymous or primary-template state class cannot receive "
                      "an automatic codec";
       return;
