@@ -14,6 +14,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
@@ -69,6 +71,30 @@ class SnapshotDecoder {
   std::map<std::string, std::string> roles_;
   std::map<std::string, std::string> types_;
   std::size_t visited_ = 0;
+  // The record messages open on the way to the current value, each with the
+  // role path of its fields. A record that contains itself lists its roles
+  // once, under the path of its outermost occurrence (collect_container_roles
+  // in context_schema.cpp), so an inner occurrence continues from that path.
+  std::vector<std::pair<const google::protobuf::Descriptor *, std::string>> open_;
+  class OpenRecord {
+    SnapshotDecoder &decoder_;
+    std::string path_; // Its own copy: the list moves when a nested record opens.
+
+  public:
+    OpenRecord(SnapshotDecoder &decoder, const google::protobuf::Descriptor &type,
+               const std::string &path)
+        : decoder_(decoder) {
+      const auto outer = std::find_if(
+          decoder.open_.begin(), decoder.open_.end(),
+          [&](const auto &entry) { return entry.first == &type; });
+      path_ = outer == decoder.open_.end() ? path : outer->second;
+      decoder.open_.emplace_back(&type, path_);
+    }
+    OpenRecord(const OpenRecord &) = delete;
+    OpenRecord &operator=(const OpenRecord &) = delete;
+    ~OpenRecord() { decoder_.open_.pop_back(); }
+    const std::string &path() const { return path_; }
+  };
   const std::string &payload_;
   // Every visited value or element takes at least a byte of the payload, which
   // is itself bounded (--snapshot-slice), so the payload size bounds the work.
@@ -105,6 +131,15 @@ class SnapshotDecoder {
   void validate(const google::protobuf::Descriptor &type,
                 std::string_view bytes, const std::string &path, bool wrapper,
                 bool map_entry, unsigned depth) {
+    if (wrapper || map_entry)
+      return validate_message(type, bytes, path, wrapper, map_entry, depth);
+    const OpenRecord record(*this, type, path);
+    validate_message(type, bytes, record.path(), false, false, depth);
+  }
+
+  void validate_message(const google::protobuf::Descriptor &type,
+                        std::string_view bytes, const std::string &path, bool wrapper,
+                        bool map_entry, unsigned depth) {
     if (depth > tracer::context_engine::max_capture_depth || ++visited_ > visit_limit())
       throw std::runtime_error("event snapshot exceeds validation limits");
     using Wire = google::protobuf::internal::WireFormatLite;
@@ -276,8 +311,9 @@ class SnapshotDecoder {
           type->field_count() == 1 && type->field(0)->is_repeated())
         return decode_field(nested, *type->field(0), path, depth + 1);
       const auto mapped = types_.find(std::string(type->full_name()));
+      const OpenRecord record(*this, *type, path);
       return EventValue{
-          record_fields(nested, path, depth),
+          record_fields(nested, record.path(), depth),
           mapped == types_.end() ? std::string() : mapped->second,
           context_state_ ? std::string(type->full_name()) : std::string()};
     }
@@ -341,6 +377,7 @@ public:
                     const std::string &type, bool wrapped) {
     if (!wrapped) {
       validate(*message.GetDescriptor(), payload_, "", false, false, 0);
+      const OpenRecord record(*this, *message.GetDescriptor(), "");
       return EventValue{record_fields(message, "", 0), type};
     }
     validate(*message.GetDescriptor(), payload_, "1", true, false, 0);
@@ -803,6 +840,88 @@ void encode_observation_value(const EventValue &value,
 
 // The native REPL JIT needs a stable destructor for snapshot temporaries.
 EventValue::~EventValue() = default;
+
+namespace detail {
+namespace {
+// The pointees that the shared pointers of the running conversion rebuilt, by
+// the address the object had in the target and the pointer type.
+struct RebuiltPointees {
+  unsigned depth = 0;
+  std::map<std::pair<std::uint64_t, std::string>, std::shared_ptr<const void>> objects;
+};
+RebuiltPointees &rebuilt_pointees() {
+  thread_local RebuiltPointees state;
+  return state;
+}
+std::uint64_t pointer_address(const EventValue &pointer) {
+  const auto *fields = std::get_if<EventValue::Object>(&pointer.data());
+  if (!fields)
+    return 0;
+  const auto found = fields->find("address");
+  const auto *address =
+      found == fields->end() ? nullptr : std::get_if<std::uint64_t>(&found->second.data());
+  return address ? *address : 0;
+}
+std::string hex_address(std::uint64_t address) {
+  std::ostringstream text;
+  text << "0x" << std::hex << address;
+  return text.str();
+}
+} // namespace
+
+PointeeScope::PointeeScope() noexcept { ++rebuilt_pointees().depth; }
+PointeeScope::~PointeeScope() {
+  auto &state = rebuilt_pointees();
+  if (--state.depth == 0)
+    state.objects.clear();
+}
+
+std::string omitted_pointee(const EventValue &pointer) {
+  const auto *fields = std::get_if<EventValue::Object>(&pointer.data());
+  if (!fields)
+    return {};
+  const auto found = fields->find("omitted");
+  const auto *reason =
+      found == fields->end() ? nullptr : std::get_if<std::string>(&found->second.data());
+  return reason ? *reason : std::string();
+}
+
+void require_captured_pointee(const EventValue &pointer) {
+  const auto reason = omitted_pointee(pointer);
+  if (reason.empty())
+    return;
+  const auto object = "the object at " + hex_address(pointer_address(pointer)) + ", owned by " +
+                      (pointer.cpp_type().empty() ? std::string("a smart pointer")
+                                                  : pointer.cpp_type()) +
+                      ", ";
+  if (reason == "cycle")
+    throw std::runtime_error(object + "is an owner of itself through a cycle of smart pointers "
+                                      "(omitted: cycle), which a typed value cannot rebuild: "
+                                      "read the snapshot fields");
+  if (reason == "alias")
+    throw std::runtime_error(object + "was captured through another pointer (omitted: alias) "
+                                      "and a typed value cannot share it here: read the "
+                                      "snapshot fields");
+  throw std::runtime_error(object + "was left out of the snapshot by a capture limit (omitted: " +
+                           reason + "), so a typed value would be incomplete: read the snapshot "
+                                    "fields");
+}
+
+std::shared_ptr<const void> rebuilt_pointee(const EventValue &pointer) {
+  if (omitted_pointee(pointer) != "alias")
+    return {};
+  const auto &objects = rebuilt_pointees().objects;
+  const auto found = objects.find({pointer_address(pointer), pointer.cpp_type()});
+  return found == objects.end() ? std::shared_ptr<const void>() : found->second;
+}
+
+void keep_rebuilt_pointee(const EventValue &pointer, std::shared_ptr<const void> object) {
+  auto &state = rebuilt_pointees();
+  const auto address = pointer_address(pointer);
+  if (state.depth && address && object)
+    state.objects.emplace(std::make_pair(address, pointer.cpp_type()), std::move(object));
+}
+} // namespace detail
 
 bool EventValue::matches_record_type(std::string_view name) const {
   if (!type_.empty())

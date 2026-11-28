@@ -123,6 +123,7 @@ struct VirtualHandle : virtual VirtualBase { virtual void action(); Target* ptr;
 struct Texted { int tag; const char* text; int* number; void* opaque; };
 struct Link { int link_id = 0; Link* next = nullptr; };
 struct Chain { Link* head; };
+struct OwnedLink { int link = 0; std::unique_ptr<OwnedLink> next; };
 struct NestedPointer { int tag; Pointee* pointee; };
 struct OuterNested { int outer_id; NestedPointer inner; };
 class Handle { public: Handle() = delete; virtual ~Handle(); int id; private: Pointee* target; PointeeBase* dynamic; const char* text; };
@@ -238,6 +239,11 @@ if (!chain->head || chain->head->link_id != 1 || !chain->head->next || chain->he
 EventValue nested_value{EventValue::Object{{"outer_id", integer(122)}, {"inner", EventValue{EventValue::Object{{"tag", integer(123)}, {"pointee", address_of(4096)}, {"pointee_snapshot", payload(124, "inner")}}, "application::NestedPointer"}}}, "application::OuterNested"};
 auto outer = nested_value.as<application::OuterNested>();
 if (outer->outer_id != 122 || outer->inner.tag != 123) throw std::runtime_error("pointer in a nested record failed");
+auto owned_link = [](int id, EventValue next) { return EventValue{EventValue::Object{{"link", integer(id)}, {"next", std::move(next)}}, "application::OwnedLink"}; };
+auto no_pointee = [](const char* why) { return EventValue{EventValue::Object{{"address", address_of(4096)}, {"value", EventValue{}}, {"suppressed", EventValue{*why != 0}}, {"omitted", text_of(why)}}, "std::unique_ptr<application::OwnedLink>"}; };
+auto owned = owned_link(1, pointer(owned_link(2, pointer(owned_link(3, no_pointee("")))))).as<application::OwnedLink>();
+if (owned.link != 1 || !owned.next || owned.next->link != 2 || !owned.next->next || owned.next->next->link != 3 || owned.next->next->next) throw std::runtime_error("a record that owns itself through unique_ptr failed");
+for (const char* why : {"depth", "cycle", "alias"}) { bool refused = false; try { (void)owned_link(1, pointer(owned_link(2, no_pointee(why)))).as<application::OwnedLink>(); } catch (const std::runtime_error& error) { refused = std::string(error.what()).find(why) != std::string::npos && std::string(error.what()).find("0x1000") != std::string::npos; } if (!refused) throw std::logic_error(std::string("a list with an omitted node was rebuilt: ") + why); }
 std::cout << "automatic-reconstruction-rules-ok" << std::endl;
 ''', True)
         assert good.returncode == 0, (good.stdout, good.stderr)
@@ -262,7 +268,7 @@ std::cout << "automatic-reconstruction-rules-ok" << std::endl;
         assert "it uses application::DropS, which could not be mapped" in good.stdout, good.stdout
         for name in ("AbstractBase", "Repeated", "Union", "Tree", "TreeNode", "VirtualHandle"):
             assert f"skipped application::{name}:" in good.stdout, good.stdout
-        for name in ("SmartHolder", "Payload", "Pinned"):
+        for name in ("SmartHolder", "Payload", "Pinned", "OwnedLink"):
             assert not re.search(rf"reconstructed application::{name}(;|\s|$)", good.stdout), good.stdout
             assert f"skipped application::{name}:" not in good.stdout, good.stdout
         assert "city" in good.stdout, good.stdout
