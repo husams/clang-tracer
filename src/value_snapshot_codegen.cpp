@@ -319,10 +319,13 @@ make_value_snapshot_code(clang::ASTContext &ast,
     limits.descriptor_bytes = 4096;
     limits.fields = 128;
     limits.depth = report_unavailable ? context_engine::max_capture_depth : 16;
+    // A record may contain itself (a tree or list node): the capture is bounded
+    // at run time by the depth, element and byte budgets, not by the type.
     entry.schema = context_engine::build_payload_schema(
-        ast, type, std::move(family), limits, access, selection);
-    const auto codec =
-        context_engine::render_payload_codec_source(ast, type, access, selection);
+        ast, type, std::move(family), limits, access, selection,
+        context_engine::SchemaRecursion::allow);
+    const auto codec = context_engine::render_payload_codec_source(
+        ast, type, access, selection, context_engine::SchemaRecursion::allow);
     if (!entry.schema)
       entry.error = entry.schema.error;
     else if (!codec)
@@ -908,9 +911,11 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
   }
   if (!types.empty()) {
     const auto codecs = member_accessors.empty()
-        ? context_engine::render_context_codec_sources(ast, {}, types, access, selection)
+        ? context_engine::render_context_codec_sources(
+              ast, {}, types, access, selection, context_engine::SchemaRecursion::allow)
         : context_engine::render_snapshot_member_accessors(
-              ast, types, member_accessors, access, selection);
+              ast, types, member_accessors, access, selection,
+              context_engine::SchemaRecursion::allow);
     if (!codecs) {
       for (auto &entry : entries)
         if (entry.error.empty())
@@ -990,6 +995,29 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
         "constexpr std::size_t snapshot_depth=" + bound(spec.snapshot_max_depth(), 32, context_engine::max_capture_depth) + ";\n"
         "constexpr std::size_t snapshot_bytes=" + bound(spec.snapshot_max_bytes(), max_snapshot_bytes, max_snapshot_bytes) + ";\n"
         "}\n";
+    // The note of a snapshot that left the pointee of a smart pointer out at a
+    // limit. The pointer itself says which limit (its `omitted` field); the note
+    // names the option that raises it where there is one.
+    code.declarations += std::string("\nnamespace tracer_snapshot_detail {\n"
+        "inline const char* pointee_cut_note(const char* reason) noexcept {\n"
+        "  switch(reason[0]){\n") +
+        (report_unavailable
+             ? "  case 'd': return \"objects owned by smart pointers were left out at the depth limit (their pointers say omitted: depth): raise --max-depth\";\n"
+               "  case 'b': return \"objects owned by smart pointers did not fit the snapshot and were left out (their pointers say omitted: bytes): raise --max-snapshot-bytes\";\n"
+               "  case 'e': return \"objects owned by smart pointers were left out at the element limit (their pointers say omitted: elements): raise --max-elements\";\n"
+               "  default: return \"objects owned by smart pointers hold a string above the limit and were left out (their pointers say omitted: string): raise --max-string-bytes\";\n"
+             : "  case 'd': return \"objects owned by smart pointers were left out at the snapshot depth limit (their pointers say omitted: depth)\";\n"
+               "  case 'b': return \"objects owned by smart pointers did not fit the snapshot payload and were left out (their pointers say omitted: bytes): raise --snapshot-slice or --snapshot-arena\";\n"
+               "  case 'e': return \"objects owned by smart pointers were left out at the snapshot element limit (their pointers say omitted: elements)\";\n"
+               "  default: return \"objects owned by smart pointers hold a string above the snapshot string limit and were left out (their pointers say omitted: string)\";\n") +
+        "  }\n}\n"
+        "inline const char* member_pointee_cut_note(const char* reason) noexcept {\n"
+        "  switch(reason[0]){\n"
+        "  case 'd': return \"objects owned by smart pointers were left out at the snapshot depth limit (their pointers say omitted: depth)\";\n"
+        "  case 'b': return \"objects owned by smart pointers did not fit the snapshot payload and were left out (their pointers say omitted: bytes): raise --snapshot-slice or --snapshot-arena\";\n"
+        "  case 'e': return \"objects owned by smart pointers were left out at the element limit (their pointers say omitted: elements): raise --vector-elements\";\n"
+        "  default: return \"objects owned by smart pointers hold a string above the limit and were left out (their pointers say omitted: string): raise --string-bytes\";\n"
+        "  }\n}\n}\n";
     code.declarations += R"(
 namespace tracer_snapshot_detail {
 template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) noexcept {
@@ -1006,17 +1034,19 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
   tracer::context_engine::EncodeBudget budget;
   budget.max_items=snapshot_items;
+  // The objects that smart pointers own are captured once per snapshot.
+  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph(snapshot_items);
+  budget.pointer_graph=&pointer_graph;
 )";
     if (report_unavailable)
-      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph(snapshot_items);\n"
-                           "  budget.pointer_graph=&pointer_graph;\n"
-                           "  budget.item_cap=snapshot_items; budget.limits=limits;\n";
+      code.declarations += "  budget.item_cap=snapshot_items; budget.limits=limits;\n";
     code.declarations += R"(
-  const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
+  const bool ok=tracer::context_engine::encode_root(writer,value,budget);
   auto bytes=writer.finish();
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
     snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
     snapshot.payload_size=bytes.size(); tracer_snapshot_commit(mark,bytes.size());
+    if(budget.pointee_cut) snapshot.detail=pointee_cut_note(budget.pointee_cut);
   }else{
     tracer_snapshot_reset(mark);
     snapshot.status=tracer::ValueSnapshot::LimitExceeded;
@@ -1049,12 +1079,15 @@ template<class T> void encode_member(tracer::ValueSnapshot& snapshot, const T& v
   budget.string_cap=string_bytes;
   budget.limits.items=limits.items; budget.limits.visits=limits.visits;
   budget.copy=&tracer_snapshot_copy_bytes; budget.readable=&tracer_snapshot_readable; budget.in_scratch=&tracer_snapshot_is_scratch; budget.max_checks=max_checks;
-  const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
+  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph(limits.items);
+  budget.pointer_graph=&pointer_graph;
+  const bool ok=tracer::context_engine::encode_root(writer,value,budget);
   auto bytes=writer.finish();
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
     snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
     snapshot.payload_size=bytes.size(); tracer_snapshot_commit(mark,bytes.size());
     if(budget.truncated) snapshot.detail=budget.cut;
+    else if(budget.pointee_cut) snapshot.detail=member_pointee_cut_note(budget.pointee_cut);
   }else{
     tracer_snapshot_reset(mark); snapshot.status=tracer::ValueSnapshot::LimitExceeded;
     snapshot.detail = budget.cut ? budget.cut

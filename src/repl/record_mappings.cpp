@@ -114,6 +114,9 @@ class Generator {
   std::map<std::string, Record*> candidates_;
   std::map<std::string, Record*> aliases_;
   std::set<Record*> defaults_, manual_, manual_reconstructed_, instantiated_, reconstructing_;
+  // Records a std::unique_ptr field took as decoded by value while they were
+  // still being planned (a list node that owns the next one).
+  std::set<Record*> owned_in_progress_;
   // Set when a by-value field depends on a record that is still being planned.
   bool value_in_progress_ = false;
   std::set<std::string> notes_;
@@ -348,13 +351,15 @@ class Generator {
             return false;
           }
           if (unique) {
-            // The pointee must not turn into a reconstructed record after this decision.
+            // A record that owns itself through the pointer (a list node) is still
+            // being planned. The pointer is decoded as owning a value; the
+            // pointee must not turn into a reconstructed record after this
+            // decision, so reconstruct() refuses a record noted here.
             if (auto* pointee = element->getAsCXXRecordDecl()) {
               const auto found = state_.find(key(pointee));
               if (found != state_.end() && found->second == 1 &&
                   !reconstructing_.count(key(pointee))) {
-                reason = "cyclic unique_ptr requires an EventCodec";
-                return false;
+                owned_in_progress_.insert(key(pointee));
               }
             }
           }
@@ -760,6 +765,9 @@ class Generator {
     };
     if (record->getNumVBases() != 0) {
       return fail("virtual bases cannot be reconstructed");
+    }
+    if (owned_in_progress_.count(canonical)) {
+      return fail("cyclic unique_ptr requires an EventCodec");
     }
     std::map<Record*, bool> seen;
     std::vector<MappedField> fields;

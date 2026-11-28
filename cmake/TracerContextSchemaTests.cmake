@@ -19,11 +19,18 @@ target_compile_definitions(generate-context-schema PRIVATE
 
 set(_context_schema_generated
   ${CMAKE_CURRENT_BINARY_DIR}/context_schema_generated.hpp)
-add_custom_command(OUTPUT ${_context_schema_generated}
+# Value snapshots of records that contain themselves (tests/repl_recursive_snapshots.cpp).
+set(_snapshot_recursive_generated
+  ${CMAKE_CURRENT_BINARY_DIR}/snapshot_recursive_generated.hpp)
+add_custom_command(OUTPUT ${_context_schema_generated} ${_snapshot_recursive_generated}
   COMMAND generate-context-schema ${_context_schema_generated}.tmp
+    ${_snapshot_recursive_generated}.tmp
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     ${_context_schema_generated}.tmp ${_context_schema_generated}
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${_snapshot_recursive_generated}.tmp ${_snapshot_recursive_generated}
   DEPENDS generate-context-schema
+    tests/fixtures/snapshot_recursive.hpp
     tests/fixtures/shared_context_nested.cpp
     tests/fixtures/context_schema_catalog.cpp
     tests/fixtures/context_schema_history_v1.cpp

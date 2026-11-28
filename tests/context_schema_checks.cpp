@@ -41,6 +41,149 @@ struct SchemaAliasFinder final : clang::RecursiveASTVisitor<SchemaAliasFinder> {
 } // namespace
 
 namespace tracer::context_engine {
+namespace {
+// Records that contain themselves (issue #180): admitted only where the caller
+// asks for it, described as a finite graph, and encoded by codecs that call
+// each other.
+void verify_recursive_schema(const std::vector<std::string> &arguments) {
+  std::ifstream fixture(TRACER_TEST_SOURCE_DIR "/tests/fixtures/snapshot_recursive.hpp");
+  const std::string source{std::istreambuf_iterator<char>(fixture), {}};
+  const std::string extra = R"cpp(
+#include <filesystem>
+#include "tracer/context.hpp"
+namespace recursive_fixture {
+struct WithPath { std::filesystem::path path; };
+struct Scope {};
+struct RecursiveState : tracer::shared_state<Scope> { std::vector<TreeNode> nodes; };
+}
+)cpp";
+  auto ast = clang::tooling::buildASTFromCodeWithArgs(source + extra, arguments,
+                                                      "recursive-schema-fixture.cc");
+  if (!ast || ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("recursive schema fixture failed to parse");
+  auto &context = ast->getASTContext();
+  const auto record = [&](const std::string &name) {
+    SchemaRecordFinder finder;
+    finder.name = "recursive_fixture::" + name;
+    finder.TraverseDecl(context.getTranslationUnitDecl());
+    if (!finder.record)
+      throw std::runtime_error("recursive fixture record not found: " + name);
+    return finder.record;
+  };
+  const auto family = [](const std::string &name) {
+    StateFamilyKey key;
+    key.source_lineage_id[0] = 0x18;
+    key.cpp_state_type = "recursive_fixture::" + name;
+    key.cpp_scope_type = "tracer::EventValueSnapshot";
+    return key;
+  };
+  const auto type = [&](const std::string &name) {
+    return clang::QualType(record(name)->getTypeForDecl(), 0);
+  };
+  const std::string rejected_text = "recursive/cyclic state schema is unsupported: ";
+  for (const auto access : {CodecAccess::public_members, CodecAccess::snapshot_members}) {
+    // Without the option a record that contains itself is still refused.
+    const auto rejected = build_payload_schema(context, type("TreeNode"), family("TreeNode"), {},
+                                               access);
+    if (rejected || rejected.error != rejected_text + "recursive_fixture::TreeNode")
+      throw std::runtime_error("a recursive record was admitted without the option: " +
+                               rejected.error);
+    if (render_payload_codec_source(context, type("TreeNode"), access))
+      throw std::runtime_error("a recursive codec was generated without the option");
+    const auto schema = build_payload_schema(context, type("TreeNode"), family("TreeNode"), {},
+                                             access, {}, SchemaRecursion::allow);
+    if (!schema)
+      throw std::runtime_error("a recursive record was refused: " + schema.error);
+    const auto &tree = schema.record->root->fields[0].message;
+    if (!tree || tree->fields.size() != 3 || tree->fields[2].kind != SchemaKind::vector ||
+        !tree->fields[2].value || tree->fields[2].value->message ||
+        tree->fields[2].value->recursive.lock() != tree ||
+        tree->fields[2].value->record() != tree)
+      throw std::runtime_error("the inner record does not refer back to the outer one");
+    // The reference does not own the record: the schema is released with its root.
+    std::weak_ptr<const SchemaMessage> watched = tree;
+    if (watched.use_count() != 1)
+      throw std::runtime_error("a recursive schema owns itself");
+    if (schema.record->container_roles != std::vector<std::string>{"1.3=vector"})
+      throw std::runtime_error("the roles of a recursive record are not listed once");
+    google::protobuf::FileDescriptorSet set;
+    google::protobuf::DescriptorPool pool;
+    if (!set.ParseFromString(schema.record->descriptor_set) || set.file_size() != 1 ||
+        !pool.BuildFile(set.file(0)))
+      throw std::runtime_error("the descriptor of a recursive record is invalid");
+    const auto *root = pool.FindMessageTypeByName(schema.record->root_type);
+    const auto *node = root ? root->field(0)->message_type() : nullptr;
+    if (!node || node->field_count() != 3 || node->field(2)->message_type() != node)
+      throw std::runtime_error("a recursive record does not name its own descriptor");
+    std::shared_ptr<const SchemaRecord> revision = schema.record;
+    const std::array<std::string_view, 5> path{"value", "kids", "kids", "kids", "name"};
+    const auto found = query_field_path(
+        ::tracer::compat::span<const std::shared_ptr<const SchemaRecord>>(&revision, 1), path);
+    if (found.size() != 1 || !found[0].present || found[0].kind != SchemaKind::string)
+      throw std::runtime_error("a field path through a recursive record was not resolved");
+    const auto codec = render_payload_codec_source(context, type("TreeNode"), access, {},
+                                                   SchemaRecursion::allow);
+    if (!codec)
+      throw std::runtime_error("a recursive codec was refused: " + codec.error);
+    auto codec_ast = clang::tooling::buildASTFromCodeWithArgs(
+        "#include \"context_codec.hpp\"\n" + source + codec.source, arguments,
+        "recursive-codec-fixture.cc");
+    if (!codec_ast || codec_ast->getDiagnostics().hasErrorOccurred())
+      throw std::runtime_error("the codec of a recursive record did not compile");
+  }
+  // Smart pointers, records that contain each other, private members and a base
+  // that holds the derived record, as the prepared route captures them.
+  std::vector<clang::QualType> roots;
+  for (const char *name : {"ListNode", "SharedNode", "Folder", "Hidden", "Grid", "Holder"}) {
+    const auto schema =
+        build_payload_schema(context, type(name), family(name), {}, CodecAccess::snapshot_members,
+                             {}, SchemaRecursion::allow);
+    if (!schema)
+      throw std::runtime_error(std::string("a recursive record was refused: ") + name + ": " +
+                               schema.error);
+    for (const auto &role : schema.record->container_roles)
+      if (role.size() > 64)
+        throw std::runtime_error("a role of a recursive record repeats its path: " + role);
+    roots.push_back(type(name));
+  }
+  const auto list = build_payload_schema(context, type("ListNode"), family("ListNode"), {},
+                                         CodecAccess::snapshot_members, {}, SchemaRecursion::allow);
+  if (list.record->container_roles != std::vector<std::string>{"1.2.2=optional"})
+    throw std::runtime_error("the roles of a list node are not those of its outermost pointer");
+  const auto codecs = render_context_codec_sources(context, {}, roots,
+                                                   CodecAccess::snapshot_members, {},
+                                                   SchemaRecursion::allow);
+  if (!codecs)
+    throw std::runtime_error("codecs of records that contain each other were refused: " +
+                             codecs.error);
+  // Folder and Entry call each other: both are declared before either is defined.
+  const auto entry_declared = codecs.source.find("template <> struct Codec<::recursive_fixture::Entry>");
+  const auto folder_defined = codecs.source.find("inline bool Codec<::recursive_fixture::Folder>::write_fields");
+  if (entry_declared == std::string::npos || folder_defined == std::string::npos ||
+      entry_declared > folder_defined)
+    throw std::runtime_error("codecs of records that contain each other are not declared first");
+  auto codecs_ast = clang::tooling::buildASTFromCodeWithArgs(
+      "#include \"context_codec.hpp\"\n" + source + codecs.source, arguments,
+      "recursive-codecs-fixture.cc");
+  if (!codecs_ast || codecs_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("codecs of records that contain each other did not compile");
+  // A standard-library record is not captured through its private layout, and
+  // shared context state stays a tree.
+  const auto path = build_payload_schema(context, type("WithPath"), family("WithPath"), {},
+                                         CodecAccess::snapshot_members, {}, SchemaRecursion::allow);
+  if (path || path.error != "unsupported standard type: std::filesystem::path (member path)")
+    throw std::runtime_error("std::filesystem::path was captured through its components: " +
+                             path.error);
+  StateFamilyKey state_family;
+  state_family.source_lineage_id[0] = 0x18;
+  state_family.cpp_state_type = "recursive_fixture::RecursiveState";
+  state_family.cpp_scope_type = "recursive_fixture::Scope";
+  const auto state = build_state_schema(context, *record("RecursiveState"), state_family);
+  if (state || state.error != rejected_text + "recursive_fixture::TreeNode")
+    throw std::runtime_error("recursive shared state was admitted: " + state.error);
+}
+} // namespace
+
 void verify_context_schema() {
   std::ifstream fixture(TRACER_TEST_SOURCE_DIR
                         "/tests/fixtures/shared_context_nested.cpp");
@@ -535,6 +678,7 @@ struct EqualState : shared_state<Scope> { std::unordered_map<EqualRecord,int> va
   assert(batch_receiver.schema_count() == 2);
   batch_receiver.close_epoch();
   assert(batch_ledger->retained_schema_bytes() == 0);
+  verify_recursive_schema(arguments);
   verify_context_schema_roundtrip();
 }
 } // namespace tracer::context_engine
