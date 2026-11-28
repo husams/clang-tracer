@@ -96,14 +96,22 @@ std::string itanium_rtti_type_name(clang::ASTContext &ast,
     return rtti_name.str();
   return {};
 }
+// With `shallow` the members and bases of a record that is not in std are not
+// walked: capture plans check each member as the schema builder reaches it.
+// `why` names a volatile type, the one cause that is not a string character type.
 bool codec_types_supported(clang::QualType type,
                            std::set<const clang::CXXRecordDecl *> &seen,
                            const context_engine::SnapshotFieldSelection &selection,
-                           const clang::CXXRecordDecl *root = nullptr) {
-  if (type.getNonReferenceType().isVolatileQualified())
+                           const clang::CXXRecordDecl *root = nullptr,
+                           bool shallow = false, std::string *why = nullptr) {
+  if (type.getNonReferenceType().isVolatileQualified()) {
+    if (why)
+      *why = "volatile member cannot be snapshotted automatically";
     return false;
+  }
   if (const auto *array = type->getAsArrayTypeUnsafe())
-    return codec_types_supported(array->getElementType(), seen, selection);
+    return codec_types_supported(array->getElementType(), seen, selection, nullptr,
+                                 shallow, why);
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
     return true;
@@ -149,7 +157,7 @@ bool codec_types_supported(clang::QualType type,
       if (primary == "weak_ptr" || !pointee->isObjectType() || pointee->isArrayType() ||
           pointee->isIncompleteType() || pointee.isVolatileQualified())
         return true;
-      return codec_types_supported(pointee, seen, selection);
+      return codec_types_supported(pointee, seen, selection, nullptr, shallow, why);
     }
     if (name.rfind("std::", 0) == 0) {
       const auto supported = [&](auto &&check, const clang::TemplateArgument &argument) -> bool {
@@ -157,7 +165,8 @@ bool codec_types_supported(clang::QualType type,
           return std::all_of(argument.pack_begin(), argument.pack_end(),
                              [&](const auto &item) { return check(check, item); });
         return argument.getKind() != clang::TemplateArgument::Type ||
-               codec_types_supported(argument.getAsType(), seen, selection);
+               codec_types_supported(argument.getAsType(), seen, selection, nullptr,
+                                     shallow, why);
       };
       for (const auto &argument : args.asArray())
         if (!supported(supported, argument))
@@ -167,23 +176,34 @@ bool codec_types_supported(clang::QualType type,
   }
   record = record->getDefinition();
   if (!record)
-    return false;
+    return shallow;
+  if (shallow)
+    return true;
   if (!root)
     root = record;
+  const auto *plan = selection.plan;
   for (const auto *member : record->fields())
-    if (selection.includes(root, *member) && !codec_types_supported(member->getType(), seen, selection))
+    if (selection.includes(root, *member) && !(plan && plan->reason(*member)) &&
+        !codec_types_supported(member->getType(), seen, selection))
       return false;
   for (const auto &base : record->bases())
     if (!codec_types_supported(base.getType(), seen, selection, root))
       return false;
   return true;
 }
+// A member some record of a schema leaves out, with the record's message name.
+struct UnavailableRow {
+  std::string record_type, record_cpp_type;
+  context_engine::SchemaUnavailable member;
+};
 std::string schema_bytes(const context_engine::SchemaRecord &schema,
-                         std::vector<std::string> &types) {
+                         std::vector<std::string> &types,
+                         std::vector<UnavailableRow> *unavailable = nullptr) {
   google::protobuf::FileDescriptorSet files;
   if (!files.ParseFromString(schema.descriptor_set))
     return {};
   std::map<std::string, std::string> names;
+  std::map<std::string, const context_engine::SchemaMessage *> named;
   std::set<const context_engine::SchemaMessage *> visited;
   std::function<void(const context_engine::SchemaField &)> field;
   std::function<void(const context_engine::SchemaMessage &)> message;
@@ -191,6 +211,7 @@ std::string schema_bytes(const context_engine::SchemaRecord &schema,
     if (!visited.insert(&value).second)
       return;
     names[message_name(value.cpp_type)] = value.cpp_type;
+    named[message_name(value.cpp_type)] = &value;
     for (const auto &item : value.fields)
       field(item);
   };
@@ -209,6 +230,9 @@ std::string schema_bytes(const context_engine::SchemaRecord &schema,
       if (found != names.end()) {
         types.push_back(file.package() + "." + record.name() + "=" +
                         found->second);
+        if (unavailable)
+          for (const auto &item : named[record.name()]->unavailable)
+            unavailable->push_back({file.package() + "." + record.name(), found->second, item});
       }
       for (auto &member : *record.mutable_field()) {
         // std::string owns arbitrary bytes, including invalid UTF-8. The codec
@@ -224,9 +248,34 @@ std::string schema_bytes(const context_engine::SchemaRecord &schema,
 }
 } // namespace
 
-ValueSnapshotCode
-make_value_snapshot_code(clang::ASTContext &ast,
-                         const clangtracer::v1::ProbeSpec &spec, bool follow_members) {
+namespace {
+// Whether a record leaves something in the event: a field that is not a record
+// message, a record that omits nothing, or one that itself captures something.
+// A field that refers back to a record being described (`message` is null) holds
+// data of its own, and the walk follows owned messages only, so it ends.
+bool captures_something(const context_engine::SchemaMessage &message) {
+  for (const auto &field : message.fields)
+    if (field.kind != context_engine::SchemaKind::message || !field.message ||
+        field.message->unavailable.empty() || captures_something(*field.message))
+      return true;
+  return false;
+}
+// The reason of the first member, in declaration order, a record that captures
+// nothing leaves out.
+std::string first_unavailable_reason(const context_engine::SchemaMessage &message) {
+  std::map<std::uint32_t, std::string> reasons;
+  for (const auto &member : message.unavailable)
+    reasons.emplace(member.number, member.reason);
+  for (const auto &field : message.fields)
+    if (field.message && !field.message->unavailable.empty())
+      if (auto reason = first_unavailable_reason(*field.message); !reason.empty())
+        reasons.emplace(field.number, std::move(reason));
+  return reasons.empty() ? std::string{} : reasons.begin()->second;
+}
+
+ValueSnapshotCode make_code(clang::ASTContext &ast,
+                            const clangtracer::v1::ProbeSpec &spec, bool follow_members,
+                            context_engine::CapturePlan *plan) {
   ValueSnapshotCode code;
   const auto snapshot_encoders = tracer::find_snapshot_encoders(ast);
   code.has_custom_encoder = snapshot_encoders.requested;
@@ -284,6 +333,17 @@ make_value_snapshot_code(clang::ASTContext &ast,
   const auto &info = spec.debug_info();
   const bool report_unavailable = spec.snapshot_report_unavailable();
   context_engine::SnapshotFieldSelection selection;
+  selection.plan = plan;
+  if (plan) {
+    // Members a record is captured without, by what the codecs cannot encode.
+    plan->reject = [](clang::QualType type) -> std::string {
+      std::set<const clang::CXXRecordDecl *> seen;
+      std::string why;
+      if (codec_types_supported(type, seen, {}, nullptr, true, &why))
+        return {};
+      return why.empty() ? "unsupported string character type in snapshot" : why;
+    };
+  }
   if (report_unavailable && !spec.snapshot_receiver_fields().empty()) {
     const auto receiver = tracer_alias(ast, "ResolvedTarget");
     selection.record = receiver.isNull() ? nullptr : receiver->getAsCXXRecordDecl();
@@ -329,6 +389,10 @@ make_value_snapshot_code(clang::ASTContext &ast,
       entry.error = entry.schema.error;
     else if (!codec)
       entry.error = codec.error;
+    // A value that captures nothing stays unsupported, with the reason of its
+    // first member; one that captures something is partial.
+    if (plan && entry.schema && !captures_something(*entry.schema.record->root))
+      entry.error = first_unavailable_reason(*entry.schema.record->root);
     std::set<const clang::CXXRecordDecl *> seen;
     if (!codec_types_supported(type, seen, selection))
       entry.error = "unsupported string character type in " +
@@ -955,6 +1019,54 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
   // fallback that drops them can be exercised.
   if (code.has_followed_members && std::getenv("TRACER_TEST_BREAK_FOLLOWED_MEMBERS"))
     code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_FOLLOWED_MEMBERS\");\n";
+  {
+    // The members the code leaves out, one line per member of each captured root.
+    std::set<std::string> noted;
+    const auto note = [&](const std::string &label, const context_engine::SchemaResult &schema) {
+      if (!schema)
+        return;
+      std::vector<std::string> record_types;
+      std::vector<UnavailableRow> rows;
+      (void)schema_bytes(*schema.record, record_types, &rows);
+      for (const auto &row : rows) {
+        code.has_omitted_members = true;
+        // The record that declares the member, which is not always the one captured.
+        const auto &name = row.member.name;
+        const auto at = name.rfind("::");
+        const auto plain = at == std::string::npos ? name : name.substr(at + 2);
+        const auto line = label + ": member " + row.member.owner + "::" + plain +
+            " of type " + row.member.cpp_type + " is not captured: " + row.member.reason;
+        if (noted.insert(line).second)
+          code.notes.push_back(line);
+      }
+    };
+    for (const auto &entry : entries) {
+      if (!entry.error.empty())
+        continue;
+      const auto label = (entry.role == Role::receiver ? std::string("receiver")
+                          : entry.role == Role::result ? std::string("result")
+                                                       : "argument " + std::to_string(entry.index)) +
+                         " (" + entry.cpp_type + ")";
+      note(label, entry.schema);
+      for (const auto &projection : entry.dynamic_projections)
+        if (projection.error.empty())
+          note(label + " as " + projection.cpp_type, projection.schema);
+    }
+    for (const auto &node : nodes) {
+      const auto &entry = entries[node.entry];
+      const auto label = (entry.role == Role::receiver ? std::string("receiver")
+                          : entry.role == Role::result ? std::string("result")
+                                                       : "argument " + std::to_string(entry.index)) +
+                         " (" + entry.cpp_type + ") followed member " + node.member.name;
+      for (const auto &projection : node.member.projections)
+        if (projection.error.empty())
+          note(label + " as " + projection.cpp_type, projection.schema);
+    }
+  }
+  // Test-only switch: makes the code that captures partial records fail to compile
+  // so the fallback to the whole-record capture can be exercised.
+  if (code.has_omitted_members && std::getenv("TRACER_TEST_BREAK_PARTIAL_CAPTURE"))
+    code.declarations += "\nstatic_assert(false, \"TRACER_TEST_BREAK_PARTIAL_CAPTURE\");\n";
   const bool has_automatic_capture =
       std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
         return node.member.polymorphic && !node.member.projections.empty();
@@ -1185,7 +1297,8 @@ inline bool verified_vtable(const void* address) noexcept {
                                 const std::string &suffix,
                                 const std::string &cpp_type) {
     std::vector<std::string> record_types;
-    const auto bytes = schema_bytes(*schema.record, record_types);
+    std::vector<UnavailableRow> unavailable;
+    const auto bytes = schema_bytes(*schema.record, record_types, &unavailable);
     body += snapshot + ".cpp_type=" + literal(cpp_type) + ";\n";
     body += snapshot + ".root_type=" + literal(schema.record->root_type) +
             "; " + snapshot + ".descriptor=" + literal(bytes) +
@@ -1207,6 +1320,17 @@ inline bool verified_vtable(const void* address) noexcept {
               "; " + snapshot + ".record_type_count=" +
               std::to_string(record_types.size()) + ";\n";
     }
+    if (!unavailable.empty()) {
+      // Members the capture code leaves out: static, unlike a limit's note in `detail`.
+      const auto table = "unavailable_" + id + suffix;
+      body += "static const tracer::ValueSnapshotUnavailable " + table + "[]={";
+      for (const auto &row : unavailable)
+        body += "{" + literal(row.record_type) + "," + literal(row.member.name) + "," +
+                literal(row.member.cpp_type) + "," + literal(row.member.reason) + "," +
+                std::to_string(row.member.number) + "u},";
+      body += "}; " + snapshot + ".unavailable=" + table + "; " + snapshot +
+              ".unavailable_count=" + std::to_string(unavailable.size()) + ";\n";
+    }
     if (member_reserve >= 0)
       body += "tracer_snapshot_detail::encode_member(" + snapshot + "," + value_expr + "," +
               std::to_string(member_reserve) + "," + std::to_string(limits.string_bytes) + "," +
@@ -1214,6 +1338,9 @@ inline bool verified_vtable(const void* address) noexcept {
               ");\n";
     else
       body += "tracer_snapshot_detail::encode(" + snapshot + "," + value_expr + ");\n";
+    if (!unavailable.empty())
+      body += "if(" + snapshot + ".status==tracer::ValueSnapshot::Complete) " + snapshot +
+              ".status=tracer::ValueSnapshot::Partial;\n";
   };
   const auto emit_projection = [&](std::string &body, const std::string &id,
                                    const Entry &entry,
@@ -1327,7 +1454,8 @@ inline bool verified_vtable(const void* address) noexcept {
       const auto name = literal(snapshot_members::wire_path(member.name));
       const auto note = node.cut_note.empty()
           ? std::string() : child + ".detail=" + literal(node.cut_note) + ";\n";
-      body += "if(" + child + ".status==tracer::ValueSnapshot::Complete){\n" + note +
+      body += "if(" + child + ".status==tracer::ValueSnapshot::Complete||" + child +
+              ".status==tracer::ValueSnapshot::Partial){\n" + note +
               members_array + "[" + count + "]={" + name + ",&" + child +
               "}; ++" + count + "; nptr_" + nid + "=" + selected + "; nsel_" + nid +
               "=" + std::to_string(i) + ";\n}else if(" + child + ".detail){\n" +
@@ -1349,10 +1477,12 @@ inline bool verified_vtable(const void* address) noexcept {
         body += "}\n";
       }
       if (report_unavailable)
-        body += "if(" + child + ".status!=tracer::ValueSnapshot::Complete && !" + child +
+        body += "if(" + child + ".status!=tracer::ValueSnapshot::Complete && " + child +
+                ".status!=tracer::ValueSnapshot::Partial && !" + child +
                 ".detail) " + child + ".detail=\"unregistered std::any payload\";\n";
       const auto name = literal(snapshot_members::wire_path(member.name));
-      body += "if(" + child + ".status==tracer::ValueSnapshot::Complete || " + child + ".detail){\n" +
+      body += "if(" + child + ".status==tracer::ValueSnapshot::Complete || " + child +
+              ".status==tracer::ValueSnapshot::Partial || " + child + ".detail){\n" +
               members_array + "[" + count + "]={" + name + ",&" + child + "}; ++" + count + ";\n}\n}\n";
       member_reserve = -1;
       return;
@@ -1571,7 +1701,8 @@ inline bool verified_vtable(const void* address) noexcept {
     }
 
     if (const auto dropped = dropped_at_entry.find(entry_index); dropped != dropped_at_entry.end())
-      body += "if(snapshot_" + id + ".status==tracer::ValueSnapshot::Complete) snapshot_" + id +
+      body += "if(snapshot_" + id + ".status==tracer::ValueSnapshot::Complete||snapshot_" + id +
+              ".status==tracer::ValueSnapshot::Partial) snapshot_" + id +
               ".detail=" +
               literal(std::to_string(dropped->second) +
                       " pointer members were not followed: raise --follow-members") + ";\n";
@@ -1608,5 +1739,24 @@ inline bool verified_vtable(const void* address) noexcept {
         link_roots(deferred, e);
   }
   return code;
+}
+} // namespace
+
+ValueSnapshotCode
+make_value_snapshot_code(clang::ASTContext &ast,
+                         const clangtracer::v1::ProbeSpec &spec, bool extended) {
+  if (!extended)
+    return make_code(ast, spec, false, nullptr);
+  // One plan covers every schema and codec of the probe. A member left out
+  // after an earlier schema kept it makes the run start over; the omitted
+  // set only grows, so this ends.
+  context_engine::CapturePlan plan;
+  for (;;) {
+    plan.conflict = false;
+    plan.described.clear();
+    auto code = make_code(ast, spec, true, &plan);
+    if (!plan.conflict)
+      return code;
+  }
 }
 } // namespace tracer

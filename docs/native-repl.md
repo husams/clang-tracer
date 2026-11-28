@@ -579,7 +579,7 @@ sizes/depths, history and REPL retention, shared-context transport memory,
 operation timeouts, and memory read/scan requests retain their settings.
 Growing queues may use more memory when consumers are slow. Allocation,
 transport, and callback failures still report through existing diagnostics.
-The native bootstrap is version 33; update the server and agent together.
+The native bootstrap is version 34; update the server and agent together.
 
 The preview runs without installing probes, stopping target threads or executing code inside
 the target. `--save` creates a new versioned text-protobuf file with selection
@@ -2334,7 +2334,9 @@ pointer or reference to a private nested implementation class
 prepared adapter republishes nested class names. If the capture code that
 follows members does not compile, the probe is built without them and the
 validation report says so; setting `TRACER_TEST_BREAK_FOLLOWED_MEMBERS` in the
-target's environment forces that fallback for testing. In a followed member a
+target's environment forces that fallback for testing. The same fallback drops
+partial record capture (below), and `TRACER_TEST_BREAK_PARTIAL_CAPTURE` forces
+it. In a followed member a
 `weak_ptr` is always recorded as expired, and a smart pointer whose pointee was
 left out by the checks or the read budget looks the same as one with no
 pointee.
@@ -2762,11 +2764,35 @@ from your constructor or factory. This custom conversion runs locally.
 Automatic target capture uses complete ABI-validated layouts and serializable
 fields, including nested records and supported STL members. Prepared layouts
 can include private and protected fields. Unions, bit-fields, volatile data,
-arbitrary raw pointees and wide/custom-character strings are unavailable for
-general automatic record capture.
+arbitrary raw pointees, wide/custom-character strings and standard types
+without a codec (such as `std::mutex` or `std::ostringstream`) are unavailable
+for general automatic record capture.
+One such member does not take the other members with it. A record that has
+members it cannot capture, and members it can, is captured as a `PARTIAL`
+snapshot: the members that can be captured keep their values and their field
+numbers, and each member that was left out is listed with the reason, in the
+event (`unavailable` on the snapshot, `status: PARTIAL`), when the probe is
+installed (`capture note:` lines after `installed probe=`) and in
+`%probe validate` (diagnostics of stage `snapshot` and severity `note`). In C++,
+`EventValue::unavailable()` maps each member left out to its reason,
+`is_partial()` is true for a record or any record nested in it, and
+`field("m")` on a member left out throws `std::out_of_range` ("event field was
+not captured: m: REASON"). A conversion that needs such a member, such as an
+`EventRecord<T>` mapping that names it, is rejected the same way; a mapping that
+names only captured members converts. The same holds for records inside
+vectors and maps, bases, results and, on the prepared route, receivers. A
+member left out is a fact about the code that was generated at install time,
+so it is missing from every event of the probe, unlike a value that a limit cuts
+at run time (that stays a `LIMIT_EXCEEDED` snapshot, or a note in `detail`). A
+record that captures nothing at all, such as `struct Blocked { std::mutex m; }`,
+stays `UNSUPPORTED` with the reason of its first member. If the generated code
+that captures partial records does not compile, the probe is built with the
+whole-record capture instead (the fallback above), and the validation report
+says so.
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
-or over-budget snapshots throw; partial objects are never returned as complete.
+or over-budget snapshots throw; a partial snapshot never pretends to hold the
+member it left out.
 Older recordings containing only object addresses need a new capture to supply
 contents. The old scalar variant/text APIs remain available.
 
