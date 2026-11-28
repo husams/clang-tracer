@@ -36,12 +36,8 @@ int main() {
     }
     if (command == 'g') {
       capi::run_once();
-      std::printf("PASS %d", pass);
-#define CAPI_PRINT(name, type) std::printf(" " #name "=%d", capi::calls.name);
-      CAPI_CASES(CAPI_PRINT)
-#undef CAPI_PRINT
-      std::printf(" receiver=%d", capi::calls.receiver);
-      std::printf("\n");
+      std::printf("PASS %d all=%d contained=%d receiver=%d\n", pass, capi::calls.all,
+                  capi::calls.contained, capi::calls.receiver);
       ++pass;
     }
   }

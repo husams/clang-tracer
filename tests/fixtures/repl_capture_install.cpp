@@ -6,13 +6,18 @@ namespace capi {
 
 Calls calls;
 
-#define CAPI_DEFINE(name, type) \
-  __attribute__((noinline)) int use_##name(const type &, const Sibling &) { \
-    ++calls.name;                                                              \
-    return 1;                                                                  \
-  }
-CAPI_CASES(CAPI_DEFINE)
-#undef CAPI_DEFINE
+__attribute__((noinline)) int use_all(const ThreadId &, const ErrorCode &,
+                                      const ExceptionPtr &, const ExceptionPtr &,
+                                      const Nested &, const AnonStruct &, const AnonGroup &,
+                                      const Sibling &) {
+  ++calls.all;
+  return 1;
+}
+
+__attribute__((noinline)) int use_contained(const Owner &, const Local &, const Sibling &) {
+  ++calls.contained;
+  return 1;
+}
 
 // A class that no header declares: a callback that reads its members makes the agent rebuild
 // the class from the target's debug data and import it. Plain is a member so that the rebuilt
@@ -40,17 +45,8 @@ void run_once() {
   const Nested nested;
   const AnonStruct anon_struct;
   const AnonGroup anon_group;
-  const Owner owner;
-  const Local local;
-  use_thread_id(thread_id, sibling);
-  use_error_code(error_code, sibling);
-  use_exception_ptr_empty(empty, sibling);
-  use_exception_ptr_set(set, sibling);
-  use_nested(nested, sibling);
-  use_anon_struct(anon_struct, sibling);
-  use_anon_group(anon_group, sibling);
-  use_contain_private(owner, sibling);
-  use_contain_anonymous(local, sibling);
+  use_all(thread_id, error_code, empty, set, nested, anon_struct, anon_group, sibling);
+  use_contained(Owner(), Local(), sibling);
   Holder().use(Plain());
 }
 

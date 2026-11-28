@@ -776,6 +776,12 @@ function(tracer_add_native_repl)
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_class_preparation PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_partial_capture
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_partial_capture.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
+          --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_partial_capture PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_recursive_capture
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_recursive_capture.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

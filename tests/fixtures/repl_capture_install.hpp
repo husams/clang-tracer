@@ -1,5 +1,5 @@
-// Argument records that automatic value capture cannot encode (issue #182). Each function takes
-// one such record and a record it can encode, and counts its calls.
+// Argument records that automatic value capture cannot encode (issue #182), passed beside a
+// record it can encode. The functions count their calls.
 #pragma once
 
 #include <exception>
@@ -75,20 +75,17 @@ struct Local {
   int tail = 8;
 };
 
-#define CAPI_CASES(X)                                                                     \
-  X(thread_id, ThreadId) X(error_code, ErrorCode) X(exception_ptr_empty, ExceptionPtr) \
-  X(exception_ptr_set, ExceptionPtr) X(nested, Nested) X(anon_struct, AnonStruct)       \
-  X(anon_group, AnonGroup) X(contain_private, Owner) X(contain_anonymous, Local)
-
-#define CAPI_DECLARE(name, type) int use_##name(const type &, const Sibling &);
-CAPI_CASES(CAPI_DECLARE)
-#undef CAPI_DECLARE
+// Takes every record that capture reports by name, and the one it can encode.
+int use_all(const ThreadId &, const ErrorCode &, const ExceptionPtr &empty,
+            const ExceptionPtr &set, const Nested &, const AnonStruct &, const AnonGroup &,
+            const Sibling &);
+// Takes the records the schema accepts and the generated codec cannot spell.
+int use_contained(const Owner &, const Local &, const Sibling &);
 
 // How often each function ran.
 struct Calls {
-#define CAPI_COUNTER(name, type) int name = 0;
-  CAPI_CASES(CAPI_COUNTER)
-#undef CAPI_COUNTER
+  int all = 0;
+  int contained = 0;
   int receiver = 0; // Holder::use, a class that only the fixture source declares
 };
 extern Calls calls;

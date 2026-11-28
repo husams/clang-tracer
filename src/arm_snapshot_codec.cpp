@@ -35,11 +35,12 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, unsigned membe
     result.set_cpp_type(source.cpp_type);
   if (source.detail)
     result.set_detail(source.detail);
-  if (source.status != ValueSnapshot::Complete)
+  if (source.status != ValueSnapshot::Complete && source.status != ValueSnapshot::Partial)
     return true;
   if (!source.descriptor || !source.root_type || source.descriptor_size > 4096 ||
       source.payload_size > max_snapshot_bytes || (!source.payload && source.payload_size) ||
       source.container_role_count > 128 || source.record_type_count > 128 ||
+      (source.unavailable_count && !source.unavailable) ||
       (source.member_count && (!member_depth || !source.members ||
                                source.member_count > snapshot_member_request().load())))
     return false;
@@ -51,6 +52,19 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, unsigned membe
     result.add_container_roles(source.container_roles[i]);
   for (std::size_t i = 0; i != source.record_type_count; ++i)
     result.add_record_types(source.record_types[i]);
+  for (std::size_t i = 0; i != source.unavailable_count; ++i) {
+    const auto &item = source.unavailable[i];
+    if (!item.record_type || !item.name)
+      return false;
+    auto &encoded = *result.add_unavailable();
+    encoded.set_record_type(item.record_type);
+    encoded.set_name(item.name);
+    if (item.cpp_type)
+      encoded.set_cpp_type(item.cpp_type);
+    if (item.reason)
+      encoded.set_reason(item.reason);
+    encoded.set_number(item.number);
+  }
   for (std::size_t i = 0; i != source.member_count; ++i) {
     const auto &member = source.members[i];
     if (!member.name || !member.snapshot)

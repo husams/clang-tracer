@@ -140,6 +140,12 @@ bool write_truncation(BoundedProtoWriter &writer,
          writer.end_message();
 }
 
+// Only a snapshot with a payload lists the members its capture left out.
+bool carries_unavailable(const tracer::ValueSnapshot &snapshot) noexcept {
+  return snapshot.status == tracer::ValueSnapshot::Complete ||
+         snapshot.status == tracer::ValueSnapshot::Partial;
+}
+
 // An upper bound of the bytes write_value_snapshot adds for a snapshot.
 std::size_t snapshot_size_bound(const tracer::ValueSnapshot &snapshot, unsigned depth) noexcept {
   const auto length = [](const char *text) { return text ? std::strlen(text) : std::size_t{0}; };
@@ -149,6 +155,11 @@ std::size_t snapshot_size_bound(const tracer::ValueSnapshot &snapshot, unsigned 
     bound += 8 + length(snapshot.container_roles[i]);
   for (std::size_t i = 0; i < snapshot.record_type_count; ++i)
     bound += 8 + length(snapshot.record_types[i]);
+  for (std::size_t i = 0; carries_unavailable(snapshot) && i < snapshot.unavailable_count && snapshot.unavailable; ++i) {
+    const auto &item = snapshot.unavailable[i];
+    bound += 32 + length(item.record_type) + length(item.name) + length(item.cpp_type) +
+             length(item.reason);
+  }
   if (depth)
     for (std::size_t i = 0; i < snapshot.member_count && snapshot.members; ++i)
       if (snapshot.members[i].snapshot)
@@ -163,6 +174,7 @@ bool write_value_snapshot(BoundedProtoWriter &writer, std::uint32_t field,
   if (snapshot.descriptor_size > 4096 ||
       snapshot.payload_size > tracer::snapshot_slice_request().load() ||
       snapshot.container_role_count > 128 || snapshot.record_type_count > 128 ||
+      (carries_unavailable(snapshot) && snapshot.unavailable_count && !snapshot.unavailable) ||
       (snapshot.member_count && (!member_depth || !snapshot.members ||
                                  snapshot.member_count > tracer::snapshot_member_request().load())))
     return false;
@@ -188,6 +200,16 @@ bool write_value_snapshot(BoundedProtoWriter &writer, std::uint32_t field,
   for (std::size_t i = 0; i < snapshot.record_type_count; ++i)
     if (!writer.string(8, text(snapshot.record_types[i])))
       return false;
+  for (std::size_t i = 0; carries_unavailable(snapshot) && i < snapshot.unavailable_count; ++i) {
+    const auto &item = snapshot.unavailable[i];
+    if (!item.record_type || !item.name)
+      return false;
+    if (!writer.begin_message(10) || !writer.string(1, text(item.record_type)) ||
+        !writer.string(2, text(item.name)) || !writer.string(3, text(item.cpp_type)) ||
+        !writer.string(4, text(item.reason)) || !writer.u64(5, item.number) ||
+        !writer.end_message())
+      return false;
+  }
   for (std::size_t i = 0; i < snapshot.member_count; ++i) {
     const auto &member = snapshot.members[i];
     if (!member.name || !member.snapshot)
